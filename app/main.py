@@ -3,8 +3,7 @@ import os
 import json
 import uuid
 import time
-import openai
-print("OpenAI SDK version:", openai.__version__)
+import logging
 from typing import Optional, Any, Dict, List, Tuple
 
 import asyncpg
@@ -12,30 +11,30 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
 
-
-
+# Optional: enable debug logging during dev
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("costsavvy")
 
 # =========================
 # Config (Render env vars)
 # =========================
 DATABASE_URL = os.environ["DATABASE_URL"]
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]  # Enforce presence
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # gpt-4.1-mini is invalid
 
-APP_API_KEY = os.getenv("APP_API_KEY", "").strip()          # if empty, auth disabled
+APP_API_KEY = os.getenv("APP_API_KEY", "").strip()
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
-
 MIN_DB_RESULTS_BEFORE_WEB = int(os.getenv("MIN_DB_RESULTS_BEFORE_WEB", "3"))
 
 # =========================
 # App
 # =========================
 app = FastAPI()
-client = OpenAI()  # uses OPENAI_API_KEY in env
+client = OpenAI(api_key=OPENAI_API_KEY)
 pool: asyncpg.Pool | None = None
 
-# Serve UI + static assets
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # =========================
@@ -48,12 +47,12 @@ class ChatRequest(BaseModel):
 # =========================
 # Rate limit (in-memory)
 # =========================
-_ip_hits: Dict[str, List[float]] = {}  # ip -> timestamps
+_ip_hits: Dict[str, List[float]] = {}
 
 def rate_limit_ok(ip: str) -> bool:
     now = time.time()
     window_start = now - 60
-    hits = _ip_hits.get(ip, [])
+    hits = _ip_hits.get(ip, [])[::]  # copy
     hits = [t for t in hits if t >= window_start]
     if len(hits) >= RATE_LIMIT_PER_MINUTE:
         _ip_hits[ip] = hits
@@ -75,6 +74,7 @@ def require_auth(request: Request):
 async def startup():
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    logger.info("✅ DB pool ready")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -93,64 +93,43 @@ async def home():
 # SSE helpers
 # =========================
 def sse(obj: dict) -> str:
-    return f"data: {json.dumps(obj)}\n\n"
-
-def _event_type(ev: Any) -> Optional[str]:
-    if hasattr(ev, "type"):
-        return getattr(ev, "type")
-    if isinstance(ev, dict):
-        return ev.get("type")
-    return None
-
-def _event_delta(ev: Any) -> str:
-    if hasattr(ev, "delta"):
-        return getattr(ev, "delta") or ""
-    if isinstance(ev, dict):
-        return ev.get("delta", "") or ""
-    return ""
-
-def _event_error(ev: Any) -> str:
-    if hasattr(ev, "error"):
-        return str(getattr(ev, "error"))
-    if isinstance(ev, dict):
-        return str(ev.get("error", "Unknown error"))
-    return "Unknown error"
+    return f"data: {json.dumps(obj, separators=(',', ':'))}\n\n"
 
 def stream_llm_to_sse(system: str, user_content: str, out_text_parts: List[str]):
     """
-    Streams OpenAI Responses output_text deltas as SSE events.
+    Streams OpenAI chat completions as SSE events.
     Appends delta text to out_text_parts for logging.
     """
-    stream = client.responses.create(
-        model=OPENAI_MODEL,
-        input=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_content},
-        ],
-        stream=True
-    )
+    try:
+        stream = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
+            ],
+            stream=True,
+            timeout=30,
+        )
 
-    for ev in stream:
-        et = _event_type(ev)
-
-        if et == "response.output_text.delta":
-            delta = _event_delta(ev)
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content
             if delta:
                 out_text_parts.append(delta)
                 yield sse({"type": "delta", "text": delta})
 
-        elif et == "error":
-            yield sse({"type": "error", "message": _event_error(ev)})
-            return
+    except OpenAIError as e:
+        logger.error(f"OpenAI error: {e}")
+        yield sse({"type": "error", "message": "LLM service unavailable. Please try again."})
+        return
+    except Exception as e:
+        logger.error(f"Streaming error: {e}")
+        yield sse({"type": "error", "message": "An unexpected error occurred."})
+        return
 
 # =========================
-# DB helpers: sessions/messages/logs
+# DB helpers
 # =========================
 def _coerce_jsonb_to_dict(val) -> dict:
-    """
-    asyncpg can return json/jsonb as dict, or sometimes as str depending on
-    driver/config. This prevents ValueError from dict(<string>).
-    """
     if val is None:
         return {}
     if isinstance(val, dict):
@@ -159,7 +138,7 @@ def _coerce_jsonb_to_dict(val) -> dict:
         try:
             parsed = json.loads(val)
             return parsed if isinstance(parsed, dict) else {}
-        except Exception:
+        except:
             return {}
     return {}
 
@@ -205,17 +184,17 @@ async def log_query(conn: asyncpg.Connection, session_id: str, question: str, in
 # Intent extraction
 # =========================
 INTENT_RULES = """
-Return ONLY JSON with:
-mode: "general" | "price" | "hybrid" | "clarify"
-zipcode: 5-digit ZIP or null
+Return ONLY valid JSON (no markdown). Keys:
+mode: "general"|"price"|"hybrid"|"clarify"
+zipcode: 5-digit ZIP string or null
 radius_miles: number or null
-payer_like: string like "%Aetna%" or null
-plan_like: string like "%PPO%" or null
-service_query: short phrase like "chest x-ray" or null
-code_type: string or null (usually "CPT")
-code: string or null (like "71046")
-clarifying_question: string or null (ask ONE question only if needed)
-cash_only: boolean (true if user wants cash/self-pay prices)
+payer_like: string (e.g., "Aetna") or null
+plan_like: string (e.g., "PPO") or null
+service_query: phrase like "colonoscopy" or null
+code_type: "CPT"|"HCPCS"|null
+code: string like "45378" or null
+clarifying_question: string or null
+cash_only: true|false
 """
 
 def merge_state(state: Dict[str, Any], intent: Dict[str, Any]) -> Dict[str, Any]:
@@ -227,27 +206,34 @@ def merge_state(state: Dict[str, Any], intent: Dict[str, Any]) -> Dict[str, Any]
     return out
 
 async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
-    resp = client.responses.create(
-        model=OPENAI_MODEL,
-        input=[
-            {"role": "system", "content": "You extract intent for healthcare Q&A and price lookup. Be conservative."},
-            {"role": "system", "content": INTENT_RULES},
-            {"role": "user", "content": json.dumps({"message": message, "session_state": state})}
-        ]
-    )
     try:
-        return json.loads(resp.output_text)
-    except Exception:
-        return {"mode": "clarify", "clarifying_question": "What 5-digit ZIP code should I search near?"}
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You extract intent for healthcare Q&A and price lookup. Be conservative."},
+                {"role": "system", "content": INTENT_RULES},
+                {"role": "user", "content": json.dumps({"message": message, "session_state": state})},
+            ],
+            temperature=0.0,
+            timeout=10,
+        )
+        content = resp.choices[0].message.content or ""
+        return json.loads(content)
+    except (json.JSONDecodeError, OpenAIError, Exception) as e:
+        logger.warning(f"Intent extraction failed: {e}")
+        return {
+            "mode": "clarify",
+            "clarifying_question": "What 5-digit ZIP code should I search near?"
+        }
 
 # =========================
-# DB: resolve code + query v3 function
+# DB: resolve code + price lookup
 # =========================
 async def resolve_service_code(conn: asyncpg.Connection, merged: Dict[str, Any]) -> Optional[Tuple[str, str]]:
     if merged.get("code_type") and merged.get("code"):
         return merged["code_type"], merged["code"]
 
-    q = (merged.get("service_query") or "").strip()
+    q = (merged.get("service_query") or "").strip().lower()
     if not q:
         return None
 
@@ -255,8 +241,9 @@ async def resolve_service_code(conn: asyncpg.Connection, merged: Dict[str, Any])
         """
         SELECT code_type, code
         FROM public.services
-        WHERE (cpt_explanation ILIKE '%' || $1 || '%'
-            OR service_description ILIKE '%' || $1 || '%')
+        WHERE 
+            lower(cpt_explanation) LIKE '%' || $1 || '%'
+            OR lower(service_description) LIKE '%' || $1 || '%'
         ORDER BY code_type, code
         LIMIT 5
         """,
@@ -281,15 +268,28 @@ async def price_lookup_v3(conn: asyncpg.Connection, zipcode: str, code_type: str
     return [dict(r) for r in rows]
 
 # =========================
-# Web search fallback (DB insufficient only)
+# Web search fallback (LLM-based estimate)
 # =========================
 def web_search_fallback_text(question: str) -> str:
-    resp = client.responses.create(
-        model=OPENAI_MODEL,
-        input=[{"role": "user", "content": question}],
-        tools=[{"type": "web_search"}],
-    )
-    return resp.output_text
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are CostSavvy.health. Provide realistic U.S. cost estimates for procedures. "
+                        "Be clear about uncertainty. Do NOT invent exact prices. Mention typical ranges, cash vs insured."
+                    )
+                },
+                {"role": "user", "content": f"Estimate costs for: {question}"}
+            ],
+            timeout=15,
+        )
+        return resp.choices[0].message.content or "No estimate available."
+    except Exception as e:
+        logger.error(f"Web fallback failed: {e}")
+        return "I couldn’t find sufficient pricing data. Try specifying ZIP code and insurance."
 
 # =========================
 # Main streaming endpoint
@@ -299,7 +299,7 @@ async def chat_stream(req: ChatRequest, request: Request):
     require_auth(request)
     ip = request.client.host if request.client else "unknown"
     if not rate_limit_ok(ip):
-        raise HTTPException(429, detail="Rate limit exceeded. Please slow down.")
+        raise HTTPException(429, detail="Rate limit exceeded.")
     if not pool:
         raise HTTPException(500, detail="Database not ready")
 
@@ -308,14 +308,12 @@ async def chat_stream(req: ChatRequest, request: Request):
             async with pool.acquire() as conn:
                 session_id, state = await get_or_create_session(conn, req.session_id)
                 yield sse({"type": "session", "session_id": session_id})
-
                 await save_message(conn, session_id, "user", req.message)
 
                 intent = await extract_intent(req.message, state)
                 merged = merge_state(state, intent)
                 mode = intent.get("mode") or "hybrid"
 
-                # cash-only: clear insurance filters
                 if merged.get("cash_only") is True:
                     merged["payer_like"] = None
                     merged["plan_like"] = None
@@ -326,36 +324,24 @@ async def chat_stream(req: ChatRequest, request: Request):
                 if mode == "general":
                     system = (
                         "You are CostSavvy.health. Answer general healthcare questions clearly in plain language. "
-                        "Avoid medical advice. End with a brief educational disclaimer."
+                        "Do not give medical advice. End with: 'This is general info, not a quote. Confirm with your provider.'"
                     )
-
                     parts: List[str] = []
                     for chunk in stream_llm_to_sse(system, req.message, parts):
                         yield chunk
 
-                    full_answer = "".join(parts).strip() or "I couldn’t generate a response. Please try again."
+                    full_answer = "".join(parts).strip() or "I couldn’t generate a response."
                     await save_message(conn, session_id, "assistant", full_answer, {"mode": "general", "intent": intent})
                     await update_session_state(conn, session_id, merged)
                     await log_query(conn, session_id, req.message, intent, None, 0, False, full_answer)
-
                     yield sse({"type": "final", "used_web_search": False})
                     return
 
                 # --------------------
                 # PRICE / HYBRID mode
                 # --------------------
-                results: List[Dict[str, Any]] = []
-                used_web = False
-                web_notes = None
-
-                zipcode = merged.get("zipcode")
-                payer_like = merged.get("payer_like")
-                plan_like = merged.get("plan_like")
-                code_type = merged.get("code_type")
-                code = merged.get("code")
-
                 if mode in ["price", "hybrid"]:
-                    # resolve code if missing
+                    code_type, code = merged.get("code_type"), merged.get("code")
                     if not (code_type and code):
                         resolved = await resolve_service_code(conn, merged)
                         if resolved:
@@ -363,68 +349,54 @@ async def chat_stream(req: ChatRequest, request: Request):
                             merged["code_type"] = code_type
                             merged["code"] = code
 
-                    # if missing required info, ask one clarifying question
+                    zipcode = merged.get("zipcode")
                     if not zipcode or not (code_type and code):
-                        cq = intent.get("clarifying_question")
-                        if not cq:
-                            missing = []
-                            if not zipcode:
-                                missing.append("your 5-digit ZIP code")
-                            if not (code_type and code):
-                                missing.append("the procedure (or CPT code)")
-                            cq = "What is " + " and ".join(missing) + "?"
+                        cq = intent.get("clarifying_question") or "Could you share your 5-digit ZIP code and procedure name (e.g., 'colonoscopy')?"
                         yield sse({"type": "delta", "text": cq})
-
                         await save_message(conn, session_id, "assistant", cq, {"mode": "clarify", "intent": intent})
                         await update_session_state(conn, session_id, merged)
                         await log_query(conn, session_id, req.message, intent, None, 0, False, cq)
-
                         yield sse({"type": "final", "used_web_search": False})
                         return
 
-                    # DB lookup
-                    results = await price_lookup_v3(conn, zipcode, code_type, code, payer_like, plan_like)
-
-                    # Web fallback only if DB insufficient
-                    if len(results) < MIN_DB_RESULTS_BEFORE_WEB:
-                        used_web = True
-                        web_notes = web_search_fallback_text(req.message)
+                    results = await price_lookup_v3(conn, zipcode, code_type, code, merged.get("payer_like"), merged.get("plan_like"))
+                    used_web = len(results) < MIN_DB_RESULTS_BEFORE_WEB
+                    web_notes = web_search_fallback_text(req.message) if used_web else None
 
                     system = (
-                        "You are CostSavvy.health. Be honest about sources.\n"
-                        "- If results are present, say they come from our hospital price database.\n"
-                        "- If web_notes are present, say you used online search because DB was insufficient.\n"
-                        "- If the user asked general info, include a short explanation too.\n"
-                        "- Summarize top 5 cheapest with distance and best_price.\n"
-                        "- End with a brief disclaimer: prices vary; confirm with hospital/insurer.\n"
+                        "You are CostSavvy.health. Be transparent and helpful.\n"
+                        "- If DB results: summarize top 5 cheapest (hospital, distance, price).\n"
+                        "- If web_notes: say 'Our database had limited results, so I supplemented with general estimates.'\n"
+                        "- Always add: 'Prices vary. Confirm with the facility and your insurer.'"
                     )
 
                     payload = {
-                        "question": req.message,
-                        "state": merged,
-                        "top_results": results[:10],
-                        "web_notes": web_notes
+                        "User question": req.message,
+                        "ZIP": zipcode,
+                        "Procedure": f"{code_type} {code}",
+                        "DB results": [
+                            {k: v for k, v in r.items() if k in ["hospital_name", "city", "state", "distance_miles", "best_price"]}
+                            for r in results[:5]
+                        ],
+                        "Web supplement": web_notes if used_web else None,
                     }
 
                     parts: List[str] = []
-                    for chunk in stream_llm_to_sse(system, json.dumps(payload), parts):
+                    for chunk in stream_llm_to_sse(system, json.dumps(payload, indent=2), parts):
                         yield chunk
 
-                    full_answer = "".join(parts).strip() or "I couldn’t generate a response. Please try again."
-                    await save_message(
-                        conn, session_id, "assistant", full_answer,
-                        {"mode": mode, "intent": intent, "result_count": len(results), "used_web_search": used_web}
-                    )
+                    full_answer = "".join(parts).strip() or "I couldn’t generate a response."
+                    await save_message(conn, session_id, "assistant", full_answer, {
+                        "mode": mode, "intent": intent, "result_count": len(results), "used_web_search": used_web
+                    })
                     await update_session_state(conn, session_id, merged)
-
                     used_radius = results[0].get("used_radius_miles") if results else None
                     await log_query(conn, session_id, req.message, intent, used_radius, len(results), used_web, full_answer)
-
                     yield sse({"type": "final", "used_web_search": used_web})
                     return
 
-                # If we somehow land here, ask to rephrase
-                msg = "I’m not sure what you need. Can you rephrase your question?"
+                # Fallback
+                msg = "I’m not sure how to help. Could you rephrase or ask about a procedure, cost, or insurance?"
                 yield sse({"type": "delta", "text": msg})
                 await save_message(conn, session_id, "assistant", msg, {"mode": "fallback", "intent": intent})
                 await update_session_state(conn, session_id, merged)
@@ -432,8 +404,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                 yield sse({"type": "final", "used_web_search": False})
 
         except Exception as e:
-            # Never fail silently
-            yield sse({"type": "error", "message": f"{type(e).__name__}: {str(e)}"})
+            logger.exception("Unhandled error in chat_stream")
+            yield sse({"type": "error", "message": f"Server error: {type(e).__name__}"})
             yield sse({"type": "final", "used_web_search": False})
 
     headers = {
@@ -443,8 +415,6 @@ async def chat_stream(req: ChatRequest, request: Request):
     }
     return StreamingResponse(event_gen(), media_type="text/event-stream", headers=headers)
 
-# Optional: non-streaming endpoint (disabled)
 @app.post("/chat")
-async def chat(req: ChatRequest, request: Request):
-    require_auth(request)
+async def chat(_req: ChatRequest, _request: Request):
     raise HTTPException(410, detail="Use /chat_stream for streaming UI.")
