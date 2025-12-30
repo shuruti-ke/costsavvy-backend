@@ -141,6 +141,23 @@ def stream_llm_to_sse(system: str, user_content: str, out_text_parts: List[str])
 # =========================
 # DB helpers: sessions/messages/logs
 # =========================
+def _coerce_jsonb_to_dict(val) -> dict:
+    """
+    asyncpg can return json/jsonb as dict, or sometimes as str depending on
+    driver/config. This prevents ValueError from dict(<string>).
+    """
+    if val is None:
+        return {}
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        try:
+            parsed = json.loads(val)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
 async def get_or_create_session(conn: asyncpg.Connection, session_id: Optional[str]) -> Tuple[str, Dict[str, Any]]:
     if not session_id:
         session_id = str(uuid.uuid4())
@@ -148,7 +165,7 @@ async def get_or_create_session(conn: asyncpg.Connection, session_id: Optional[s
     row = await conn.fetchrow("SELECT session_state FROM public.chat_session WHERE id = $1", session_id)
     if row:
         await conn.execute("UPDATE public.chat_session SET last_seen = now() WHERE id = $1", session_id)
-        return session_id, dict(row["session_state"] or {})
+        return session_id, _coerce_jsonb_to_dict(row["session_state"])
 
     await conn.execute(
         "INSERT INTO public.chat_session (id, session_state) VALUES ($1, $2::jsonb)",
