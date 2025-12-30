@@ -3,6 +3,8 @@ import os
 import json
 import uuid
 import time
+import openai
+print("OpenAI SDK version:", openai.__version__)
 from typing import Optional, Any, Dict, List, Tuple
 
 import asyncpg
@@ -11,6 +13,9 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from openai import OpenAI
+
+
+
 
 # =========================
 # Config (Render env vars)
