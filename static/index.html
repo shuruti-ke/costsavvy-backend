@@ -1,0 +1,110 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>CostSavvy Chat</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, Arial; max-width: 900px; margin: 30px auto; padding: 12px; }
+    #log { border: 1px solid #ddd; padding: 12px; border-radius: 10px; min-height: 280px; white-space: pre-wrap; }
+    .row { display: flex; gap: 8px; margin-top: 10px; }
+    input { flex: 1; padding: 10px; }
+    button { padding: 10px 14px; }
+    .meta { color: #666; font-size: 13px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h1>CostSavvy.health (beta)</h1>
+
+  <div id="log"></div>
+
+  <div class="row">
+    <input id="q" placeholder="Ask: chest x-ray near 06032 with Aetna" />
+    <button id="send">Send</button>
+  </div>
+
+  <div class="meta">
+    Session: <span id="sid">(new)</span>
+  </div>
+
+<script>
+  const log = document.getElementById("log");
+  const q = document.getElementById("q");
+  const send = document.getElementById("send");
+  const sidEl = document.getElementById("sid");
+
+  let sessionId = localStorage.getItem("session_id") || "";
+
+  function addLine(text) {
+    log.textContent += text;
+    log.scrollTop = log.scrollHeight;
+  }
+
+  async function chatStream(message) {
+    addLine("\n\nYou: " + message + "\nAssistant: ");
+
+    const res = await fetch("/chat_stream", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        // If you want browser auth too, uncomment and set your key:
+        // "X-API-Key": "YOUR_APP_API_KEY"
+      },
+      body: JSON.stringify({ session_id: sessionId || null, message })
+    });
+
+    if (!res.ok) {
+      const t = await res.text();
+      addLine("\n\n[Error] " + t + "\n");
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // Stream is SSE-ish lines: "data: {...}\n\n"
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop();
+
+      for (const p of parts) {
+        const line = p.split("\n").find(l => l.startsWith("data: "));
+        if (!line) continue;
+
+        const payload = JSON.parse(line.slice(6));
+        if (payload.type === "session") {
+          sessionId = payload.session_id;
+          localStorage.setItem("session_id", sessionId);
+          sidEl.textContent = sessionId;
+        } else if (payload.type === "delta") {
+          addLine(payload.text);
+        } else if (payload.type === "final") {
+          addLine("\n");
+          if (payload.used_web_search) addLine("[Used web fallback]\n");
+        } else if (payload.type === "error") {
+          addLine("\n\n[Error] " + payload.message + "\n");
+        }
+      }
+    }
+  }
+
+  if (sessionId) sidEl.textContent = sessionId;
+
+  send.onclick = () => {
+    const msg = q.value.trim();
+    if (!msg) return;
+    q.value = "";
+    chatStream(msg);
+  };
+
+  q.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") send.click();
+  });
+</script>
+</body>
+</html>
