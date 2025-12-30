@@ -3,10 +3,24 @@ services:
     name: costsavvy-backend
     env: python
     plan: starter
+    region: oregon               # or frankfurt/singapore if better for your users
+    pythonVersion: "3.11"        # matches modern asyncpg + FastAPI
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
     envVars:
+      # 🔐 DATABASE_URL — manually paste your *existing* DB URL in Render dashboard
       - key: DATABASE_URL
         sync: false
+
+      # 🔐 Required: set this in Render dashboard after deploy
       - key: OPENAI_API_KEY
         sync: false
+
+      # ✅ Optional but recommended
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "30"
+      # - key: APP_API_KEY
+      #   generateValue: true   # uncomment to auto-generate a secure key
