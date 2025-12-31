@@ -30,19 +30,16 @@ APP_API_KEY = os.getenv("APP_API_KEY", "").strip()
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
 MIN_DB_RESULTS_BEFORE_WEB = int(os.getenv("MIN_DB_RESULTS_BEFORE_WEB", "3"))
 
+# Always try to show at least this many facilities in the answer
+MIN_FACILITIES_TO_DISPLAY = int(os.getenv("MIN_FACILITIES_TO_DISPLAY", "5"))
+
 # Refiners cache TTL (DB-first, Python fallback)
 REFINERS_CACHE_TTL_SECONDS = int(os.getenv("REFINERS_CACHE_TTL_SECONDS", "300"))
 
 # ---- Intent override controls (env-driven) ----
-# If enabled, questions that contain pricing keywords will be forced into "price" mode.
 INTENT_OVERRIDE_FORCE_PRICE_ENABLED = os.getenv("INTENT_OVERRIDE_FORCE_PRICE_ENABLED", "true").lower() in (
-    "1",
-    "true",
-    "yes",
-    "y",
-    "on",
+    "1", "true", "yes", "y", "on"
 )
-# Comma-separated keywords or phrases (case-insensitive) that trigger pricing override.
 INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS = [
     s.strip().lower()
     for s in os.getenv(
@@ -52,15 +49,15 @@ INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS = [
     if s.strip()
 ]
 
-# If enabled, for new pricing questions we will NOT reuse old ZIP/payment fields from session state
-# unless the user includes them in the current message.
+# For new pricing questions, do NOT reuse old ZIP/payment fields from session
 RESET_GATING_FIELDS_ON_NEW_PRICE_QUESTION = os.getenv("RESET_GATING_FIELDS_ON_NEW_PRICE_QUESTION", "true").lower() in (
-    "1",
-    "true",
-    "yes",
-    "y",
-    "on",
+    "1", "true", "yes", "y", "on"
 )
+
+# Progressive radius attempts for priced search (miles)
+PRICE_RADIUS_ATTEMPTS = [
+    int(x) for x in os.getenv("PRICE_RADIUS_ATTEMPTS", "10,25,50,100,200").split(",") if x.strip().isdigit()
+] or [10, 25, 50, 100, 200]
 
 # ----------------------------
 # App
@@ -197,13 +194,7 @@ async def get_or_create_session(conn: asyncpg.Connection, session_id: Optional[s
     return session_id, {}
 
 
-async def save_message(
-    conn: asyncpg.Connection,
-    session_id: str,
-    role: str,
-    content: str,
-    metadata: Optional[dict] = None,
-):
+async def save_message(conn: asyncpg.Connection, session_id: str, role: str, content: str, metadata: Optional[dict] = None):
     await conn.execute(
         "INSERT INTO public.chat_message (session_id, role, content, metadata) VALUES ($1,$2,$3,$4::jsonb)",
         session_id,
@@ -272,17 +263,7 @@ Notes:
 
 def merge_state(state: Dict[str, Any], intent: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(state or {})
-    for k in [
-        "zipcode",
-        "radius_miles",
-        "payer_like",
-        "plan_like",
-        "payment_mode",
-        "service_query",
-        "code_type",
-        "code",
-        "cash_only",
-    ]:
+    for k in ["zipcode", "radius_miles", "payer_like", "plan_like", "payment_mode", "service_query", "code_type", "code", "cash_only"]:
         v = intent.get(k)
         if v is not None and v != "":
             out[k] = v
@@ -351,12 +332,7 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
 # Intent override + deterministic service inference + gating reset
 # ----------------------------
 def infer_service_query_from_message(message: str) -> Optional[str]:
-    """
-    Lightweight deterministic service detection so "price" flows work even if the LLM
-    forgets to populate service_query. Expand over time as needed.
-    """
     msg = (message or "").lower()
-
     if "colonoscopy" in msg:
         return "colonoscopy"
     if "mammogram" in msg or "mammo" in msg:
@@ -373,32 +349,17 @@ def infer_service_query_from_message(message: str) -> Optional[str]:
         return "lab test"
     if "office visit" in msg or "doctor visit" in msg:
         return "office visit"
-
     return None
 
 
 def should_force_price_mode(message: str, merged: Dict[str, Any]) -> bool:
-    """
-    Env-driven rule:
-    - If enabled, and the message contains any pricing keywords, force "price" mode.
-    This intentionally does NOT require service_query to be present.
-    """
     if not INTENT_OVERRIDE_FORCE_PRICE_ENABLED:
         return False
     msg = (message or "").lower()
     return any(kw in msg for kw in INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS)
 
 
-def apply_intent_override_if_needed(
-    intent: Dict[str, Any],
-    message: str,
-    merged: Dict[str, Any],
-    session_id: str,
-) -> Dict[str, Any]:
-    """
-    If rule matches, mutate intent["mode"] to "price" and log.
-    Also infer service_query if missing so refiners / CPT resolution can work.
-    """
+def apply_intent_override_if_needed(intent: Dict[str, Any], message: str, merged: Dict[str, Any], session_id: str) -> Dict[str, Any]:
     if should_force_price_mode(message, merged):
         prev = intent.get("mode")
         if prev != "price":
@@ -406,7 +367,6 @@ def apply_intent_override_if_needed(
                 "Intent override applied: forcing mode=price",
                 extra={"session_id": session_id, "prev_mode": prev, "keywords": INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS},
             )
-
         intent["mode"] = "price"
         intent["intent_overridden"] = True
         intent["override_reason"] = "cost_keyword"
@@ -415,10 +375,7 @@ def apply_intent_override_if_needed(
             inferred = infer_service_query_from_message(message)
             if inferred:
                 merged["service_query"] = inferred
-                logger.info(
-                    "Service query inferred from message",
-                    extra={"session_id": session_id, "service_query": inferred},
-                )
+                logger.info("Service query inferred from message", extra={"session_id": session_id, "service_query": inferred})
     else:
         intent["intent_overridden"] = False
 
@@ -439,11 +396,6 @@ def message_contains_payment_info(message: str) -> bool:
 
 
 def reset_gating_fields_for_new_price_question(message: str, merged: Dict[str, Any]) -> None:
-    """
-    Your desired behavior:
-    - If the current message does NOT include ZIP or payment info,
-      clear those fields so the assistant asks again (instead of reusing session memory).
-    """
     if not message_contains_zip(message):
         merged.pop("zipcode", None)
 
@@ -488,13 +440,15 @@ async def price_lookup_v3(
     code: str,
     payer_like: Optional[str],
     plan_like: Optional[str],
+    radius_array: Optional[List[int]] = None,
 ) -> List[Dict[str, Any]]:
+    radius_array = radius_array or [10, 25, 50]
     rows = await conn.fetch(
         """
         SELECT *
         FROM public.get_prices_by_zip_radius_v3(
           $1, $2, $3, $4, $5,
-          ARRAY[10,25,50], 10, 25
+          $6::int[], 10, 25
         );
         """,
         zipcode,
@@ -502,27 +456,306 @@ async def price_lookup_v3(
         code,
         payer_like,
         plan_like,
+        radius_array,
     )
     return [dict(r) for r in rows]
 
 
+async def price_lookup_progressive(
+    conn: asyncpg.Connection,
+    zipcode: str,
+    code_type: str,
+    code: str,
+    payer_like: Optional[str],
+    plan_like: Optional[str],
+) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """
+    Tries widening radius arrays until we hit MIN_FACILITIES_TO_DISPLAY priced results,
+    or we exhaust attempts.
+    Returns: (results, used_max_radius)
+    """
+    last_results: List[Dict[str, Any]] = []
+    used_max_radius: Optional[int] = None
+
+    for r in PRICE_RADIUS_ATTEMPTS:
+        radius_array = [x for x in PRICE_RADIUS_ATTEMPTS if x <= r]
+        logger.info("Price lookup attempt", extra={"zipcode": zipcode, "max_radius": r, "radius_array": radius_array})
+        try:
+            res = await price_lookup_v3(conn, zipcode, code_type, code, payer_like, plan_like, radius_array=radius_array)
+        except Exception as e:
+            logger.warning(f"Price lookup attempt failed at radius {r}: {e}")
+            res = []
+
+        if res:
+            last_results = res
+            used_max_radius = r
+
+        if len(res) >= MIN_FACILITIES_TO_DISPLAY:
+            return res, r
+
+    return last_results, used_max_radius
+
+
 # ----------------------------
-# Web fallback (note: no real web tools)
+# Nearby hospitals (for facility list even when no prices)
 # ----------------------------
-def web_search_fallback_text(question: str) -> str:
+async def get_nearby_hospitals(conn: asyncpg.Connection, zipcode: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """
+    Best-effort: returns nearby hospitals with address + phone.
+    If latitude/longitude columns exist, we compute approximate distance.
+    If they do not exist, we still return hospitals (distance may be null).
+    """
+    # Strategy:
+    # 1) pull zip lat/lon from zip_locations
+    # 2) select hospitals, compute distance if lat/lon exist
+    try:
+        z = await conn.fetchrow(
+            "SELECT latitude, longitude FROM public.zip_locations WHERE zipcode = $1 LIMIT 1",
+            zipcode,
+        )
+        zlat = z["latitude"] if z else None
+        zlon = z["longitude"] if z else None
+    except Exception:
+        zlat, zlon = None, None
+
+    # Column aliasing to tolerate common schemas.
+    # Adjust this SELECT if your hospital_details uses different names.
+    if zlat is not None and zlon is not None:
+        # Haversine distance (miles). Works without PostGIS.
+        q = """
+        SELECT
+          COALESCE(h.hospital_name, h.name) AS hospital_name,
+          COALESCE(h.address, h.street_address, h.location, '') AS address,
+          COALESCE(h.city, '') AS city,
+          COALESCE(h.state, '') AS state,
+          COALESCE(h.zipcode, h.zip, '') AS zipcode,
+          COALESCE(h.telephone, h.phone, '') AS phone,
+          h.latitude AS latitude,
+          h.longitude AS longitude,
+          (3959 * acos(
+              cos(radians($2)) * cos(radians(h.latitude)) * cos(radians(h.longitude) - radians($3)) +
+              sin(radians($2)) * sin(radians(h.latitude))
+          )) AS distance_miles
+        FROM public.hospital_details h
+        WHERE h.latitude IS NOT NULL AND h.longitude IS NOT NULL
+        ORDER BY distance_miles ASC NULLS LAST
+        LIMIT $1
+        """
+        rows = await conn.fetch(q, limit, float(zlat), float(zlon))
+        return [dict(r) for r in rows]
+
+    # Fallback: no zip lat/lon or no hospital lat/lon, return arbitrary nearby-ish (same state not guaranteed)
+    q2 = """
+    SELECT
+      COALESCE(h.hospital_name, h.name) AS hospital_name,
+      COALESCE(h.address, h.street_address, h.location, '') AS address,
+      COALESCE(h.city, '') AS city,
+      COALESCE(h.state, '') AS state,
+      COALESCE(h.zipcode, h.zip, '') AS zipcode,
+      COALESCE(h.telephone, h.phone, '') AS phone,
+      NULL::float AS distance_miles
+    FROM public.hospital_details h
+    ORDER BY COALESCE(h.state, ''), COALESCE(h.city, ''), COALESCE(h.hospital_name, h.name)
+    LIMIT $1
+    """
+    rows = await conn.fetch(q2, limit)
+    return [dict(r) for r in rows]
+
+
+# ----------------------------
+# Estimated range (when DB price missing)
+# ----------------------------
+def estimate_cost_range(service_query: str, payment_mode: str) -> str:
+    """
+    Returns a short '$X–$Y' range, explicitly an estimate.
+    This is used ONLY when DB pricing is missing.
+    """
+    system = (
+        "You output ONLY a short numeric range for a U.S. healthcare service.\n"
+        "Format: '$X–$Y'. No extra text.\n"
+        "Be conservative and plausible."
+    )
+    user = json.dumps({"service": service_query, "payment_mode": payment_mode})
     try:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": "Provide realistic U.S. cost estimates. Be clear about uncertainty."},
-                {"role": "user", "content": question},
-            ],
-            timeout=15,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            timeout=12,
         )
-        return resp.choices[0].message.content or "No estimate available."
-    except Exception as e:
-        logger.error(f"Web fallback failed: {e}")
-        return "I couldn’t find sufficient pricing data."
+        txt = (resp.choices[0].message.content or "").strip()
+        # basic sanity
+        if "$" in txt and any(ch.isdigit() for ch in txt):
+            return txt
+        return "$1,000–$3,000"
+    except Exception:
+        return "$1,000–$3,000"
+
+
+# ----------------------------
+# Facility formatting
+# ----------------------------
+def _pick_price_fields(row: Dict[str, Any]) -> Optional[float]:
+    """
+    Best-effort: try common column names returned by your SQL function.
+    """
+    for k in ["cash_price", "cash", "price", "rate", "negotiated_rate", "allowed_amount", "standard_charge"]:
+        v = row.get(k)
+        if isinstance(v, (int, float)):
+            return float(v)
+        # sometimes Decimal
+        try:
+            if v is not None and str(v).replace(".", "", 1).isdigit():
+                return float(v)
+        except Exception:
+            pass
+    return None
+
+
+def _pick_hospital_name(row: Dict[str, Any]) -> str:
+    for k in ["hospital_name", "hospital", "facility_name", "provider_name", "name"]:
+        v = row.get(k)
+        if v:
+            return str(v)
+    return "Unknown facility"
+
+
+def _pick_phone(row: Dict[str, Any]) -> str:
+    for k in ["phone", "telephone", "tel"]:
+        v = row.get(k)
+        if v:
+            return str(v)
+    return ""
+
+
+def _pick_address(row: Dict[str, Any]) -> str:
+    # Build a readable one-liner from common fields
+    addr = row.get("address") or row.get("street_address") or ""
+    city = row.get("city") or ""
+    state = row.get("state") or ""
+    z = row.get("zipcode") or row.get("zip") or ""
+    parts = [p for p in [addr, city, state, z] if p]
+    return ", ".join(parts).strip()
+
+
+def _format_money(v: Optional[float]) -> str:
+    if v is None:
+        return ""
+    try:
+        return f"${v:,.0f}"
+    except Exception:
+        return f"${v}"
+
+
+def build_facility_block(
+    service_query: str,
+    payment_mode: str,
+    priced_results: List[Dict[str, Any]],
+    fallback_hospitals: List[Dict[str, Any]],
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Returns (text_answer, facilities_payload_for_ui).
+    Always produces at least MIN_FACILITIES_TO_DISPLAY facilities in text when possible.
+    """
+    facilities: List[Dict[str, Any]] = []
+
+    # 1) Start with priced results (dedupe by name)
+    seen = set()
+    for r in priced_results:
+        name = _pick_hospital_name(r)
+        key = name.lower().strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        facilities.append(r)
+        if len(facilities) >= MIN_FACILITIES_TO_DISPLAY:
+            break
+
+    # 2) Top up with nearby hospitals if we still need more
+    for h in fallback_hospitals:
+        if len(facilities) >= MIN_FACILITIES_TO_DISPLAY:
+            break
+        name = (h.get("hospital_name") or "").strip() or "Unknown facility"
+        key = name.lower().strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        facilities.append(h)
+
+    # If still empty, we’ll at least show a helpful message
+    if not facilities:
+        return (
+            "I don’t yet have facility records available for that area in my database.\n"
+            "Confirm with the facility and your insurer.",
+            [],
+        )
+
+    # Prepare an estimate range if needed
+    est_range = estimate_cost_range(service_query or "this service", payment_mode or "cash")
+
+    # Build answer text
+    bullets = []
+    bullets.append(f"- Colonoscopies can be **screening** (preventive) or **diagnostic** (symptoms/abnormal finding).")
+    bullets.append(f"- Facility setting matters: **outpatient endoscopy centers** often differ from **hospital outpatient** pricing.")
+    bullets.append(f"- If a biopsy or polyp removal happens, total cost can increase.")
+
+    lines = []
+    lines.extend(bullets)
+    lines.append("")
+    lines.append(f"Here are nearby options for **{service_query or 'colonoscopy'}** ({payment_mode}):")
+
+    for i, f in enumerate(facilities[:MIN_FACILITIES_TO_DISPLAY], start=1):
+        name = _pick_hospital_name(f) if "hospital_name" not in f else (f.get("hospital_name") or _pick_hospital_name(f))
+        addr = _pick_address(f)
+        phone = _pick_phone(f) if "phone" not in f else (f.get("phone") or _pick_phone(f))
+        dist = f.get("distance_miles") or f.get("distance") or f.get("miles")
+        dist_txt = ""
+        try:
+            if dist is not None:
+                dist_txt = f" ({float(dist):.1f} mi)"
+        except Exception:
+            pass
+
+        price = _pick_price_fields(f)
+        if price is not None:
+            price_txt = _format_money(price)
+            price_note = "DB price"
+        else:
+            price_txt = est_range
+            price_note = "ESTIMATE (no DB price yet)"
+
+        detail_bits = []
+        if addr:
+            detail_bits.append(addr)
+        if phone:
+            detail_bits.append(f"Tel: {phone}")
+        if detail_bits:
+            detail = " | ".join(detail_bits)
+        else:
+            detail = "Contact info not available in DB."
+
+        lines.append(f"{i}) **{name}**{dist_txt}")
+        lines.append(f"   - {detail}")
+        lines.append(f"   - Price: **{price_txt}** ({price_note})")
+
+    lines.append("")
+    lines.append("Confirm with the facility and your insurer.")
+
+    # Build facility payload for UI
+    ui_payload = []
+    for f in facilities[:MIN_FACILITIES_TO_DISPLAY]:
+        ui_payload.append(
+            {
+                "hospital_name": f.get("hospital_name") or _pick_hospital_name(f),
+                "address": _pick_address(f),
+                "phone": f.get("phone") or _pick_phone(f),
+                "distance_miles": f.get("distance_miles") or f.get("distance"),
+                "price": _pick_price_fields(f),
+                "estimated_range": None if _pick_price_fields(f) is not None else est_range,
+                "price_is_estimate": _pick_price_fields(f) is None,
+            }
+        )
+
+    return "\n".join(lines), ui_payload
 
 
 # ----------------------------
@@ -699,12 +932,11 @@ async def chat_stream(req: ChatRequest, request: Request):
                 merged = merge_state(state, intent)
                 _normalize_payment_mode(merged)
 
-                # ✅ Apply override BEFORE mode is used (forces pricing flow on cost questions)
+                # Force pricing mode when cost keywords appear
                 intent = apply_intent_override_if_needed(intent, req.message, merged, session_id)
                 mode = intent.get("mode") or "hybrid"
 
-                # ✅ NEW: If this is a cost/pricing question, do NOT reuse prior ZIP/payment from session
-                # unless the user provided them in the current message.
+                # NEW: if this is a (forced) pricing question, only accept ZIP/payment if present in the message
                 if RESET_GATING_FIELDS_ON_NEW_PRICE_QUESTION and mode in ["price", "hybrid"] and should_force_price_mode(req.message, merged):
                     before = {
                         "zipcode": merged.get("zipcode"),
@@ -788,13 +1020,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     if refiner and refiner.get("require_choice_before_pricing") is True and not merged.get("refiner_choice"):
                         msg = get_refinement_prompt(refiner)
                         yield sse({"type": "delta", "text": msg})
-                        await save_message(
-                            conn,
-                            session_id,
-                            "assistant",
-                            msg,
-                            {"mode": "clarify_variant", "refiner_id": refiner.get("id"), "intent": intent},
-                        )
+                        await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_variant", "refiner_id": refiner.get("id"), "intent": intent})
                         await update_session_state(conn, session_id, merged)
                         await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
                         yield sse({"type": "final", "used_web_search": False})
@@ -829,7 +1055,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                         yield sse({"type": "final", "used_web_search": False})
                         return
 
-                    results = await price_lookup_v3(
+                    # --- PRICED LOOKUP (progressive radius) ---
+                    results, used_max_radius = await price_lookup_progressive(
                         conn,
                         merged["zipcode"],
                         merged["code_type"],
@@ -838,14 +1065,28 @@ async def chat_stream(req: ChatRequest, request: Request):
                         merged.get("plan_like"),
                     )
 
-                    used_web = len(results) < MIN_DB_RESULTS_BEFORE_WEB
-                    web_notes = web_search_fallback_text(req.message) if used_web else None
+                    # --- ALWAYS fetch at least 5 hospitals for display (even if pricing is missing) ---
+                    nearby_hospitals = []
+                    try:
+                        nearby_hospitals = await get_nearby_hospitals(conn, merged["zipcode"], limit=MIN_FACILITIES_TO_DISPLAY)
+                    except Exception as e:
+                        logger.warning(f"Nearby hospitals lookup failed: {e}")
+                        nearby_hospitals = []
 
-                    # Send structured results to UI first
+                    # Build deterministic facility response
+                    facility_text, facility_payload = build_facility_block(
+                        service_query=merged.get("service_query") or "this service",
+                        payment_mode=merged.get("payment_mode") or "cash",
+                        priced_results=results,
+                        fallback_hospitals=nearby_hospitals,
+                    )
+
+                    # Send structured results to UI first (priced + facilities)
                     yield sse(
                         {
                             "type": "results",
                             "results": results[:25],
+                            "facilities": facility_payload,
                             "state": {
                                 k: merged.get(k)
                                 for k in [
@@ -863,34 +1104,10 @@ async def chat_stream(req: ChatRequest, request: Request):
                         }
                     )
 
-                    # Follow-up menu (after showing costs) when it improves accuracy
-                    followup_menu = None
-                    if refiner and needs_refinement(merged, refiner) and refiner.get("require_choice_before_pricing") is not True:
-                        followup_menu = get_refinement_prompt(refiner)
+                    # Stream the facility text response (not generic LLM)
+                    yield sse({"type": "delta", "text": facility_text})
 
-                    system = (
-                        "You are CostSavvy.health.\n"
-                        "Follow this strict response structure:\n"
-                        "1) 2 to 4 bullet points explaining key types or variants of the service (brief).\n"
-                        "2) Show the nearest option first (or top 3) using the provided results and costs.\n"
-                        "3) If followup_menu is provided, include it verbatim at the end.\n"
-                        "4) Always add: 'Confirm with the facility and your insurer.'\n"
-                        "Be concise. Do not repeat generic education without using the provided results."
-                    )
-
-                    payload = {
-                        "question": req.message,
-                        "state": merged,
-                        "top_results": results[:10],
-                        "web_notes": web_notes,
-                        "followup_menu": followup_menu,
-                    }
-
-                    parts: List[str] = []
-                    for chunk in stream_llm_to_sse(system, json.dumps(payload), parts):
-                        yield chunk
-
-                    full_answer = "".join(parts).strip() or "No response generated."
+                    full_answer = facility_text
                     await save_message(
                         conn,
                         session_id,
@@ -900,11 +1117,14 @@ async def chat_stream(req: ChatRequest, request: Request):
                             "mode": mode,
                             "intent": intent,
                             "result_count": len(results),
+                            "used_max_radius": used_max_radius,
                             "refiner_id": (refiner or {}).get("id"),
                         },
                     )
                     await update_session_state(conn, session_id, merged)
-                    used_radius = results[0].get("used_radius_miles") if results else None
+
+                    used_radius = used_max_radius
+                    used_web = len(results) < MIN_DB_RESULTS_BEFORE_WEB
                     await log_query(conn, session_id, req.message, intent, used_radius, len(results), used_web, full_answer)
                     yield sse({"type": "final", "used_web_search": used_web})
                     return
@@ -921,11 +1141,7 @@ async def chat_stream(req: ChatRequest, request: Request):
             yield sse({"type": "error", "message": f"{type(e).__name__}: {str(e)}"})
             yield sse({"type": "final", "used_web_search": False})
 
-    headers = {
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-    }
+    headers = {"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
     return StreamingResponse(event_gen(), media_type="text/event-stream", headers=headers)
 
 
