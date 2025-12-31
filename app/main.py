@@ -258,7 +258,7 @@ async def price_lookup_v3(conn: asyncpg.Connection, zipcode: str, code_type: str
     rows = await conn.fetch(
         """
         SELECT *
-        FROM public.get_prices_by_zip_radius_v2(
+        FROM public.get_prices_by_zip_radius_v3(
           $1, $2, $3, $4, $5,
           ARRAY[10,25,50], 10, 25
         );
