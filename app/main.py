@@ -92,7 +92,7 @@ async def home():
 # SSE Helpers
 # ----------------------------
 def sse(obj: dict) -> str:
-    return f"data: {json.dumps(obj, separators=(',', ':'))}\n\n"
+    return f" {json.dumps(obj, separators=(',', ':'))}\n\n"
 
 def stream_llm_to_sse(system: str, user_content: str, out_text_parts: List[str]):
     try:
@@ -163,7 +163,7 @@ async def log_query(conn: asyncpg.Connection, session_id: str, question: str, in
     )
 
 # ----------------------------
-# Intent Extraction (Updated)
+# Intent Extraction
 # ----------------------------
 INTENT_RULES = """
 Return ONLY valid JSON. Keys:
@@ -288,14 +288,13 @@ async def chat_stream(req: ChatRequest, request: Request):
                 merged = merge_state(state, intent)
                 mode = intent.get("mode", "hybrid")
 
-                # Cash-only: override insurance
                 if merged.get("cash_only") is True:
                     merged["payer_like"] = None
                     merged["plan_like"] = None
                     merged["insurance_status"] = "uninsured"
 
                 # --------------------
-                # Step 1: Ask for ZIP (if missing)
+                # Step 1: Ask for ZIP
                 # --------------------
                 if not merged.get("zipcode"):
                     cq = intent.get("clarifying_question") or "What is your 5-digit ZIP code?"
@@ -307,7 +306,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     return
 
                 # --------------------
-                # Step 2: Ask for insurance status (if unknown)
+                # Step 2: Ask for insurance
                 # --------------------
                 insurance_status = merged.get("insurance_status", "unknown")
                 if insurance_status == "unknown":
@@ -319,7 +318,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     return
 
                 # --------------------
-                # Step 3: Resolve procedure code
+                # Step 3: Resolve code
                 # --------------------
                 code_type, code = merged.get("code_type"), merged.get("code")
                 if not (code_type and code):
@@ -347,16 +346,38 @@ async def chat_stream(req: ChatRequest, request: Request):
                 web_notes = web_search_fallback_text(req.message) if used_web else None
 
                 # --------------------
-                # Step 5: Generate response
+                # Step 5: Build system prompt + payload (STEPS 1, 2, 3 implemented)
                 # --------------------
+                # 🔹 STEP 1: POLISHED SYSTEM PROMPT
                 system = (
-                    "You are CostSavvy.health — a transparent, educational assistant for U.S. healthcare costs.\n"
-                    "- Explain that prices vary by insurance status (cash vs insured).\n"
-                    "- If both cash and insured prices are available, show both.\n"
-                    "- Mention screening vs diagnostic colonoscopy if relevant.\n"
-                    "- List top 5 hospitals with distance, prices, phone, and city.\n"
-                    "- Always say: 'Confirm with the facility and your insurer before scheduling.'"
+                    "You are CostSavvy.health — a transparent, empathetic assistant for U.S. healthcare cost questions.\n"
+                    "Follow these rules strictly:\n"
+                    "1. 🧾 ALWAYS explain that prices differ by insurance status:\n"
+                    "   - 'Cash/self-pay': what you pay without insurance (often negotiable)\n"
+                    "   - 'Insured': negotiated rate with insurance (you may still owe co-pay/deductible)\n"
+                    "2. 🏥 For each hospital, list in this format:\n"
+                    "   - **Hospital Name** (X.X mi)\n"
+                    "     📞 [phone]\n"
+                    "     💰 Cash: $[amount] | Insured: $[amount] ([Payer])\n"
+                    "3. 🩺 If the procedure is 'colonoscopy', add a brief educational note:\n"
+                    "   - 'Screening (no symptoms) vs Diagnostic (symptoms/abnormal test) may have different codes/prices.'\n"
+                    "4. ⚠️ ALWAYS end with: 'Confirm with the facility and your insurer before scheduling.'\n"
+                    "5. 📉 Sort hospitals by distance, then price. Show top 3–5.\n"
+                    "6. ❓ If data is missing (e.g., no insured price), say 'Insured price: Not reported'.\n"
+                    "Be concise, scannable, and kind. Use plain language — no jargon."
                 )
+
+                # 🔹 STEP 2: ENHANCED PAYLOAD WITH SAFETY
+                is_colonoscopy = code.lower() in ["45378", "45380", "45385"] or "colonoscop" in (merged.get("service_query") or "").lower()
+
+                # 🔹 STEP 3: COLONOSCOPY-SPECIFIC CONTEXT (ADDED CONDITIONALLY)
+                if is_colonoscopy:
+                    system += (
+                        "\n\nAdditional context for colonoscopy:\n"
+                        "- Screening colonoscopy (CPT 45378): For people 45+ with no symptoms. Often $0 with insurance.\n"
+                        "- Diagnostic colonoscopy (CPT 45380/45385): For symptoms (e.g., bleeding) or follow-up. May require co-pay.\n"
+                        "- Cash prices are for self-pay or uninsured patients.\n"
+                    )
 
                 payload = {
                     "User question": req.message,
@@ -364,22 +385,29 @@ async def chat_stream(req: ChatRequest, request: Request):
                     "Procedure": f"{code_type} {code}",
                     "Insurance status": insurance_status,
                     "Payer filter": merged.get("payer_like"),
+                    "Is colonoscopy": is_colonoscopy,
                     "DB results": [
                         {
-                            "hospital": r["hospital_name"],
-                            "city": r["city"],
-                            "state": r["state"],
-                            "distance_mi": round(r["distance_miles"], 1),
-                            "cash_price": f"${r['cash_price']:,.0f}" if r['cash_price'] else "N/A",
-                            "insured_price": f"${r['insured_price']:,.0f}" if r['insured_price'] else "N/A",
-                            "phone": r["phone"],
-                            "address": r["address"]
+                            "hospital": r.get("hospital_name") or "Unknown Facility",
+                            "city": r.get("city") or "",
+                            "state": r.get("state") or "",
+                            "distance_mi": round(float(r.get("distance_miles", 999)), 1),
+                            "cash_price": f"${r['cash_price']:,.0f}" if r.get("cash_price") not in (None, 0) else "Not reported",
+                            "insured_price": (
+                                f"${r['insured_price']:,.0f} ({r['payer_name']})"
+                                if r.get("insured_price") not in (None, 0) and r.get("payer_name")
+                                else "Not reported"
+                            ),
+                            "phone": r.get("phone") or "Not listed",
+                            "address": f"{r.get('city', '')}, {r.get('state', '')}".strip(", ")
                         }
                         for r in results[:5]
+                        if float(r.get("distance_miles", 999)) < 100  # skip outliers
                     ],
                     "Web supplement": web_notes if used_web else None
                 }
 
+                # Stream response
                 parts: List[str] = []
                 for chunk in stream_llm_to_sse(system, json.dumps(payload, indent=2), parts):
                     yield chunk
