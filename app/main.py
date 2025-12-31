@@ -501,35 +501,25 @@ async def price_lookup_progressive(
 # ----------------------------
 async def get_nearby_hospitals(conn: asyncpg.Connection, zipcode: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
-    Best-effort: returns nearby hospitals with address + phone.
-    If latitude/longitude columns exist, we compute approximate distance.
-    If they do not exist, we still return hospitals (distance may be null).
+    Returns nearby hospitals with name/address/state/zipcode/phone (+ distance if possible).
+    Matches your hospital_details schema exactly:
+      name, address, state, zipcode, phone, latitude, longitude
     """
-    # Strategy:
-    # 1) pull zip lat/lon from zip_locations
-    # 2) select hospitals, compute distance if lat/lon exist
-    try:
-        z = await conn.fetchrow(
-            "SELECT latitude, longitude FROM public.zip_locations WHERE zipcode = $1 LIMIT 1",
-            zipcode,
-        )
-        zlat = z["latitude"] if z else None
-        zlon = z["longitude"] if z else None
-    except Exception:
-        zlat, zlon = None, None
+    z = await conn.fetchrow(
+        "SELECT latitude, longitude FROM public.zip_locations WHERE zipcode = $1 LIMIT 1",
+        zipcode,
+    )
+    zlat = float(z["latitude"]) if z and z["latitude"] is not None else None
+    zlon = float(z["longitude"]) if z and z["longitude"] is not None else None
 
-    # Column aliasing to tolerate common schemas.
-    # Adjust this SELECT if your hospital_details uses different names.
     if zlat is not None and zlon is not None:
-        # Haversine distance (miles). Works without PostGIS.
         q = """
         SELECT
-          COALESCE(h.hospital_name, h.name) AS hospital_name,
-          COALESCE(h.address, h.street_address, h.location, '') AS address,
-          COALESCE(h.city, '') AS city,
-          COALESCE(h.state, '') AS state,
-          COALESCE(h.zipcode, h.zip, '') AS zipcode,
-          COALESCE(h.telephone, h.phone, '') AS phone,
+          h.name AS hospital_name,
+          h.address AS address,
+          h.state AS state,
+          h.zipcode AS zipcode,
+          h.phone AS phone,
           h.latitude AS latitude,
           h.longitude AS longitude,
           (3959 * acos(
@@ -538,24 +528,23 @@ async def get_nearby_hospitals(conn: asyncpg.Connection, zipcode: str, limit: in
           )) AS distance_miles
         FROM public.hospital_details h
         WHERE h.latitude IS NOT NULL AND h.longitude IS NOT NULL
-        ORDER BY distance_miles ASC NULLS LAST
+        ORDER BY distance_miles ASC
         LIMIT $1
         """
-        rows = await conn.fetch(q, limit, float(zlat), float(zlon))
+        rows = await conn.fetch(q, limit, zlat, zlon)
         return [dict(r) for r in rows]
 
-    # Fallback: no zip lat/lon or no hospital lat/lon, return arbitrary nearby-ish (same state not guaranteed)
+    # If we can’t compute distance, still return facilities
     q2 = """
     SELECT
-      COALESCE(h.hospital_name, h.name) AS hospital_name,
-      COALESCE(h.address, h.street_address, h.location, '') AS address,
-      COALESCE(h.city, '') AS city,
-      COALESCE(h.state, '') AS state,
-      COALESCE(h.zipcode, h.zip, '') AS zipcode,
-      COALESCE(h.telephone, h.phone, '') AS phone,
+      h.name AS hospital_name,
+      h.address AS address,
+      h.state AS state,
+      h.zipcode AS zipcode,
+      h.phone AS phone,
       NULL::float AS distance_miles
     FROM public.hospital_details h
-    ORDER BY COALESCE(h.state, ''), COALESCE(h.city, ''), COALESCE(h.hospital_name, h.name)
+    ORDER BY h.state, h.zipcode, h.name
     LIMIT $1
     """
     rows = await conn.fetch(q2, limit)
@@ -612,19 +601,10 @@ def _pick_price_fields(row: Dict[str, Any]) -> Optional[float]:
 
 
 def _pick_hospital_name(row: Dict[str, Any]) -> str:
-    for k in ["hospital_name", "hospital", "facility_name", "provider_name", "name"]:
-        v = row.get(k)
-        if v:
-            return str(v)
-    return "Unknown facility"
-
+    return (row.get("hospital_name") or row.get("name") or "Unknown facility").strip()
 
 def _pick_phone(row: Dict[str, Any]) -> str:
-    for k in ["phone", "telephone", "tel"]:
-        v = row.get(k)
-        if v:
-            return str(v)
-    return ""
+    return (row.get("phone") or "").strip()
 
 
 def _pick_address(row: Dict[str, Any]) -> str:
