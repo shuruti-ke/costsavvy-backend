@@ -3,6 +3,9 @@ import os
 import json
 import uuid
 import time
+import openai
+print("🔥 OpenAI SDK VERSION:", openai.__version__)
+
 from typing import Optional, Any, Dict, List, Tuple
 
 import asyncpg
