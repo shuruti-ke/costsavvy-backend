@@ -4,6 +4,7 @@ import json
 import uuid
 import time
 import logging
+import traceback  # 👈 For full tracebacks
 from typing import Optional, Any, Dict, List, Tuple
 
 import asyncpg
@@ -16,7 +17,10 @@ from openai import OpenAI, OpenAIError
 # ----------------------------
 # Config
 # ----------------------------
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
 logger = logging.getLogger("costsavvy")
 
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -30,7 +34,7 @@ MIN_DB_RESULTS_BEFORE_WEB = int(os.getenv("MIN_DB_RESULTS_BEFORE_WEB", "3"))
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="CostSavvy.health API", version="1.0")
+app = FastAPI(title="CostSavvy.health API", version="1.1-debug")
 client = OpenAI(api_key=OPENAI_API_KEY)
 pool: asyncpg.Pool | None = None
 
@@ -72,17 +76,50 @@ def require_auth(request: Request):
 @app.on_event("startup")
 async def startup():
     global pool
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    logger.info("✅ DB pool ready")
+    try:
+        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        logger.info("✅ DB pool created")
+    except Exception as e:
+        logger.critical(f"❌ DB connection failed: {e}")
+        raise
 
 @app.on_event("shutdown")
 async def shutdown():
     if pool:
         await pool.close()
+        logger.info("CloseOperation: DB pool closed")
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "db_pool": bool(pool)}
+
+# 🔍 DEBUG ENDPOINT — Bypass LLM, test DB directly
+@app.get("/debug-prices")
+async def debug_prices():
+    if not pool:
+        return {"error": "DB pool not ready"}
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT *
+                FROM public.get_prices_by_zip_radius_v3('06032', 'CPT', '45378', NULL, NULL)
+                LIMIT 3;
+            """)
+            if not rows:
+                return {"status": "success", "count": 0, "message": "No rows returned — check ZIP/data."}
+            sample = dict(rows[0])
+            return {
+                "status": "success",
+                "count": len(rows),
+                "columns": list(sample.keys()),
+                "sample_row": {k: str(v)[:50] for k, v in sample.items()}
+            }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
 
 @app.get("/")
 async def home():
@@ -111,11 +148,13 @@ def stream_llm_to_sse(system: str, user_content: str, out_text_parts: List[str])
                 out_text_parts.append(delta)
                 yield sse({"type": "delta", "text": delta})
     except OpenAIError as e:
-        logger.error(f"OpenAI error: {e}")
-        yield sse({"type": "error", "message": "Service temporarily unavailable."})
+        msg = f"OpenAI error: {e}"
+        logger.error(msg)
+        yield sse({"type": "error", "message": msg})
     except Exception as e:
-        logger.error(f"Streaming error: {e}")
-        yield sse({"type": "error", "message": "An error occurred."})
+        msg = f"Streaming error: {type(e).__name__}: {e}"
+        logger.error(f"{msg}\n{traceback.format_exc()}")
+        yield sse({"type": "error", "message": msg})
 
 # ----------------------------
 # DB Helpers
@@ -223,7 +262,8 @@ async def resolve_service_code(conn: asyncpg.Connection, merged: Dict[str, Any])
         FROM public.services
         WHERE 
             lower(code) = $1
-            OR lower(description) LIKE '%' || $1 || '%'
+            OR lower(service_description) LIKE '%' || $1 || '%'
+            OR lower(cpt_explanation) LIKE '%' || $1 || '%'
         ORDER BY 
             CASE WHEN lower(code) = $1 THEN 0 ELSE 1 END,
             code_type, code
@@ -235,27 +275,31 @@ async def resolve_service_code(conn: asyncpg.Connection, merged: Dict[str, Any])
 
 async def price_lookup_v3(conn: asyncpg.Connection, zipcode: str, code_type: str, code: str,
                           payer_like: Optional[str], plan_like: Optional[str]) -> List[Dict[str, Any]]:
-    rows = await conn.fetch("""
-        SELECT *
-        FROM public.get_prices_by_zip_radius_v3(
-          $1, $2, $3, $4, $5,
-          ARRAY[10,25,50], 10, 50
-        );
-        """, zipcode, code_type, code, payer_like, plan_like)
-    return [dict(r) for r in rows]
+    try:
+        rows = await conn.fetch("""
+            SELECT *
+            FROM public.get_prices_by_zip_radius_v3(
+              $1, $2, $3, $4, $5,
+              ARRAY[10,25,50], 10, 50
+            );
+            """, zipcode, code_type, code, payer_like, plan_like)
+        logger.info(f"🔍 DB returned {len(rows)} rows for ZIP={zipcode}, code={code_type} {code}")
+        if rows:
+            logger.debug(f"   Sample columns: {list(rows[0].keys())}")
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"❌ DB query failed: {e}\n{traceback.format_exc()}")
+        raise
 
 # ----------------------------
-# Web Fallback (LLM-based)
+# Web Fallback
 # ----------------------------
 def web_search_fallback_text(question: str) -> str:
     try:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": (
-                    "You are CostSavvy.health. Provide realistic U.S. cost estimates. "
-                    "Mention typical cash vs insured ranges. Be clear about uncertainty."
-                )},
+                {"role": "system", "content": "Provide realistic U.S. cost estimates. Be clear about uncertainty."},
                 {"role": "user", "content": f"Estimate costs for: {question}"}
             ],
             timeout=15,
@@ -266,7 +310,7 @@ def web_search_fallback_text(question: str) -> str:
         return "I couldn’t find sufficient pricing data."
 
 # ----------------------------
-# Main Streaming Endpoint
+# Main Streaming Endpoint — with full error visibility
 # ----------------------------
 @app.post("/chat_stream")
 async def chat_stream(req: ChatRequest, request: Request):
@@ -279,6 +323,7 @@ async def chat_stream(req: ChatRequest, request: Request):
 
     async def event_gen():
         try:
+            logger.info(f"🆕 New chat request: '{req.message}' from IP {ip}")
             async with pool.acquire() as conn:
                 session_id, state = await get_or_create_session(conn, req.session_id)
                 yield sse({"type": "session", "session_id": session_id})
@@ -293,11 +338,10 @@ async def chat_stream(req: ChatRequest, request: Request):
                     merged["plan_like"] = None
                     merged["insurance_status"] = "uninsured"
 
-                # --------------------
-                # Step 1: Ask for ZIP
-                # --------------------
+                # Step 1: ZIP
                 if not merged.get("zipcode"):
                     cq = intent.get("clarifying_question") or "What is your 5-digit ZIP code?"
+                    logger.info(f"❓ Asking for ZIP: '{cq}'")
                     yield sse({"type": "delta", "text": cq})
                     await save_message(conn, session_id, "assistant", cq, {"mode": "clarify", "intent": intent})
                     await update_session_state(conn, session_id, merged)
@@ -305,21 +349,18 @@ async def chat_stream(req: ChatRequest, request: Request):
                     yield sse({"type": "final", "used_web_search": False})
                     return
 
-                # --------------------
-                # Step 2: Ask for insurance
-                # --------------------
+                # Step 2: Insurance
                 insurance_status = merged.get("insurance_status", "unknown")
                 if insurance_status == "unknown":
-                    yield sse({"type": "delta", "text": "Do you have health insurance? (Yes/No)"})
-                    await save_message(conn, session_id, "assistant", "Do you have health insurance? (Yes/No)", 
-                                     {"mode": "clarify", "intent": intent})
+                    msg = "Do you have health insurance? (Yes/No)"
+                    logger.info("❓ Asking for insurance status")
+                    yield sse({"type": "delta", "text": msg})
+                    await save_message(conn, session_id, "assistant", msg, {"mode": "clarify", "intent": intent})
                     await update_session_state(conn, session_id, merged)
                     yield sse({"type": "final", "used_web_search": False})
                     return
 
-                # --------------------
-                # Step 3: Resolve code
-                # --------------------
+                # Step 3: Code resolution
                 code_type, code = merged.get("code_type"), merged.get("code")
                 if not (code_type and code):
                     resolved = await resolve_service_code(conn, merged)
@@ -329,7 +370,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                         merged["code"] = code
 
                 if not (code_type and code):
-                    cq = "Could you specify the procedure? For example: 'screening colonoscopy', 'chest X-ray', or CPT code like '45378'."
+                    cq = "Could you specify the procedure? Example: 'screening colonoscopy' or 'CPT 45378'."
+                    logger.warning("❓ Missing procedure code")
                     yield sse({"type": "delta", "text": cq})
                     await save_message(conn, session_id, "assistant", cq, {"mode": "clarify", "intent": intent})
                     await update_session_state(conn, session_id, merged)
@@ -337,60 +379,40 @@ async def chat_stream(req: ChatRequest, request: Request):
                     yield sse({"type": "final", "used_web_search": False})
                     return
 
-                # --------------------
-                # Step 4: Query DB
-                # --------------------
+                # Step 4: DB query
+                logger.info(f"🔍 Querying DB: ZIP={merged['zipcode']}, code={code_type} {code}, payer={merged.get('payer_like')}")
                 results = await price_lookup_v3(conn, merged["zipcode"], code_type, code,
                                                merged.get("payer_like"), merged.get("plan_like"))
                 used_web = len(results) < MIN_DB_RESULTS_BEFORE_WEB
                 web_notes = web_search_fallback_text(req.message) if used_web else None
 
-                # --------------------
-                # Step 5: Build system prompt + payload (STEPS 1, 2, 3 implemented)
-                # --------------------
-                # 🔹 STEP 1: POLISHED SYSTEM PROMPT
+                # Step 5: Generate response
                 system = (
                     "You are CostSavvy.health — a transparent, empathetic assistant for U.S. healthcare cost questions.\n"
                     "Follow these rules strictly:\n"
                     "1. 🧾 ALWAYS explain that prices differ by insurance status:\n"
-                    "   - 'Cash/self-pay': what you pay without insurance (often negotiable)\n"
+                    "   - 'Cash/self-pay': what you pay without insurance\n"
                     "   - 'Insured': negotiated rate with insurance (you may still owe co-pay/deductible)\n"
-                    "2. 🏥 For each hospital, list in this format:\n"
+                    "2. 🏥 For each hospital, list:\n"
                     "   - **Hospital Name** (X.X mi)\n"
                     "     📞 [phone]\n"
                     "     💰 Cash: $[amount] | Insured: $[amount] ([Payer])\n"
-                    "3. 🩺 If the procedure is 'colonoscopy', add a brief educational note:\n"
-                    "   - 'Screening (no symptoms) vs Diagnostic (symptoms/abnormal test) may have different codes/prices.'\n"
+                    "3. 🩺 If colonoscopy: note screening vs diagnostic.\n"
                     "4. ⚠️ ALWAYS end with: 'Confirm with the facility and your insurer before scheduling.'\n"
-                    "5. 📉 Sort hospitals by distance, then price. Show top 3–5.\n"
-                    "6. ❓ If data is missing (e.g., no insured price), say 'Insured price: Not reported'.\n"
-                    "Be concise, scannable, and kind. Use plain language — no jargon."
+                    "Be concise, scannable, and kind."
                 )
 
-                # 🔹 STEP 2: ENHANCED PAYLOAD WITH SAFETY
                 is_colonoscopy = code.lower() in ["45378", "45380", "45385"] or "colonoscop" in (merged.get("service_query") or "").lower()
-
-                # 🔹 STEP 3: COLONOSCOPY-SPECIFIC CONTEXT (ADDED CONDITIONALLY)
                 if is_colonoscopy:
-                    system += (
-                        "\n\nAdditional context for colonoscopy:\n"
-                        "- Screening colonoscopy (CPT 45378): For people 45+ with no symptoms. Often $0 with insurance.\n"
-                        "- Diagnostic colonoscopy (CPT 45380/45385): For symptoms (e.g., bleeding) or follow-up. May require co-pay.\n"
-                        "- Cash prices are for self-pay or uninsured patients.\n"
-                    )
+                    system += "\n\nAdditional context for colonoscopy:\n- Screening (no symptoms) → CPT 45378, often $0 with insurance.\n- Diagnostic (symptoms) → CPT 45380, may require co-pay."
 
                 payload = {
                     "User question": req.message,
                     "ZIP": merged["zipcode"],
                     "Procedure": f"{code_type} {code}",
-                    "Insurance status": insurance_status,
-                    "Payer filter": merged.get("payer_like"),
-                    "Is colonoscopy": is_colonoscopy,
                     "DB results": [
                         {
-                            "hospital": r.get("hospital_name") or "Unknown Facility",
-                            "city": r.get("city") or "",
-                            "state": r.get("state") or "",
+                            "hospital": r.get("hospital_name") or "Unknown",
                             "distance_mi": round(float(r.get("distance_miles", 999)), 1),
                             "cash_price": f"${r['cash_price']:,.0f}" if r.get("cash_price") not in (None, 0) else "Not reported",
                             "insured_price": (
@@ -399,15 +421,12 @@ async def chat_stream(req: ChatRequest, request: Request):
                                 else "Not reported"
                             ),
                             "phone": r.get("phone") or "Not listed",
-                            "address": f"{r.get('city', '')}, {r.get('state', '')}".strip(", ")
+                            "city_state": f"{r.get('city', '')}, {r.get('state', '')}".strip(", ")
                         }
                         for r in results[:5]
-                        if float(r.get("distance_miles", 999)) < 100  # skip outliers
                     ],
-                    "Web supplement": web_notes if used_web else None
                 }
 
-                # Stream response
                 parts: List[str] = []
                 for chunk in stream_llm_to_sse(system, json.dumps(payload, indent=2), parts):
                     yield chunk
@@ -421,9 +440,11 @@ async def chat_stream(req: ChatRequest, request: Request):
                 await log_query(conn, session_id, req.message, intent, used_radius, len(results), used_web, full_answer)
                 yield sse({"type": "final", "used_web_search": used_web})
 
+        # ✅ CRITICAL: Full error visibility
         except Exception as e:
-            logger.exception("Unhandled error")
-            yield sse({"type": "error", "message": f"Server error: {type(e).__name__}"})
+            error_msg = f"{type(e).__name__}: {str(e)}"
+            logger.critical(f"🔥 Unhandled error in chat_stream:\n{traceback.format_exc()}")
+            yield sse({"type": "error", "message": error_msg})
             yield sse({"type": "final", "used_web_search": False})
 
     headers = {
