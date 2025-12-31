@@ -34,7 +34,7 @@ MIN_DB_RESULTS_BEFORE_WEB = int(os.getenv("MIN_DB_RESULTS_BEFORE_WEB", "3"))
 REFINERS_CACHE_TTL_SECONDS = int(os.getenv("REFINERS_CACHE_TTL_SECONDS", "300"))
 
 # ---- Intent override controls (env-driven) ----
-# If enabled, questions that contain cost words + a detected service_query are forced into "price" mode
+# If enabled, questions that contain pricing keywords will be forced into "price" mode
 INTENT_OVERRIDE_FORCE_PRICE_ENABLED = os.getenv("INTENT_OVERRIDE_FORCE_PRICE_ENABLED", "true").lower() in (
     "1",
     "true",
@@ -322,27 +322,54 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ----------------------------
-# Intent override (NEW + TESTABLE)
+# Intent override (FIXED: does not depend on LLM service_query)
 # ----------------------------
+def infer_service_query_from_message(message: str) -> Optional[str]:
+    """
+    Lightweight deterministic service detection so "price" flows work even if the LLM
+    forgets to populate service_query.
+    Expand over time as needed.
+    """
+    msg = (message or "").lower()
+
+    # High-value / common, include colonoscopy explicitly
+    if "colonoscopy" in msg:
+        return "colonoscopy"
+    if "mammogram" in msg or "mammo" in msg:
+        return "mammogram"
+    if "ultrasound" in msg:
+        return "ultrasound"
+    if "ct" in msg or "cat scan" in msg:
+        return "ct scan"
+    if "mri" in msg:
+        return "mri"
+    if "x-ray" in msg or "xray" in msg:
+        return "x-ray"
+    if "blood test" in msg or "lab test" in msg or "labs" in msg:
+        return "lab test"
+    if "office visit" in msg or "doctor visit" in msg:
+        return "office visit"
+
+    return None
+
+
 def should_force_price_mode(message: str, merged: Dict[str, Any]) -> bool:
     """
     Env-driven rule:
-    - If enabled, and the message contains any "cost/price" keywords
-      and service_query is present in merged, force price mode.
+    - If enabled, and the message contains any pricing keywords, force "price" mode.
+    This intentionally does NOT require service_query to be present.
     """
     if not INTENT_OVERRIDE_FORCE_PRICE_ENABLED:
         return False
 
     msg = (message or "").lower()
-    if not (merged.get("service_query") or "").strip():
-        return False
-
     return any(kw in msg for kw in INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS)
 
 
 def apply_intent_override_if_needed(intent: Dict[str, Any], message: str, merged: Dict[str, Any], session_id: str) -> Dict[str, Any]:
     """
     If rule matches, mutate intent["mode"] to "price" and log.
+    Also infer service_query if missing so refiners / CPT resolution can work.
     """
     if should_force_price_mode(message, merged):
         prev = intent.get("mode")
@@ -352,15 +379,26 @@ def apply_intent_override_if_needed(intent: Dict[str, Any], message: str, merged
                 extra={
                     "session_id": session_id,
                     "prev_mode": prev,
-                    "service_query": merged.get("service_query"),
                     "keywords": INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS,
                 },
             )
+
         intent["mode"] = "price"
         intent["intent_overridden"] = True
-        intent["override_reason"] = "cost_keyword_plus_service_query"
+        intent["override_reason"] = "cost_keyword"
+
+        # If the LLM didn't set a service_query, infer it from the raw message
+        if not (merged.get("service_query") or "").strip():
+            inferred = infer_service_query_from_message(message)
+            if inferred:
+                merged["service_query"] = inferred
+                logger.info(
+                    "Service query inferred from message",
+                    extra={"session_id": session_id, "service_query": inferred},
+                )
     else:
         intent["intent_overridden"] = False
+
     return intent
 
 
@@ -609,7 +647,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                 merged = merge_state(state, intent)
                 _normalize_payment_mode(merged)
 
-                # ✅ Apply the override BEFORE mode is used (NEW)
+                # ✅ Apply the override BEFORE mode is used (FIXED)
                 intent = apply_intent_override_if_needed(intent, req.message, merged, session_id)
 
                 mode = intent.get("mode") or "hybrid"
@@ -644,9 +682,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     if not zipcode:
                         msg = "What’s your 5-digit ZIP code?"
                         yield sse({"type": "delta", "text": msg})
-                        await save_message(
-                            conn, session_id, "assistant", msg, {"mode": "clarify_zip", "intent": intent}
-                        )
+                        await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_zip", "intent": intent})
                         await update_session_state(conn, session_id, merged)
                         await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
                         yield sse({"type": "final", "used_web_search": False})
@@ -657,9 +693,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     if not payment_mode:
                         msg = "Are you paying cash (self-pay) or using insurance? If insurance, what carrier (e.g., Aetna)?"
                         yield sse({"type": "delta", "text": msg})
-                        await save_message(
-                            conn, session_id, "assistant", msg, {"mode": "clarify_payment", "intent": intent}
-                        )
+                        await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_payment", "intent": intent})
                         await update_session_state(conn, session_id, merged)
                         await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
                         yield sse({"type": "final", "used_web_search": False})
@@ -669,9 +703,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     if payment_mode == "insurance" and not (merged.get("payer_like") or "").strip():
                         msg = "Which insurance carrier should I match prices for (e.g., Aetna, UnitedHealthcare, Blue Cross)?"
                         yield sse({"type": "delta", "text": msg})
-                        await save_message(
-                            conn, session_id, "assistant", msg, {"mode": "clarify_payer", "intent": intent}
-                        )
+                        await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_payer", "intent": intent})
                         await update_session_state(conn, session_id, merged)
                         await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
                         yield sse({"type": "final", "used_web_search": False})
