@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from openai import OpenAI, OpenAIError
 
 # Python fallback refiners (create app/service_refiners.py from the registry I provided)
-from appservice_refiners import refiners_registry
+from app.service_refiners import refiners_registry
 
 # ----------------------------
 # Config
