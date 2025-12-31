@@ -34,7 +34,7 @@ MIN_DB_RESULTS_BEFORE_WEB = int(os.getenv("MIN_DB_RESULTS_BEFORE_WEB", "3"))
 REFINERS_CACHE_TTL_SECONDS = int(os.getenv("REFINERS_CACHE_TTL_SECONDS", "300"))
 
 # ---- Intent override controls (env-driven) ----
-# If enabled, questions that contain pricing keywords will be forced into "price" mode
+# If enabled, questions that contain pricing keywords will be forced into "price" mode.
 INTENT_OVERRIDE_FORCE_PRICE_ENABLED = os.getenv("INTENT_OVERRIDE_FORCE_PRICE_ENABLED", "true").lower() in (
     "1",
     "true",
@@ -42,7 +42,7 @@ INTENT_OVERRIDE_FORCE_PRICE_ENABLED = os.getenv("INTENT_OVERRIDE_FORCE_PRICE_ENA
     "y",
     "on",
 )
-# Comma-separated keywords or phrases (case-insensitive) that trigger pricing override
+# Comma-separated keywords or phrases (case-insensitive) that trigger pricing override.
 INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS = [
     s.strip().lower()
     for s in os.getenv(
@@ -51,6 +51,16 @@ INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS = [
     ).split(",")
     if s.strip()
 ]
+
+# If enabled, for new pricing questions we will NOT reuse old ZIP/payment fields from session state
+# unless the user includes them in the current message.
+RESET_GATING_FIELDS_ON_NEW_PRICE_QUESTION = os.getenv("RESET_GATING_FIELDS_ON_NEW_PRICE_QUESTION", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+)
 
 # ----------------------------
 # App
@@ -187,7 +197,13 @@ async def get_or_create_session(conn: asyncpg.Connection, session_id: Optional[s
     return session_id, {}
 
 
-async def save_message(conn: asyncpg.Connection, session_id: str, role: str, content: str, metadata: Optional[dict] = None):
+async def save_message(
+    conn: asyncpg.Connection,
+    session_id: str,
+    role: str,
+    content: str,
+    metadata: Optional[dict] = None,
+):
     await conn.execute(
         "INSERT INTO public.chat_message (session_id, role, content, metadata) VALUES ($1,$2,$3,$4::jsonb)",
         session_id,
@@ -256,7 +272,17 @@ Notes:
 
 def merge_state(state: Dict[str, Any], intent: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(state or {})
-    for k in ["zipcode", "radius_miles", "payer_like", "plan_like", "payment_mode", "service_query", "code_type", "code", "cash_only"]:
+    for k in [
+        "zipcode",
+        "radius_miles",
+        "payer_like",
+        "plan_like",
+        "payment_mode",
+        "service_query",
+        "code_type",
+        "code",
+        "cash_only",
+    ]:
         v = intent.get(k)
         if v is not None and v != "":
             out[k] = v
@@ -322,24 +348,22 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ----------------------------
-# Intent override (FIXED: does not depend on LLM service_query)
+# Intent override + deterministic service inference + gating reset
 # ----------------------------
 def infer_service_query_from_message(message: str) -> Optional[str]:
     """
     Lightweight deterministic service detection so "price" flows work even if the LLM
-    forgets to populate service_query.
-    Expand over time as needed.
+    forgets to populate service_query. Expand over time as needed.
     """
     msg = (message or "").lower()
 
-    # High-value / common, include colonoscopy explicitly
     if "colonoscopy" in msg:
         return "colonoscopy"
     if "mammogram" in msg or "mammo" in msg:
         return "mammogram"
     if "ultrasound" in msg:
         return "ultrasound"
-    if "ct" in msg or "cat scan" in msg:
+    if "cat scan" in msg or "ct scan" in msg or (" ct " in f" {msg} "):
         return "ct scan"
     if "mri" in msg:
         return "mri"
@@ -361,12 +385,16 @@ def should_force_price_mode(message: str, merged: Dict[str, Any]) -> bool:
     """
     if not INTENT_OVERRIDE_FORCE_PRICE_ENABLED:
         return False
-
     msg = (message or "").lower()
     return any(kw in msg for kw in INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS)
 
 
-def apply_intent_override_if_needed(intent: Dict[str, Any], message: str, merged: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+def apply_intent_override_if_needed(
+    intent: Dict[str, Any],
+    message: str,
+    merged: Dict[str, Any],
+    session_id: str,
+) -> Dict[str, Any]:
     """
     If rule matches, mutate intent["mode"] to "price" and log.
     Also infer service_query if missing so refiners / CPT resolution can work.
@@ -376,18 +404,13 @@ def apply_intent_override_if_needed(intent: Dict[str, Any], message: str, merged
         if prev != "price":
             logger.info(
                 "Intent override applied: forcing mode=price",
-                extra={
-                    "session_id": session_id,
-                    "prev_mode": prev,
-                    "keywords": INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS,
-                },
+                extra={"session_id": session_id, "prev_mode": prev, "keywords": INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS},
             )
 
         intent["mode"] = "price"
         intent["intent_overridden"] = True
         intent["override_reason"] = "cost_keyword"
 
-        # If the LLM didn't set a service_query, infer it from the raw message
         if not (merged.get("service_query") or "").strip():
             inferred = infer_service_query_from_message(message)
             if inferred:
@@ -400,6 +423,35 @@ def apply_intent_override_if_needed(intent: Dict[str, Any], message: str, merged
         intent["intent_overridden"] = False
 
     return intent
+
+
+def message_contains_zip(message: str) -> bool:
+    msg = (message or "").strip()
+    tokens = [t.strip(",.()[]{}") for t in msg.split()]
+    return any(len(t) == 5 and t.isdigit() for t in tokens)
+
+
+def message_contains_payment_info(message: str) -> bool:
+    msg = (message or "").lower()
+    cash_terms = ["cash", "self pay", "self-pay", "out of pocket", "out-of-pocket", "uninsured", "no insurance"]
+    ins_terms = ["insurance", "insured", "copay", "coinsurance", "deductible"]
+    return any(t in msg for t in cash_terms) or any(t in msg for t in ins_terms)
+
+
+def reset_gating_fields_for_new_price_question(message: str, merged: Dict[str, Any]) -> None:
+    """
+    Your desired behavior:
+    - If the current message does NOT include ZIP or payment info,
+      clear those fields so the assistant asks again (instead of reusing session memory).
+    """
+    if not message_contains_zip(message):
+        merged.pop("zipcode", None)
+
+    if not message_contains_payment_info(message):
+        merged.pop("payment_mode", None)
+        merged.pop("payer_like", None)
+        merged.pop("plan_like", None)
+        merged.pop("cash_only", None)
 
 
 # ----------------------------
@@ -647,10 +699,33 @@ async def chat_stream(req: ChatRequest, request: Request):
                 merged = merge_state(state, intent)
                 _normalize_payment_mode(merged)
 
-                # ✅ Apply the override BEFORE mode is used (FIXED)
+                # ✅ Apply override BEFORE mode is used (forces pricing flow on cost questions)
                 intent = apply_intent_override_if_needed(intent, req.message, merged, session_id)
-
                 mode = intent.get("mode") or "hybrid"
+
+                # ✅ NEW: If this is a cost/pricing question, do NOT reuse prior ZIP/payment from session
+                # unless the user provided them in the current message.
+                if RESET_GATING_FIELDS_ON_NEW_PRICE_QUESTION and mode in ["price", "hybrid"] and should_force_price_mode(req.message, merged):
+                    before = {
+                        "zipcode": merged.get("zipcode"),
+                        "payment_mode": merged.get("payment_mode"),
+                        "payer_like": merged.get("payer_like"),
+                        "plan_like": merged.get("plan_like"),
+                        "cash_only": merged.get("cash_only"),
+                    }
+                    reset_gating_fields_for_new_price_question(req.message, merged)
+                    after = {
+                        "zipcode": merged.get("zipcode"),
+                        "payment_mode": merged.get("payment_mode"),
+                        "payer_like": merged.get("payer_like"),
+                        "plan_like": merged.get("plan_like"),
+                        "cash_only": merged.get("cash_only"),
+                    }
+                    if before != after:
+                        logger.info(
+                            "Reset gating fields for new price question (message lacked ZIP/payment details)",
+                            extra={"session_id": session_id, "before": before, "after": after},
+                        )
 
                 # Load refiners and match to current service_query (state-aware)
                 refiners_doc = await get_refiners(conn)
