@@ -769,7 +769,7 @@ async def price_lookup_nearest_facilities(
                     pick.negotiated_dollar,
                     pick.estimated_amount,
                     pick.standard_charge_cash,
-                    pick.carrier_name,
+                    pick.payer_name,
                     pick.plan_name
                 FROM public.hospitals h
                 LEFT JOIN LATERAL (
@@ -777,13 +777,13 @@ async def price_lookup_nearest_facilities(
                         nr.negotiated_dollar,
                         nr.estimated_amount,
                         nr.standard_charge_cash,
-                        ip.carrier_name,
+                        ip.payer_name,
                         ip.plan_name
                     FROM public.negotiated_rates nr
                     JOIN public.insurance_plans ip ON ip.id = nr.plan_id
                     WHERE nr.hospital_id = h.id
                       AND nr.service_id = ANY($3::int[])
-                      AND ip.carrier_name ILIKE $4
+                      AND ip.payer_name ILIKE $4
                       AND ip.plan_name ILIKE $5
                     ORDER BY
                         nr.negotiated_dollar NULLS LAST,
