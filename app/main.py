@@ -359,13 +359,25 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
         for k, v in carrier_map.items():
             if k in ml:
                 return v
+
+        # Filter out common filler words so we don't accidentally treat
+        # "I have insurance" or "use insurance" as the carrier name "I Have Insurance".
+        clean = m
+        for stop in ["i have", "i use", "use", "with", "insurance", "my", "have", "paying"]:
+            # Word-boundary aware case-insensitive replacement
+            clean = re.sub(r'\b' + re.escape(stop) + r'\b', '', clean, flags=re.IGNORECASE)
+
+        clean = clean.strip()
+        tokens = re.findall(r"[a-zA-Z]+", clean)
+
         # if the user replies with just a single word, treat it as a carrier candidate
-        tokens = re.findall(r"[a-zA-Z]+", m)
         if len(tokens) == 1 and len(tokens[0]) >= 3:
             return tokens[0].title()
-        # two-word carrier (e.g., "Blue Cross")
+        
+        # two-word carrier (e.g., "Harvard Pilgrim")
         if 2 <= len(tokens) <= 3:
             return " ".join([t.title() for t in tokens])
+            
         return None
 
     # 1) If we are explicitly awaiting ZIP, only accept ZIP (or a cancel/new question handled by LLM below).
@@ -446,8 +458,8 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
 
     # 5) Otherwise fall back to LLM-based intent extraction (general Q&A, non-price).
     try:
-        resp = oai.chat.completions.create(
-            model=INTENT_MODEL,
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
             temperature=0,
             messages=[
                 {"role": "system", "content": "You extract intent for healthcare Q&A and price lookup. Be conservative."},
