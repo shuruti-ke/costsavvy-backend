@@ -1,10 +1,10 @@
 # app/main.py
 import os
 import json
+import re
 import uuid
 import time
 import logging
-import re
 from typing import Optional, Any, Dict, List, Tuple
 
 import asyncpg
@@ -294,96 +294,165 @@ def _normalize_payment_mode(merged: Dict[str, Any]) -> None:
 
 async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Guardrail: if message is ZIP-only and we already have service_query in state,
-    treat it as continuation of pricing flow.
+    Deterministic session-aware intent extraction.
+
+    Key goals:
+      - Keep the user in the pricing flow once they started it.
+      - Ask for ZIP first if missing (geo-first).
+      - Accept short replies like "Cash", "Self pay", "Insurance", "Aetna" as continuations.
+      - Allow the user to change ZIP/payment/payer mid-session and rerun pricing accordingly.
     """
+    msg = (message or "").strip()
+    msg_l = msg.lower()
 
-    # If we previously asked a clarification (ZIP or payment), treat short replies as continuations.
-    awaiting = (state or {}).get("_awaiting")
-    msg_l = (message or "").strip().lower()
+    # Pull existing context
+    st = state or {}
+    awaiting = st.get("_awaiting")
+    have_service = bool(st.get("service_query") or st.get("code"))
+    have_zip = bool(st.get("zipcode"))
 
+    # 0) ZIP detection anywhere in the message
+    zip_match = re.search(r"\b(\d{5})\b", msg)
+    if zip_match:
+        z = zip_match.group(1)
+        # If we already have a service in session, treat this as continuation of pricing flow.
+        if have_service or awaiting in {"zip", "payment", "payer"}:
+            return {
+                "mode": "price",
+                "zipcode": z,
+                "service_query": st.get("service_query"),
+                "code_type": st.get("code_type"),
+                "code": st.get("code"),
+                "payment_mode": st.get("payment_mode"),
+                "payer_like": st.get("payer_like"),
+                "plan_like": st.get("plan_like"),
+                "clarifying_question": None,
+            }
+
+    # Helpers
+    cash_terms = {
+        "cash", "self pay", "self-pay", "selfpay", "out of pocket", "oop",
+        "paying cash", "pay cash", "cash pay", "self pay patient", "selfpay patient",
+    }
+    insurance_terms = {"insurance", "insured", "use insurance", "with insurance"}
+
+    carrier_map = {
+        "aetna": "Aetna",
+        "cigna": "Cigna",
+        "anthem": "Anthem",
+        "blue cross": "Blue Cross Blue Shield",
+        "bcbs": "Blue Cross Blue Shield",
+        "united": "UnitedHealthcare",
+        "uhc": "UnitedHealthcare",
+        "humana": "Humana",
+        "kaiser": "Kaiser Permanente",
+        "molina": "Molina",
+        "centene": "Centene",
+        "wellcare": "Wellcare",
+        "medicaid": "Medicaid",
+        "medicare": "Medicare",
+    }
+
+    def extract_carrier(m: str) -> Optional[str]:
+        ml = (m or "").lower()
+        # direct map matches
+        for k, v in carrier_map.items():
+            if k in ml:
+                return v
+        # if the user replies with just a single word, treat it as a carrier candidate
+        tokens = re.findall(r"[a-zA-Z]+", m)
+        if len(tokens) == 1 and len(tokens[0]) >= 3:
+            return tokens[0].title()
+        # two-word carrier (e.g., "Blue Cross")
+        if 2 <= len(tokens) <= 3:
+            return " ".join([t.title() for t in tokens])
+        return None
+
+    # 1) If we are explicitly awaiting ZIP, only accept ZIP (or a cancel/new question handled by LLM below).
+    if awaiting == "zip":
+        # If they didn't provide a ZIP, keep asking.
+        return {"mode": "clarify", "clarifying_question": "What’s your 5-digit ZIP code?"}
+
+    # 2) If we are awaiting payment, accept cash/insurance quickly.
     if awaiting == "payment":
-        # Common cash synonyms
-        cash_terms = {"cash", "self pay", "self-pay", "selfpay", "out of pocket", "oop", "paying cash", "pay cash", "cash pay"}
         if any(t in msg_l for t in cash_terms):
             return {
                 "mode": "price",
-                "zipcode": state.get("zipcode"),
-                "radius_miles": None,
+                "zipcode": st.get("zipcode"),
+                "service_query": st.get("service_query"),
+                "code_type": st.get("code_type"),
+                "code": st.get("code"),
+                "payment_mode": "cash",
                 "payer_like": None,
                 "plan_like": None,
-                "payment_mode": "cash",
-                "service_query": state.get("service_query"),
-                "code_type": state.get("code_type"),
-                "code": state.get("code"),
                 "clarifying_question": None,
                 "cash_only": True,
             }
 
-        # Insurance mention or carrier
-        if "insurance" in msg_l or any(k in msg_l for k in ["aetna", "cigna", "anthem", "blue", "bcbs", "united", "uhc", "humana", "kaiser", "molina", "centene", "wellcare"]):
-            # crude carrier extraction: keep the original casing from message where possible
-            payer_like = None
-            # Try common carriers first
-            carrier_map = {
-                "aetna": "Aetna",
-                "cigna": "Cigna",
-                "anthem": "Anthem",
-                "bcbs": "Blue Cross Blue Shield",
-                "blue cross": "Blue Cross Blue Shield",
-                "blue shield": "Blue Cross Blue Shield",
-                "united": "UnitedHealthcare",
-                "uhc": "UnitedHealthcare",
-                "humana": "Humana",
-                "kaiser": "Kaiser Permanente",
-                "molina": "Molina",
-                "centene": "Centene",
-                "wellcare": "WellCare",
-            }
-            for k, v in carrier_map.items():
-                if k in msg_l:
-                    payer_like = v
-                    break
-            # Fallback: take last capitalized word sequence (best-effort)
-            if not payer_like:
-                m = re.findall(r"\b[A-Z][A-Za-z&]+(?:\s+[A-Z][A-Za-z&]+)*\b", message or "")
-                payer_like = m[-1] if m else None
-
+        if any(t in msg_l for t in insurance_terms) or extract_carrier(msg):
+            payer_like = extract_carrier(msg)
             return {
                 "mode": "price",
-                "zipcode": state.get("zipcode"),
-                "radius_miles": None,
+                "zipcode": st.get("zipcode"),
+                "service_query": st.get("service_query"),
+                "code_type": st.get("code_type"),
+                "code": st.get("code"),
+                "payment_mode": "insurance",
                 "payer_like": payer_like,
                 "plan_like": None,
-                "payment_mode": "insurance",
-                "service_query": state.get("service_query"),
-                "code_type": state.get("code_type"),
-                "code": state.get("code"),
                 "clarifying_question": None,
                 "cash_only": False,
             }
-    if _is_zip_only_message(message) and (state or {}).get("service_query"):
-        return {
-            "mode": "price",
-            "zipcode": message.strip(),
-            "radius_miles": None,
-            "payer_like": None,
-            "plan_like": None,
-            "payment_mode": None,
-            "service_query": state.get("service_query"),
-            "code_type": state.get("code_type"),
-            "code": state.get("code"),
-            "clarifying_question": None,
-            "cash_only": state.get("cash_only", False),
-        }
 
+        return {"mode": "clarify", "clarifying_question": "Are you paying cash (self-pay) or using insurance? If insurance, what carrier (e.g., Aetna)?"}
+
+    # 3) Session-aware continuation even when not awaiting:
+    # If the session already has service + zip, treat "cash"/"insurance"/carrier-only as updates and rerun pricing.
+    if have_service and have_zip:
+        if any(t in msg_l for t in cash_terms):
+            return {
+                "mode": "price",
+                "zipcode": st.get("zipcode"),
+                "service_query": st.get("service_query"),
+                "code_type": st.get("code_type"),
+                "code": st.get("code"),
+                "payment_mode": "cash",
+                "payer_like": None,
+                "plan_like": None,
+                "clarifying_question": None,
+                "cash_only": True,
+            }
+
+        carrier = extract_carrier(msg)
+        if any(t in msg_l for t in insurance_terms) or carrier:
+            return {
+                "mode": "price",
+                "zipcode": st.get("zipcode"),
+                "service_query": st.get("service_query"),
+                "code_type": st.get("code_type"),
+                "code": st.get("code"),
+                "payment_mode": "insurance",
+                "payer_like": carrier or st.get("payer_like"),
+                "plan_like": None,
+                "clarifying_question": None,
+                "cash_only": False,
+            }
+
+    # 4) If the user is asking a new price question but we lack ZIP, we will ask for ZIP (geo-first).
+    inferred_service = infer_service_query_from_message(msg)
+    if inferred_service and not have_zip:
+        # Force clarifying ZIP instead of letting the LLM ask for payment first.
+        return {"mode": "price", "service_query": inferred_service, "clarifying_question": None}
+
+    # 5) Otherwise fall back to LLM-based intent extraction (general Q&A, non-price).
     try:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
+        resp = oai.chat.completions.create(
+            model=INTENT_MODEL,
+            temperature=0,
             messages=[
                 {"role": "system", "content": "You extract intent for healthcare Q&A and price lookup. Be conservative."},
                 {"role": "system", "content": INTENT_RULES},
-                {"role": "user", "content": json.dumps({"message": message, "session_state": state})},
+                {"role": "user", "content": json.dumps({"message": msg, "session_state": st})},
             ],
             timeout=10,
         )
@@ -393,10 +462,6 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
         logger.warning(f"Intent extraction failed: {e}")
         return {"mode": "clarify", "clarifying_question": "What 5-digit ZIP code should I search near?"}
 
-
-# ----------------------------
-# Intent override + deterministic service inference + gating reset
-# ----------------------------
 def infer_service_query_from_message(message: str) -> Optional[str]:
     msg = (message or "").lower()
     if "colonoscopy" in msg:
