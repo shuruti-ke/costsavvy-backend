@@ -4,6 +4,7 @@ import json
 import uuid
 import time
 import logging
+import re
 from typing import Optional, Any, Dict, List, Tuple
 
 import asyncpg
