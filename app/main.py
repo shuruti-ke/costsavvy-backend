@@ -631,11 +631,55 @@ async def get_service_id(conn: asyncpg.Connection, code_type: str, code: str) ->
     return int(row["id"]) if row else None
 
 
+async def get_service_ids(conn: asyncpg.Connection, service_query: str, code_type: Optional[str] = None, code: Optional[str] = None, limit: int = 25) -> List[int]:
+    """Return a list of candidate service_ids for a user query.
+
+    We prefer keyword matches in `services` (description/explanations), and we also include the
+    explicitly-resolved (code_type, code) id when provided.
+    """
+    q = (service_query or "").strip()
+    ids: List[int] = []
+
+    # 1) Keyword matches
+    if q:
+        rows = await conn.fetch(
+            """
+            SELECT id
+            FROM public.services
+            WHERE (cpt_explanation ILIKE '%' || $1 || '%'
+                OR service_description ILIKE '%' || $1 || '%'
+                OR patient_summary ILIKE '%' || $1 || '%')
+            ORDER BY id
+            LIMIT $2
+            """,
+            q,
+            limit,
+        )
+        ids.extend([int(r["id"]) for r in rows if r and r["id"] is not None])
+
+    # 2) Explicit code match (ensures at least one id if the keyword search is sparse)
+    if code_type and code:
+        sid = await get_service_id(conn, code_type, code)
+        if sid is not None:
+            ids.append(int(sid))
+
+    # de-dup, preserve order
+    out: List[int] = []
+    seen = set()
+    for i in ids:
+        if i not in seen:
+            out.append(i)
+            seen.add(i)
+    return out
+
+
+
 async def price_lookup_nearest_facilities(
     conn: asyncpg.Connection,
     zipcode: str,
     code_type: str,
     code: str,
+    service_query: str,
     payment_mode: str,
     payer_like: Optional[str],
     plan_like: Optional[str],
@@ -654,8 +698,8 @@ async def price_lookup_nearest_facilities(
         return []
 
     zlat, zlon = float(z["latitude"]), float(z["longitude"])
-    service_id = await get_service_id(conn, code_type, code)
-    if not service_id:
+    service_ids = await get_service_ids(conn, service_query=service_query, code_type=code_type, code=code, limit=25)
+    if not service_ids:
         return []
 
     # We expand radius until we have enough rows, then return the best set.
@@ -689,7 +733,7 @@ async def price_lookup_nearest_facilities(
                         MIN(estimated_amount) AS estimated_amount,
                         MIN(standard_charge_gross) AS standard_charge_gross
                     FROM public.negotiated_rates
-                    WHERE hospital_id = h.id AND service_id = $3
+                    WHERE hospital_id = h.id AND service_id = ANY($3::int[])
                 ) nr ON TRUE
                 WHERE h.latitude IS NOT NULL AND h.longitude IS NOT NULL
                   AND (3959 * acos(
@@ -700,7 +744,7 @@ async def price_lookup_nearest_facilities(
                 ORDER BY distance_miles ASC
                 LIMIT $5
                 """,
-                zlat, zlon, service_id, r, limit,
+                zlat, zlon, service_ids, r, limit,
             )
         else:
             payer_pat = f"%{payer_like}%" if payer_like else "%"
@@ -738,7 +782,7 @@ async def price_lookup_nearest_facilities(
                     FROM public.negotiated_rates nr
                     JOIN public.insurance_plans ip ON ip.id = nr.plan_id
                     WHERE nr.hospital_id = h.id
-                      AND nr.service_id = $3
+                      AND nr.service_id = ANY($3::int[])
                       AND ip.carrier_name ILIKE $4
                       AND ip.plan_name ILIKE $5
                     ORDER BY
@@ -756,7 +800,7 @@ async def price_lookup_nearest_facilities(
                 ORDER BY distance_miles ASC
                 LIMIT $7
                 """,
-                zlat, zlon, service_id, payer_pat, plan_pat, r, limit,
+                zlat, zlon, service_ids, payer_pat, plan_pat, r, limit,
             )
 
         last_rows = [dict(rr) for rr in rows] if rows else last_rows
@@ -799,6 +843,7 @@ async def price_lookup_progressive(
     zipcode: str,
     code_type: str,
     code: str,
+    service_query: str,
     payer_like: Optional[str],
     plan_like: Optional[str],
     payment_mode: str,
@@ -811,6 +856,7 @@ async def price_lookup_progressive(
         zipcode=zipcode,
         code_type=code_type,
         code=code,
+        service_query=service_query,
         payment_mode=payment_mode,
         payer_like=payer_like,
         plan_like=plan_like,
@@ -1235,53 +1281,37 @@ async def chat_stream(req: ChatRequest, request: Request):
                 yield sse({"type": "session", "session_id": session_id})
                 await save_message(conn, session_id, "user", req.message)
 
+                # 1) Intent + state merge
                 intent = await extract_intent(req.message, state)
                 merged = merge_state(state, intent)
                 _normalize_payment_mode(merged)
-                # Clear awaiting flags once the user provides the missing info
-                if merged.get('_awaiting') == 'zip' and merged.get('zipcode'):
-                    merged.pop('_awaiting', None)
-                if merged.get('_awaiting') == 'payment' and merged.get('payment_mode'):
-                    merged.pop('_awaiting', None)
 
-                # Force pricing mode when cost keywords appear
+                # 2) Force/override pricing intent when we are mid-flow
                 intent = apply_intent_override_if_needed(intent, req.message, merged, session_id)
                 mode = intent.get("mode") or "hybrid"
 
-                # NEW: if this is a (forced) pricing question, only accept ZIP/payment if present in the message
-                if RESET_GATING_FIELDS_ON_NEW_PRICE_QUESTION and mode in ["price", "hybrid"] and should_force_price_mode(req.message, merged):
-                    before = {
-                        "zipcode": merged.get("zipcode"),
-                        "payment_mode": merged.get("payment_mode"),
-                        "payer_like": merged.get("payer_like"),
-                        "plan_like": merged.get("plan_like"),
-                        "cash_only": merged.get("cash_only"),
-                    }
-                    reset_gating_fields_for_new_price_question(req.message, merged)
-                    after = {
-                        "zipcode": merged.get("zipcode"),
-                        "payment_mode": merged.get("payment_mode"),
-                        "payer_like": merged.get("payer_like"),
-                        "plan_like": merged.get("plan_like"),
-                        "cash_only": merged.get("cash_only"),
-                    }
-                    if before != after:
-                        logger.info(
-                            "Reset gating fields for new price question (message lacked ZIP/payment details)",
-                            extra={"session_id": session_id, "before": before, "after": after},
-                        )
+                # 3) OPTIONAL: reset gating fields only when this message looks like a NEW pricing question
+                # (Never reset while we are awaiting ZIP/payment/payer)
+                if (
+                    RESET_GATING_FIELDS_ON_NEW_PRICE_QUESTION
+                    and mode in ["price", "hybrid"]
+                    and not (merged.get("_awaiting") in {"zip", "payment", "payer"})
+                ):
+                    # Only reset if the message itself contains a price keyword AND a service hint
+                    msg_l = (req.message or "").lower()
+                    inferred_service = infer_service_query_from_message(req.message)
+                    if inferred_service and any(kw in msg_l for kw in INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS):
+                        reset_gating_fields_for_new_price_question(req.message, merged)
 
-                # Load refiners and match to current service_query (state-aware)
+                # 4) Load refiners + apply choice (if user replies 1/2/3)
                 refiners_doc = await get_refiners(conn)
                 refiner = match_refiner(merged.get("service_query") or "", refiners_doc)
-
-                # If user replies with "1/2/3", apply refiner choice
                 merged = apply_refiner_choice(req.message, merged, refiner)
-
-                # Apply preview code when appropriate
                 merged = maybe_apply_preview_code(merged, refiner)
 
+                # ----------------------------
                 # GENERAL mode
+                # ----------------------------
                 if mode == "general":
                     system = "You are CostSavvy.health. Answer clearly in plain language. Avoid medical advice."
                     parts: List[str] = []
@@ -1294,8 +1324,17 @@ async def chat_stream(req: ChatRequest, request: Request):
                     yield sse({"type": "final", "used_web_search": False})
                     return
 
-                # PRICE / HYBRID mode
+                # ----------------------------
+                # PRICE / HYBRID mode (deterministic, DB-first)
+                # ----------------------------
                 if mode in ["price", "hybrid"]:
+                    # Gate 0: need a service (or a code)
+                    if not (merged.get("service_query") or "").strip() and not (merged.get("code_type") and merged.get("code")):
+                        # Try deterministic inference for common services
+                        inferred = infer_service_query_from_message(req.message)
+                        if inferred:
+                            merged["service_query"] = inferred
+
                     # Gate 1: ZIP required
                     zipcode = merged.get("zipcode")
                     if not zipcode:
@@ -1307,8 +1346,10 @@ async def chat_stream(req: ChatRequest, request: Request):
                         await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
                         yield sse({"type": "final", "used_web_search": False})
                         return
+                    if merged.get("_awaiting") == "zip":
+                        merged.pop("_awaiting", None)
 
-                    # Gate 2: payment mode required (cash vs insurance)
+                    # Gate 2: payment mode required
                     payment_mode = merged.get("payment_mode")
                     if not payment_mode:
                         merged["_awaiting"] = "payment"
@@ -1319,9 +1360,15 @@ async def chat_stream(req: ChatRequest, request: Request):
                         await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
                         yield sse({"type": "final", "used_web_search": False})
                         return
+                    if merged.get("_awaiting") == "payment":
+                        merged.pop("_awaiting", None)
 
-                    # If insurance mode but payer not specified, ask for it
+                    _normalize_payment_mode(merged)
+                    payment_mode = merged.get("payment_mode") or payment_mode
+
+                    # Gate 3 (insurance): require payer
                     if payment_mode == "insurance" and not (merged.get("payer_like") or "").strip():
+                        merged["_awaiting"] = "payer"
                         msg = "Which insurance carrier should I match prices for (e.g., Aetna, UnitedHealthcare, Blue Cross)?"
                         yield sse({"type": "delta", "text": msg})
                         await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_payer", "intent": intent})
@@ -1329,8 +1376,10 @@ async def chat_stream(req: ChatRequest, request: Request):
                         await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
                         yield sse({"type": "final", "used_web_search": False})
                         return
+                    if merged.get("_awaiting") == "payer" and (merged.get("payer_like") or "").strip():
+                        merged.pop("_awaiting", None)
 
-                    # If a refiner requires choice before pricing and user has not chosen yet, ask now
+                    # Refiners: ask for choice before pricing when required
                     if refiner and refiner.get("require_choice_before_pricing") is True and not merged.get("refiner_choice"):
                         msg = get_refinement_prompt(refiner)
                         yield sse({"type": "delta", "text": msg})
@@ -1340,23 +1389,15 @@ async def chat_stream(req: ChatRequest, request: Request):
                         yield sse({"type": "final", "used_web_search": False})
                         return
 
-                    # Ensure payer/plan are cleared for cash
-                    _normalize_payment_mode(merged)
-                # Clear awaiting flags once the user provides the missing info
-                if merged.get('_awaiting') == 'zip' and merged.get('zipcode'):
-                    merged.pop('_awaiting', None)
-                if merged.get('_awaiting') == 'payment' and merged.get('payment_mode'):
-                    merged.pop('_awaiting', None)
-
-                    # Resolve code if still missing
+                    # Resolve code if needed
                     if not (merged.get("code_type") and merged.get("code")):
                         resolved = await resolve_service_code(conn, merged)
                         if resolved:
                             merged["code_type"], merged["code"] = resolved
 
-                    # If still no service or code, ask for service
+                    # If still no service, ask
                     if not (merged.get("service_query") or "").strip() and not (merged.get("code_type") and merged.get("code")):
-                        msg = "What service are you pricing (for example: MRI brain, chest x-ray, office visit, lab test)?"
+                        msg = "What service are you pricing (for example: colonoscopy, MRI brain, chest x-ray, office visit, lab test)?"
                         yield sse({"type": "delta", "text": msg})
                         await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_service", "intent": intent})
                         await update_session_state(conn, session_id, merged)
@@ -1364,7 +1405,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                         yield sse({"type": "final", "used_web_search": False})
                         return
 
-                    # If code still missing after resolution, ask for detail
+                    # If code is still missing, ask for more detail
                     if not (merged.get("code_type") and merged.get("code")):
                         msg = "I can price this, but I need a bit more detail on the exact service. What exactly is being ordered?"
                         yield sse({"type": "delta", "text": msg})
@@ -1374,28 +1415,25 @@ async def chat_stream(req: ChatRequest, request: Request):
                         yield sse({"type": "final", "used_web_search": False})
                         return
 
-                    # --- PRICED LOOKUP (progressive radius) ---
+                    # ---- PRICED LOOKUP (geo-first, progressive radius) ----
                     results, used_max_radius = await price_lookup_progressive(
                         conn,
                         merged["zipcode"],
                         merged["code_type"],
                         merged["code"],
+                        merged.get("service_query") or "",
                         merged.get("payer_like"),
                         merged.get("plan_like"),
                         merged.get("payment_mode") or "cash",
                     )
 
-
-
-                    # --- ALWAYS fetch at least 5 hospitals for display (even if pricing is missing) ---
-                    nearby_hospitals = []
+                    # Always fetch at least 5 facilities for display
                     try:
                         nearby_hospitals = await get_nearby_hospitals(conn, merged["zipcode"], limit=MIN_FACILITIES_TO_DISPLAY)
                     except Exception as e:
                         logger.warning(f"Nearby hospitals lookup failed: {e}")
                         nearby_hospitals = []
 
-                    # Build deterministic facility response
                     facility_text, facility_payload = build_facility_block(
                         service_query=merged.get("service_query") or "this service",
                         payment_mode=merged.get("payment_mode") or "cash",
@@ -1403,7 +1441,6 @@ async def chat_stream(req: ChatRequest, request: Request):
                         fallback_hospitals=nearby_hospitals,
                     )
 
-                    # Send structured results to UI first (priced + facilities)
                     yield sse(
                         {
                             "type": "results",
@@ -1425,8 +1462,6 @@ async def chat_stream(req: ChatRequest, request: Request):
                             },
                         }
                     )
-
-                    # Stream the facility text response (not generic LLM)
                     yield sse({"type": "delta", "text": facility_text})
 
                     full_answer = facility_text
@@ -1445,12 +1480,12 @@ async def chat_stream(req: ChatRequest, request: Request):
                     )
                     await update_session_state(conn, session_id, merged)
 
-                    used_radius = used_max_radius
                     used_web = len(results) < MIN_DB_RESULTS_BEFORE_WEB
-                    await log_query(conn, session_id, req.message, intent, used_radius, len(results), used_web, full_answer)
+                    await log_query(conn, session_id, req.message, intent, used_max_radius, len(results), used_web, full_answer)
                     yield sse({"type": "final", "used_web_search": used_web})
                     return
 
+                # Fallback: ask to rephrase (should be rare)
                 msg = "I’m not sure what you need. Can you rephrase?"
                 yield sse({"type": "delta", "text": msg})
                 await save_message(conn, session_id, "assistant", msg, {"mode": "fallback", "intent": intent})
@@ -1468,5 +1503,6 @@ async def chat_stream(req: ChatRequest, request: Request):
 
 
 @app.post("/chat")
+
 async def chat(_req: ChatRequest, _request: Request):
     raise HTTPException(410, detail="Use /chat_stream")
