@@ -417,21 +417,42 @@ async def resolve_service_code(conn: asyncpg.Connection, merged: Dict[str, Any])
     if not q:
         return None
 
+    # 1) Canonical lookup from `services`
     rows = await conn.fetch(
         """
         SELECT code_type, code
         FROM public.services
         WHERE (cpt_explanation ILIKE '%' || $1 || '%'
-            OR service_description ILIKE '%' || $1 || '%')
+            OR service_description ILIKE '%' || $1 || '%'
+            OR patient_summary ILIKE '%' || $1 || '%')
         ORDER BY code_type, code
         LIMIT 5
         """,
         q,
     )
-    if not rows:
-        return None
-    return rows[0]["code_type"], rows[0]["code"]
+    if rows:
+        return rows[0]["code_type"], rows[0]["code"]
 
+    # 2) Fallback: staged hospital file often has the right CPT even when `services` lacks the keyword
+    srows = await conn.fetch(
+        """
+        SELECT code_type, code, COUNT(*) AS n
+        FROM public.stg_hospital_rates
+        WHERE code_type IS NOT NULL AND code IS NOT NULL
+          AND (
+                service_description ILIKE '%' || $1 || '%'
+             OR code ILIKE '%' || $1 || '%'
+          )
+        GROUP BY code_type, code
+        ORDER BY n DESC, code_type, code
+        LIMIT 5
+        """,
+        q,
+    )
+    if srows:
+        return srows[0]["code_type"], srows[0]["code"]
+
+    return None
 
 async def price_lookup_v3(
     conn: asyncpg.Connection,
@@ -461,6 +482,244 @@ async def price_lookup_v3(
     return [dict(r) for r in rows]
 
 
+async def price_lookup_staging(
+    conn: asyncpg.Connection,
+    zipcode: str,
+    service_query: str,
+    payer_like: Optional[str],
+    plan_like: Optional[str],
+    limit: int = 25,
+) -> List[Dict[str, Any]]:
+    """
+    DB-first fallback when we cannot resolve a code or the pricing function returns no rows.
+    It searches `stg_hospital_rates` by service_description and joins to `hospitals` + `zip_locations`
+    to compute distance (when possible). Returns a row shape compatible with `build_facility_block`.
+    """
+    q = (service_query or "").strip()
+    if not q:
+        return []
+
+    z = await conn.fetchrow(
+        "SELECT latitude, longitude FROM public.zip_locations WHERE zipcode = $1 LIMIT 1",
+        zipcode,
+    )
+    zlat = float(z["latitude"]) if z and z["latitude"] is not None else None
+    zlon = float(z["longitude"]) if z and z["longitude"] is not None else None
+
+    where_bits = ["r.service_description ILIKE '%' || $2 || '%'"]
+    args = [zipcode, q, payer_like, plan_like, limit]
+    # payer/plan filters are optional
+    payer_clause = "($3::text IS NULL OR r.payer_name ILIKE '%' || $3 || '%')"
+    plan_clause = "($4::text IS NULL OR r.plan_name ILIKE '%' || $4 || '%')"
+
+    if zlat is not None and zlon is not None:
+        sql = """
+        SELECT
+          h.name AS hospital_name,
+          h.address AS address,
+          h.state AS state,
+          h.zipcode AS zipcode,
+          h.phone AS phone,
+          h.latitude AS latitude,
+          h.longitude AS longitude,
+          (3959 * acos(
+              cos(radians($6)) * cos(radians(h.latitude)) * cos(radians(h.longitude) - radians($7)) +
+              sin(radians($6)) * sin(radians(h.latitude))
+          )) AS distance_miles,
+          r.code_type,
+          r.code,
+          r.payer_name,
+          r.plan_name,
+          r.standard_charge_discounted_cash AS standard_charge_cash,
+          r.standard_charge_negotiated_dollar AS negotiated_dollar,
+          r.estimated_amount AS estimated_amount
+        FROM public.stg_hospital_rates r
+        LEFT JOIN public.hospitals h ON h.id = r.hospital_id
+        WHERE r.service_description ILIKE '%' || $2 || '%'
+          AND """ + payer_clause + """ 
+          AND """ + plan_clause + """ 
+          AND h.latitude IS NOT NULL AND h.longitude IS NOT NULL
+        ORDER BY distance_miles ASC NULLS LAST
+        LIMIT $5
+        """
+        rows = await conn.fetch(sql, zipcode, q, payer_like, plan_like, limit, zlat, zlon)
+        return [dict(r) for r in rows]
+
+# ----------------------------
+# Nearest-facility pricing (geo-first, ensures a facility list)
+# ----------------------------
+async def get_service_id(conn: asyncpg.Connection, code_type: str, code: str) -> Optional[int]:
+    row = await conn.fetchrow(
+        "SELECT id FROM public.services WHERE code_type = $1 AND code = $2 LIMIT 1",
+        code_type,
+        code,
+    )
+    return int(row["id"]) if row else None
+
+
+async def price_lookup_nearest_facilities(
+    conn: asyncpg.Connection,
+    zipcode: str,
+    code_type: str,
+    code: str,
+    payment_mode: str,
+    payer_like: Optional[str],
+    plan_like: Optional[str],
+    limit: int = 10,
+    radius_array: Optional[List[int]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Returns nearest facilities (by distance to ZIP centroid) with best-available price fields.
+
+    For cash: pulls MIN(standard_charge_cash) (fallback to MIN(estimated_amount), MIN(standard_charge_gross))
+    For insurance: pulls the first matching plan row by payer/plan filters with negotiated_dollar preferred.
+    """
+    radius_array = radius_array or [10, 25, 50, 100]
+    z = await conn.fetchrow("SELECT latitude, longitude FROM public.zip_locations WHERE zipcode = $1", zipcode)
+    if not z:
+        return []
+
+    zlat, zlon = float(z["latitude"]), float(z["longitude"])
+    service_id = await get_service_id(conn, code_type, code)
+    if not service_id:
+        return []
+
+    # We expand radius until we have enough rows, then return the best set.
+    last_rows: List[Dict[str, Any]] = []
+    for r in radius_array:
+        if payment_mode.lower() == "cash":
+            rows = await conn.fetch(
+                """
+                WITH user_zip AS (
+                    SELECT $1::double precision AS zlat, $2::double precision AS zlon
+                )
+                SELECT
+                    h.id AS hospital_id,
+                    h.name AS hospital_name,
+                    h.address,
+                    h.state,
+                    h.zipcode,
+                    h.phone,
+                    (3959 * acos(
+                        cos(radians((SELECT zlat FROM user_zip))) * cos(radians(h.latitude)) *
+                        cos(radians(h.longitude) - radians((SELECT zlon FROM user_zip))) +
+                        sin(radians((SELECT zlat FROM user_zip))) * sin(radians(h.latitude))
+                    )) AS distance_miles,
+                    nr.standard_charge_cash,
+                    nr.estimated_amount,
+                    nr.standard_charge_gross
+                FROM public.hospitals h
+                LEFT JOIN LATERAL (
+                    SELECT
+                        MIN(standard_charge_cash) AS standard_charge_cash,
+                        MIN(estimated_amount) AS estimated_amount,
+                        MIN(standard_charge_gross) AS standard_charge_gross
+                    FROM public.negotiated_rates
+                    WHERE hospital_id = h.id AND service_id = $3
+                ) nr ON TRUE
+                WHERE h.latitude IS NOT NULL AND h.longitude IS NOT NULL
+                  AND (3959 * acos(
+                        cos(radians((SELECT zlat FROM user_zip))) * cos(radians(h.latitude)) *
+                        cos(radians(h.longitude) - radians((SELECT zlon FROM user_zip))) +
+                        sin(radians((SELECT zlat FROM user_zip))) * sin(radians(h.latitude))
+                  )) <= $4
+                ORDER BY distance_miles ASC
+                LIMIT $5
+                """,
+                zlat, zlon, service_id, r, limit,
+            )
+        else:
+            payer_pat = f"%{payer_like}%" if payer_like else "%"
+            plan_pat = f"%{plan_like}%" if plan_like else "%"
+            rows = await conn.fetch(
+                """
+                WITH user_zip AS (
+                    SELECT $1::double precision AS zlat, $2::double precision AS zlon
+                )
+                SELECT
+                    h.id AS hospital_id,
+                    h.name AS hospital_name,
+                    h.address,
+                    h.state,
+                    h.zipcode,
+                    h.phone,
+                    (3959 * acos(
+                        cos(radians((SELECT zlat FROM user_zip))) * cos(radians(h.latitude)) *
+                        cos(radians(h.longitude) - radians((SELECT zlon FROM user_zip))) +
+                        sin(radians((SELECT zlat FROM user_zip))) * sin(radians(h.latitude))
+                    )) AS distance_miles,
+                    pick.negotiated_dollar,
+                    pick.estimated_amount,
+                    pick.standard_charge_cash,
+                    pick.carrier_name,
+                    pick.plan_name
+                FROM public.hospitals h
+                LEFT JOIN LATERAL (
+                    SELECT
+                        nr.negotiated_dollar,
+                        nr.estimated_amount,
+                        nr.standard_charge_cash,
+                        ip.carrier_name,
+                        ip.plan_name
+                    FROM public.negotiated_rates nr
+                    JOIN public.insurance_plans ip ON ip.id = nr.plan_id
+                    WHERE nr.hospital_id = h.id
+                      AND nr.service_id = $3
+                      AND ip.carrier_name ILIKE $4
+                      AND ip.plan_name ILIKE $5
+                    ORDER BY
+                        nr.negotiated_dollar NULLS LAST,
+                        nr.estimated_amount NULLS LAST,
+                        nr.standard_charge_cash NULLS LAST
+                    LIMIT 1
+                ) pick ON TRUE
+                WHERE h.latitude IS NOT NULL AND h.longitude IS NOT NULL
+                  AND (3959 * acos(
+                        cos(radians((SELECT zlat FROM user_zip))) * cos(radians(h.latitude)) *
+                        cos(radians(h.longitude) - radians((SELECT zlon FROM user_zip))) +
+                        sin(radians((SELECT zlat FROM user_zip))) * sin(radians(h.latitude))
+                  )) <= $6
+                ORDER BY distance_miles ASC
+                LIMIT $7
+                """,
+                zlat, zlon, service_id, payer_pat, plan_pat, r, limit,
+            )
+
+        last_rows = [dict(rr) for rr in rows] if rows else last_rows
+        if len(last_rows) >= MIN_FACILITIES_TO_DISPLAY:
+            return last_rows
+
+    return last_rows
+
+
+    # No lat/lon available, return without distance ordering
+    sql2 = """
+    SELECT
+      COALESCE(h.name, r.hospital_name) AS hospital_name,
+      h.address AS address,
+      h.state AS state,
+      h.zipcode AS zipcode,
+      h.phone AS phone,
+      NULL::float AS distance_miles,
+      r.code_type,
+      r.code,
+      r.payer_name,
+      r.plan_name,
+      r.standard_charge_discounted_cash AS standard_charge_cash,
+      r.standard_charge_negotiated_dollar AS negotiated_dollar,
+      r.estimated_amount AS estimated_amount
+    FROM public.stg_hospital_rates r
+    LEFT JOIN public.hospitals h ON h.id = r.hospital_id
+    WHERE r.service_description ILIKE '%' || $2 || '%'
+      AND """ + payer_clause + """ 
+      AND """ + plan_clause + """ 
+    ORDER BY COALESCE(h.state, ''), COALESCE(h.zipcode, ''), COALESCE(h.name, r.hospital_name, '')
+    LIMIT $5
+    """
+    rows = await conn.fetch(sql2, zipcode, q, payer_like, plan_like, limit)
+    return [dict(r) for r in rows]
+
+
 async def price_lookup_progressive(
     conn: asyncpg.Connection,
     zipcode: str,
@@ -468,33 +727,27 @@ async def price_lookup_progressive(
     code: str,
     payer_like: Optional[str],
     plan_like: Optional[str],
+    payment_mode: str,
 ) -> Tuple[List[Dict[str, Any]], Optional[int]]:
-    """
-    Tries widening radius arrays until we hit MIN_FACILITIES_TO_DISPLAY priced results,
-    or we exhaust attempts.
-    Returns: (results, used_max_radius)
-    """
-    last_results: List[Dict[str, Any]] = []
-    used_max_radius: Optional[int] = None
+    """Geo-first nearest-facility pricing lookup with expanding radius."""
+    radius_array = [10, 25, 50, 100]
 
-    for r in PRICE_RADIUS_ATTEMPTS:
-        radius_array = [x for x in PRICE_RADIUS_ATTEMPTS if x <= r]
-        logger.info("Price lookup attempt", extra={"zipcode": zipcode, "max_radius": r, "radius_array": radius_array})
-        try:
-            res = await price_lookup_v3(conn, zipcode, code_type, code, payer_like, plan_like, radius_array=radius_array)
-        except Exception as e:
-            logger.warning(f"Price lookup attempt failed at radius {r}: {e}")
-            res = []
+    rows = await price_lookup_nearest_facilities(
+        conn,
+        zipcode=zipcode,
+        code_type=code_type,
+        code=code,
+        payment_mode=payment_mode,
+        payer_like=payer_like,
+        plan_like=plan_like,
+        limit=max(MIN_FACILITIES_TO_DISPLAY, 10),
+        radius_array=radius_array,
+    )
 
-        if res:
-            last_results = res
-            used_max_radius = r
-
-        if len(res) >= MIN_FACILITIES_TO_DISPLAY:
-            return res, r
-
-    return last_results, used_max_radius
-
+    used_radius = None
+    if rows:
+        used_radius = radius_array[-1]
+    return rows, used_radius
 
 # ----------------------------
 # Nearby hospitals (for facility list even when no prices)
@@ -515,7 +768,7 @@ async def get_nearby_hospitals(conn: asyncpg.Connection, zipcode: str, limit: in
     if zlat is not None and zlon is not None:
         q = """
         SELECT
-          h.name AS hospital_name,
+          h.hospital_name AS hospital_name,
           h.address AS address,
           h.state AS state,
           h.zipcode AS zipcode,
@@ -537,14 +790,14 @@ async def get_nearby_hospitals(conn: asyncpg.Connection, zipcode: str, limit: in
     # If we can’t compute distance, still return facilities
     q2 = """
     SELECT
-      h.name AS hospital_name,
+      h.hospital_name AS hospital_name,
       h.address AS address,
       h.state AS state,
       h.zipcode AS zipcode,
       h.phone AS phone,
       NULL::float AS distance_miles
     FROM public.hospital_details h
-    ORDER BY h.state, h.zipcode, h.name
+    ORDER BY h.state, h.zipcode, h.hospital_name
     LIMIT $1
     """
     rows = await conn.fetch(q2, limit)
@@ -587,7 +840,7 @@ def _pick_price_fields(row: Dict[str, Any]) -> Optional[float]:
     """
     Best-effort: try common column names returned by your SQL function.
     """
-    for k in ["cash_price", "cash", "price", "rate", "negotiated_rate", "allowed_amount", "standard_charge"]:
+    for k in ["standard_charge_cash","standard_charge_discounted_cash","cash_price","cash","negotiated_dollar","standard_charge_negotiated_dollar","negotiated_percentage","standard_charge_negotiated_percentage","estimated_amount","standard_charge","standard_charge_gross","rate","price","allowed_amount"]:
         v = row.get(k)
         if isinstance(v, (int, float)):
             return float(v)
@@ -661,11 +914,11 @@ def build_facility_block(
         seen.add(key)
         facilities.append(h)
 
-    # If still empty, we’ll at least show a helpful message
+    # If still empty, return a graceful message (should be rare if hospitals are loaded)
     if not facilities:
         return (
-            "I don’t yet have facility records available for that area in my database.\n"
-            "Confirm with the facility and your insurer.",
+            "I couldn’t find hospitals near that ZIP code in my database yet. "
+            "Try another nearby ZIP, or expand the search radius.",
             [],
         )
 
@@ -1043,7 +1296,10 @@ async def chat_stream(req: ChatRequest, request: Request):
                         merged["code"],
                         merged.get("payer_like"),
                         merged.get("plan_like"),
+                        merged.get("payment_mode") or "cash",
                     )
+
+
 
                     # --- ALWAYS fetch at least 5 hospitals for display (even if pricing is missing) ---
                     nearby_hospitals = []
