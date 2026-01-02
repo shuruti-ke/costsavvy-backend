@@ -296,6 +296,71 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
     Guardrail: if message is ZIP-only and we already have service_query in state,
     treat it as continuation of pricing flow.
     """
+
+    # If we previously asked a clarification (ZIP or payment), treat short replies as continuations.
+    awaiting = (state or {}).get("_awaiting")
+    msg_l = (message or "").strip().lower()
+
+    if awaiting == "payment":
+        # Common cash synonyms
+        cash_terms = {"cash", "self pay", "self-pay", "selfpay", "out of pocket", "oop", "paying cash", "pay cash", "cash pay"}
+        if any(t in msg_l for t in cash_terms):
+            return {
+                "mode": "price",
+                "zipcode": state.get("zipcode"),
+                "radius_miles": None,
+                "payer_like": None,
+                "plan_like": None,
+                "payment_mode": "cash",
+                "service_query": state.get("service_query"),
+                "code_type": state.get("code_type"),
+                "code": state.get("code"),
+                "clarifying_question": None,
+                "cash_only": True,
+            }
+
+        # Insurance mention or carrier
+        if "insurance" in msg_l or any(k in msg_l for k in ["aetna", "cigna", "anthem", "blue", "bcbs", "united", "uhc", "humana", "kaiser", "molina", "centene", "wellcare"]):
+            # crude carrier extraction: keep the original casing from message where possible
+            payer_like = None
+            # Try common carriers first
+            carrier_map = {
+                "aetna": "Aetna",
+                "cigna": "Cigna",
+                "anthem": "Anthem",
+                "bcbs": "Blue Cross Blue Shield",
+                "blue cross": "Blue Cross Blue Shield",
+                "blue shield": "Blue Cross Blue Shield",
+                "united": "UnitedHealthcare",
+                "uhc": "UnitedHealthcare",
+                "humana": "Humana",
+                "kaiser": "Kaiser Permanente",
+                "molina": "Molina",
+                "centene": "Centene",
+                "wellcare": "WellCare",
+            }
+            for k, v in carrier_map.items():
+                if k in msg_l:
+                    payer_like = v
+                    break
+            # Fallback: take last capitalized word sequence (best-effort)
+            if not payer_like:
+                m = re.findall(r"\b[A-Z][A-Za-z&]+(?:\s+[A-Z][A-Za-z&]+)*\b", message or "")
+                payer_like = m[-1] if m else None
+
+            return {
+                "mode": "price",
+                "zipcode": state.get("zipcode"),
+                "radius_miles": None,
+                "payer_like": payer_like,
+                "plan_like": None,
+                "payment_mode": "insurance",
+                "service_query": state.get("service_query"),
+                "code_type": state.get("code_type"),
+                "code": state.get("code"),
+                "clarifying_question": None,
+                "cash_only": False,
+            }
     if _is_zip_only_message(message) and (state or {}).get("service_query"):
         return {
             "mode": "price",
@@ -355,6 +420,15 @@ def infer_service_query_from_message(message: str) -> Optional[str]:
 def should_force_price_mode(message: str, merged: Dict[str, Any]) -> bool:
     if not INTENT_OVERRIDE_FORCE_PRICE_ENABLED:
         return False
+
+    # If we already have a pricing context (service + ZIP) and are still collecting
+    # payment details, keep the conversation in price mode even if the user's reply
+    # doesn't include explicit cost keywords (e.g., "I have Aetna insurance").
+    if (merged or {}).get("service_query") and (merged or {}).get("zipcode") and not (merged or {}).get("payment_mode"):
+        return True
+    if (merged or {}).get("_awaiting") in {"zip", "payment"}:
+        return True
+
     msg = (message or "").lower()
     return any(kw in msg for kw in INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS)
 
@@ -1164,6 +1238,11 @@ async def chat_stream(req: ChatRequest, request: Request):
                 intent = await extract_intent(req.message, state)
                 merged = merge_state(state, intent)
                 _normalize_payment_mode(merged)
+                # Clear awaiting flags once the user provides the missing info
+                if merged.get('_awaiting') == 'zip' and merged.get('zipcode'):
+                    merged.pop('_awaiting', None)
+                if merged.get('_awaiting') == 'payment' and merged.get('payment_mode'):
+                    merged.pop('_awaiting', None)
 
                 # Force pricing mode when cost keywords appear
                 intent = apply_intent_override_if_needed(intent, req.message, merged, session_id)
@@ -1220,6 +1299,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     # Gate 1: ZIP required
                     zipcode = merged.get("zipcode")
                     if not zipcode:
+                        merged["_awaiting"] = "zip"
                         msg = "What’s your 5-digit ZIP code?"
                         yield sse({"type": "delta", "text": msg})
                         await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_zip", "intent": intent})
@@ -1231,6 +1311,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     # Gate 2: payment mode required (cash vs insurance)
                     payment_mode = merged.get("payment_mode")
                     if not payment_mode:
+                        merged["_awaiting"] = "payment"
                         msg = "Are you paying cash (self-pay) or using insurance? If insurance, what carrier (e.g., Aetna)?"
                         yield sse({"type": "delta", "text": msg})
                         await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_payment", "intent": intent})
@@ -1261,6 +1342,11 @@ async def chat_stream(req: ChatRequest, request: Request):
 
                     # Ensure payer/plan are cleared for cash
                     _normalize_payment_mode(merged)
+                # Clear awaiting flags once the user provides the missing info
+                if merged.get('_awaiting') == 'zip' and merged.get('zipcode'):
+                    merged.pop('_awaiting', None)
+                if merged.get('_awaiting') == 'payment' and merged.get('payment_mode'):
+                    merged.pop('_awaiting', None)
 
                     # Resolve code if still missing
                     if not (merged.get("code_type") and merged.get("code")):
