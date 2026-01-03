@@ -454,7 +454,7 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
     inferred_service = infer_service_query_from_message(msg)
     if inferred_service and not have_zip:
         # Force clarifying ZIP instead of letting the LLM ask for payment first.
-        return {"mode": "price", "service_query": inferred_service, "clarifying_question": None}
+        return {"mode": "price", "service_query": inferred_service, "clarifying_question": None, "_new_price_question": True}
 
     # 5) Otherwise fall back to LLM-based intent extraction (general Q&A, non-price).
     try:
@@ -1373,6 +1373,19 @@ async def chat_stream(req: ChatRequest, request: Request):
                 # 1) Intent + state merge
                 intent = await extract_intent(req.message, state)
                 merged = merge_state(state, intent)
+
+                # If this message is a NEW pricing question (service inferred) and the user did not provide a ZIP,
+                # do not reuse a prior ZIP/payment from the session. Force ZIP collection first.
+                if intent.get("_new_price_question"):
+                    if not message_contains_zip(req.message):
+                        merged.pop("zipcode", None)
+                    # Always reset payment/payer/plan for a new pricing question unless explicitly stated
+                    if not message_contains_payment_info(req.message):
+                        merged.pop("payment_mode", None)
+                        merged.pop("payer_like", None)
+                        merged.pop("plan_like", None)
+                        merged.pop("cash_only", None)
+                    merged.pop("_awaiting", None)
                 _normalize_payment_mode(merged)
 
                 # 2) Force/override pricing intent when we are mid-flow
