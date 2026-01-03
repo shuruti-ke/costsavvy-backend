@@ -263,30 +263,11 @@ Notes:
 
 
 def merge_state(state: Dict[str, Any], intent: Dict[str, Any]) -> Dict[str, Any]:
-    """Merge intent-extracted fields into persisted session state."""
     out = dict(state or {})
-    for k in [
-        "zipcode",
-        "radius_miles",
-        "payment_mode",
-        "cash_only",
-        "payer_like",
-        "plan_like",
-        "service_query",
-        "code_type",
-        "code",
-        "refiner_choice",
-    ]:
+    for k in ["zipcode", "radius_miles", "payer_like", "plan_like", "payment_mode", "service_query", "code_type", "code", "cash_only"]:
         v = intent.get(k)
-        # allow explicit None to clear payer/plan when switching to cash
-        if k in {"payer_like", "plan_like"} and v is None and intent.get("payment_mode") == "cash":
-            out[k] = None
-            continue
         if v is not None and v != "":
             out[k] = v
-    # preserve awaiting flag when present
-    if intent.get("_awaiting"):
-        out["_awaiting"] = intent["_awaiting"]
     return out
 
 
@@ -378,13 +359,25 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
         for k, v in carrier_map.items():
             if k in ml:
                 return v
+
+        # Filter out common filler words so we don't accidentally treat
+        # "I have insurance" or "use insurance" as the carrier name "I Have Insurance".
+        clean = m
+        for stop in ["i have", "i use", "use", "with", "insurance", "my", "have", "paying"]:
+            # Word-boundary aware case-insensitive replacement
+            clean = re.sub(r'\b' + re.escape(stop) + r'\b', '', clean, flags=re.IGNORECASE)
+
+        clean = clean.strip()
+        tokens = re.findall(r"[a-zA-Z]+", clean)
+
         # if the user replies with just a single word, treat it as a carrier candidate
-        tokens = re.findall(r"[a-zA-Z]+", m)
         if len(tokens) == 1 and len(tokens[0]) >= 3:
             return tokens[0].title()
-        # two-word carrier (e.g., "Blue Cross")
+        
+        # two-word carrier (e.g., "Harvard Pilgrim")
         if 2 <= len(tokens) <= 3:
             return " ".join([t.title() for t in tokens])
+            
         return None
 
     # 1) If we are explicitly awaiting ZIP, only accept ZIP (or a cancel/new question handled by LLM below).
@@ -465,8 +458,8 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
 
     # 5) Otherwise fall back to LLM-based intent extraction (general Q&A, non-price).
     try:
-        resp = oai.chat.completions.create(
-            model=INTENT_MODEL,
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
             temperature=0,
             messages=[
                 {"role": "system", "content": "You extract intent for healthcare Q&A and price lookup. Be conservative."},
@@ -798,7 +791,7 @@ async def price_lookup_nearest_facilities(
                 )
                 SELECT
                     h.id AS hospital_id,
-                    h.name AS hospital_name,
+                    COALESCE(h.hospital_name, h.name) AS hospital_name,
                     h.address,
                     h.state,
                     h.zipcode,
@@ -808,26 +801,32 @@ async def price_lookup_nearest_facilities(
                         cos(radians(h.longitude) - radians((SELECT zlon FROM user_zip))) +
                         sin(radians((SELECT zlat FROM user_zip))) * sin(radians(h.latitude))
                     )) AS distance_miles,
+                    nr.best_price,
                     nr.standard_charge_cash,
                     nr.estimated_amount,
-                    nr.standard_charge_gross,
-                    COALESCE(nr.standard_charge_cash, nr.estimated_amount, nr.standard_charge_gross) AS best_price
+                    nr.standard_charge_gross
                 FROM public.hospitals h
-                LEFT JOIN LATERAL (
+                JOIN LATERAL (
                     SELECT
+                        COALESCE(
+                            MIN(standard_charge_cash),
+                            MIN(estimated_amount),
+                            MIN(standard_charge_gross)
+                        ) AS best_price,
                         MIN(standard_charge_cash) AS standard_charge_cash,
                         MIN(estimated_amount) AS estimated_amount,
                         MIN(standard_charge_gross) AS standard_charge_gross
                     FROM public.negotiated_rates
-                    WHERE hospital_id = h.id AND service_id = ANY($3::int[])
+                    WHERE hospital_id = h.id
+                      AND service_id = ANY($3::int[])
                 ) nr ON TRUE
                 WHERE h.latitude IS NOT NULL AND h.longitude IS NOT NULL
-                  AND COALESCE(nr.standard_charge_cash, nr.estimated_amount, nr.standard_charge_gross) IS NOT NULL
                   AND (3959 * acos(
                         cos(radians((SELECT zlat FROM user_zip))) * cos(radians(h.latitude)) *
                         cos(radians(h.longitude) - radians((SELECT zlon FROM user_zip))) +
                         sin(radians((SELECT zlat FROM user_zip))) * sin(radians(h.latitude))
                   )) <= $4
+                  AND nr.best_price IS NOT NULL
                 ORDER BY distance_miles ASC
                 LIMIT $5
                 """,
@@ -843,7 +842,7 @@ async def price_lookup_nearest_facilities(
                 )
                 SELECT
                     h.id AS hospital_id,
-                    h.name AS hospital_name,
+                    COALESCE(h.hospital_name, h.name) AS hospital_name,
                     h.address,
                     h.state,
                     h.zipcode,
@@ -853,15 +852,16 @@ async def price_lookup_nearest_facilities(
                         cos(radians(h.longitude) - radians((SELECT zlon FROM user_zip))) +
                         sin(radians((SELECT zlat FROM user_zip))) * sin(radians(h.latitude))
                     )) AS distance_miles,
+                    pick.best_price,
                     pick.negotiated_dollar,
                     pick.estimated_amount,
                     pick.standard_charge_cash,
                     pick.payer_name,
-                    pick.plan_name,
-                    COALESCE(pick.negotiated_dollar, pick.estimated_amount, pick.standard_charge_cash) AS best_price
+                    pick.plan_name
                 FROM public.hospitals h
-                LEFT JOIN LATERAL (
+                JOIN LATERAL (
                     SELECT
+                        COALESCE(nr.negotiated_dollar, nr.estimated_amount, nr.standard_charge_cash) AS best_price,
                         nr.negotiated_dollar,
                         nr.estimated_amount,
                         nr.standard_charge_cash,
@@ -873,6 +873,7 @@ async def price_lookup_nearest_facilities(
                       AND nr.service_id = ANY($3::int[])
                       AND ip.payer_name ILIKE $4
                       AND ip.plan_name ILIKE $5
+                      AND (nr.negotiated_dollar IS NOT NULL OR nr.estimated_amount IS NOT NULL OR nr.standard_charge_cash IS NOT NULL)
                     ORDER BY
                         nr.negotiated_dollar NULLS LAST,
                         nr.estimated_amount NULLS LAST,
@@ -880,7 +881,6 @@ async def price_lookup_nearest_facilities(
                     LIMIT 1
                 ) pick ON TRUE
                 WHERE h.latitude IS NOT NULL AND h.longitude IS NOT NULL
-                  AND COALESCE(pick.negotiated_dollar, pick.estimated_amount, pick.standard_charge_cash) IS NOT NULL
                   AND (3959 * acos(
                         cos(radians((SELECT zlat FROM user_zip))) * cos(radians(h.latitude)) *
                         cos(radians(h.longitude) - radians((SELECT zlon FROM user_zip))) +
@@ -1046,34 +1046,17 @@ def estimate_cost_range(service_query: str, payment_mode: str) -> str:
 # Facility formatting
 # ----------------------------
 def _pick_price_fields(row: Dict[str, Any]) -> Optional[float]:
-    """Return the most useful numeric price from a result row."""
-    for k in [
-        # preferred, normalized
-        "best_price",
-        # cash / self-pay
-        "standard_charge_cash",
-        # negotiated / insurance
-        "negotiated_dollar",
-        # other numeric fallbacks
-        "estimated_amount",
-        "standard_charge_gross",
-        "standard_charge_min",
-        "standard_charge_max",
-        # generic names (legacy)
-        "rate",
-        "price",
-        "allowed_amount",
-    ]:
+    """
+    Best-effort: try common column names returned by your SQL function.
+    """
+    for k in ["best_price","standard_charge_cash","standard_charge_discounted_cash","cash_price","cash","negotiated_dollar","standard_charge_negotiated_dollar","negotiated_percentage","standard_charge_negotiated_percentage","estimated_amount","standard_charge","standard_charge_gross","rate","price","allowed_amount"]:
         v = row.get(k)
-        if v is None:
-            continue
         if isinstance(v, (int, float)):
             return float(v)
-        # Decimal or numeric strings
+        # sometimes Decimal
         try:
-            s = str(v).strip()
-            if s and s.replace(".", "", 1).isdigit():
-                return float(s)
+            if v is not None and str(v).replace(".", "", 1).isdigit():
+                return float(v)
         except Exception:
             pass
     return None
