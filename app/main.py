@@ -263,8 +263,27 @@ Notes:
 
 
 def merge_state(state: Dict[str, Any], intent: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge LLM/deterministic intent into session state.
+
+    IMPORTANT:
+      - Preserve other session keys (like _awaiting / _variant_options) by starting from a copy of state.
+      - Only overwrite with non-empty intent values.
+    """
     out = dict(state or {})
-    for k in ["zipcode", "radius_miles", "payer_like", "plan_like", "payment_mode", "service_query", "code_type", "code", "cash_only"]:
+    for k in [
+        "zipcode",
+        "radius_miles",
+        "payer_like",
+        "plan_like",
+        "payment_mode",
+        "service_query",
+        "code_type",
+        "code",
+        "cash_only",
+        # Variant selection (subtypes)
+        "variant_cpt_code",
+        "variant_name",
+    ]:
         v = intent.get(k)
         if v is not None and v != "":
             out[k] = v
@@ -450,7 +469,23 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
                 "cash_only": False,
             }
 
-    # 4) If the user is asking a new price question but we lack ZIP, we will ask for ZIP (geo-first).
+    
+    # If user asks about the "type" of the service (e.g., screening vs diagnostic),
+    # keep them in the pricing flow so we can show/ask for subtypes (variants).
+    if have_service and (("type" in msg_l) or ("screening" in msg_l) or ("diagnostic" in msg_l) or ("preventive" in msg_l)):
+        return {
+            "mode": "price",
+            "zipcode": st.get("zipcode"),
+            "service_query": st.get("service_query"),
+            "code_type": st.get("code_type"),
+            "code": st.get("code"),
+            "payment_mode": st.get("payment_mode"),
+            "payer_like": st.get("payer_like"),
+            "plan_like": st.get("plan_like"),
+            "clarifying_question": None,
+        }
+
+# 4) If the user is asking a new price question but we lack ZIP, we will ask for ZIP (geo-first).
     inferred_service = infer_service_query_from_message(msg)
     if inferred_service and not have_zip:
         # Force clarifying ZIP instead of letting the LLM ask for payment first.
@@ -493,6 +528,129 @@ def infer_service_query_from_message(message: str) -> Optional[str]:
     if "office visit" in msg or "doctor visit" in msg:
         return "office visit"
     return None
+
+
+
+# ----------------------------
+# Service variants (CPT subtypes) via public.service_variants
+# ----------------------------
+async def fetch_service_variants(
+    conn: asyncpg.Connection,
+    service_query: str,
+    code_type: Optional[str] = None,
+    code: Optional[str] = None,
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """Fetch candidate CPT variants (subtypes) for a service.
+
+    Strategy:
+      1) If we already have an explicit CPT code, try an exact cpt_code match.
+      2) Otherwise search by service_query across parent_service, variant_name, patient_summary.
+    """
+    q = (service_query or "").strip()
+
+    if code_type and code and str(code_type).upper() == "CPT":
+        rows = await conn.fetch(
+            """
+            SELECT parent_service, cpt_code, variant_name, patient_summary, is_preventive
+            FROM public.service_variants
+            WHERE cpt_code = $1
+            LIMIT $2
+            """,
+            str(code),
+            limit,
+        )
+        if rows:
+            return [dict(r) for r in rows]
+
+    if not q:
+        return []
+
+    pat = f"%{q}%"
+    rows = await conn.fetch(
+        """
+        SELECT parent_service, cpt_code, variant_name, patient_summary, is_preventive
+        FROM public.service_variants
+        WHERE parent_service ILIKE $1
+           OR variant_name ILIKE $1
+           OR patient_summary ILIKE $1
+        ORDER BY parent_service, cpt_code
+        LIMIT $2
+        """,
+        pat,
+        limit,
+    )
+    return [dict(r) for r in rows]
+
+
+def _variant_question(service_query: str, variants: List[Dict[str, Any]]) -> str:
+    svc = (service_query or "this service").strip()
+    lines: List[str] = []
+    lines.append(f"{svc.title()} can be billed in different ways, and the price can vary by type.")
+    lines.append("Here are the common options:")
+    lines.append("")
+    for idx, v in enumerate(variants, start=1):
+        name = (v.get("variant_name") or "").strip() or f"Option {idx}"
+        summary = (v.get("patient_summary") or "").strip()
+
+        # Keep summaries short, use the source text only (no guessing)
+        if summary and len(summary) > 240:
+            summary = summary[:237].rstrip() + "..."
+
+        extra_bits: List[str] = []
+        if v.get("is_preventive") is True:
+            extra_bits.append("preventive")
+        elif v.get("is_preventive") is False:
+            extra_bits.append("non-preventive")
+        extra = f" ({', '.join(extra_bits)})" if extra_bits else ""
+
+        if summary:
+            lines.append(f"{idx}) **{name}**{extra} — {summary}")
+        else:
+            lines.append(f"{idx}) **{name}**{extra}")
+
+    lines.append("")
+    lines.append("Which option best matches what you need? Reply with the number (or the CPT code).")
+
+    return "\n".join(lines)
+
+
+def apply_variant_choice(message: str, merged: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply user's variant selection when awaiting subtype choice."""
+    if (merged or {}).get("_awaiting") != "variant":
+        return merged
+
+    opts = merged.get("_variant_options") or []
+    msg = (message or "").strip()
+
+    # Direct CPT code (5 digits)
+    if re.fullmatch(r"\d{5}", msg):
+        for o in opts:
+            if str(o.get("cpt_code")) == msg:
+                merged["variant_cpt_code"] = msg
+                merged["variant_name"] = o.get("variant_name")
+                merged["code_type"] = "CPT"
+                merged["code"] = msg
+                merged.pop("_awaiting", None)
+                merged.pop("_variant_options", None)
+                return merged
+
+    # Numeric choice
+    if msg.isdigit():
+        i = int(msg)
+        if 1 <= i <= len(opts):
+            chosen = opts[i - 1]
+            cpt = str(chosen.get("cpt_code") or "").strip()
+            if cpt:
+                merged["variant_cpt_code"] = cpt
+                merged["variant_name"] = chosen.get("variant_name")
+                merged["code_type"] = "CPT"
+                merged["code"] = cpt
+                merged.pop("_awaiting", None)
+                merged.pop("_variant_options", None)
+                return merged
+
+    return merged
 
 
 def should_force_price_mode(message: str, merged: Dict[str, Any]) -> bool:
@@ -1374,6 +1532,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                 intent = await extract_intent(req.message, state)
                 merged = merge_state(state, intent)
 
+                # Apply subtype (variant) choice if we are awaiting it
+                merged = apply_variant_choice(req.message, merged)
+
                 # If this message is a NEW pricing question (service inferred) and the user did not provide a ZIP,
                 # do not reuse a prior ZIP/payment from the session. Force ZIP collection first.
                 if intent.get("_new_price_question"):
@@ -1480,6 +1641,41 @@ async def chat_stream(req: ChatRequest, request: Request):
                         return
                     if merged.get("_awaiting") == "payer" and (merged.get("payer_like") or "").strip():
                         merged.pop("_awaiting", None)
+
+
+                    # Variants (subtypes): if this service has multiple CPT variants, explain options and ask the user to choose.
+                    if not (merged.get("variant_cpt_code") or "").strip():
+                        try:
+                            variants = await fetch_service_variants(
+                                conn,
+                                service_query=merged.get("service_query") or "",
+                                code_type=merged.get("code_type"),
+                                code=merged.get("code"),
+                                limit=10,
+                            )
+                        except Exception as e:
+                            logger.warning(f"Service variants lookup failed: {e}")
+                            variants = []
+
+                        # If multiple variants exist, prompt user to select before pricing
+                        if variants and len(variants) >= 2:
+                            merged["_awaiting"] = "variant"
+                            merged["_variant_options"] = [
+                                {
+                                    "cpt_code": str(v.get("cpt_code") or "").strip(),
+                                    "variant_name": (v.get("variant_name") or "").strip(),
+                                }
+                                for v in variants[:10]
+                                if v.get("cpt_code")
+                            ]
+
+                            msg = _variant_question(merged.get("service_query") or "this service", variants[:10])
+                            yield sse({"type": "delta", "text": msg})
+                            await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_variant", "intent": intent})
+                            await update_session_state(conn, session_id, merged)
+                            await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
+                            yield sse({"type": "final", "used_web_search": False})
+                            return
 
                     # Refiners: ask for choice before pricing when required
                     if refiner and refiner.get("require_choice_before_pricing") is True and not merged.get("refiner_choice"):
