@@ -1259,7 +1259,7 @@ async def get_service_variants_for_parent(conn: asyncpg.Connection, parent_servi
           {summary_col} AS patient_summary,
           is_preventive
         FROM public.service_variants
-        WHERE parent_service = $1
+        WHERE lower(parent_service) = lower($1)
         ORDER BY is_preventive DESC NULLS LAST, variant_name ASC, id ASC
         """,
         parent_service,
@@ -1369,6 +1369,51 @@ async def price_lookup_staging_by_cpt_with_variants(
         cpt_code, zlat, zlon, limit,
     )
     return [dict(r) for r in rows]
+
+# ----------------------------
+# Service education bullets (service-specific, avoids colonoscopy-only text)
+# ----------------------------
+def build_service_education_bullets(service_query: str, payment_mode: str) -> List[str]:
+    q = (service_query or "").lower()
+
+    if "colonoscopy" in q:
+        return [
+            "- Colonoscopies can be **screening** (preventive) or **diagnostic** (symptoms/abnormal finding).",
+            "- Facility setting matters, **outpatient endoscopy centers** often differ from **hospital outpatient** pricing.",
+            "- If a biopsy or polyp removal happens, total cost can increase.",
+        ]
+
+    if "mri" in q:
+        return [
+            "- MRI prices vary by **body part** and whether it’s **with or without contrast**.",
+            "- Many totals include both the **technical** fee (scanner/facility) and the **professional** fee (radiologist read).",
+            "- If sedation is used, that can add to the total.",
+        ]
+
+    if "ct" in q or "cat scan" in q:
+        return [
+            "- CT prices vary by **body part** and whether it’s **with or without contrast**.",
+            "- If contrast is used, there may be additional charges for the contrast material and administration.",
+            "- Hospital outpatient CT is often priced differently than freestanding imaging centers.",
+        ]
+
+    if "x-ray" in q or "xray" in q:
+        return [
+            "- X-ray prices vary by **body part** and the number of views.",
+            "- There may be separate charges for the **facility** and the **radiologist interpretation**.",
+        ]
+
+    if "ultrasound" in q:
+        return [
+            "- Ultrasound prices vary by **body part** and whether it’s a **limited** vs **complete** study.",
+            "- Some totals include the **facility** fee and the **radiologist interpretation** separately.",
+        ]
+
+    return [
+        "- Prices can vary by facility setting (hospital outpatient vs freestanding clinic).",
+        "- Additional services (contrast, anesthesia, labs, interpretation fees) can change the total.",
+    ]
+
 # ----------------------------
 # Facility formatting
 # ----------------------------
@@ -1463,10 +1508,7 @@ def build_facility_block(
     est_range = estimate_cost_range(service_query or "this service", payment_mode or "cash")
 
     # Build answer text
-    bullets = []
-    bullets.append(f"- Colonoscopies can be **screening** (preventive) or **diagnostic** (symptoms/abnormal finding).")
-    bullets.append(f"- Facility setting matters: **outpatient endoscopy centers** often differ from **hospital outpatient** pricing.")
-    bullets.append(f"- If a biopsy or polyp removal happens, total cost can increase.")
+    bullets = build_service_education_bullets(service_query or "this service", payment_mode or "cash")
 
     lines = []
     # If we have a selected variant, show it clearly (and keep it patient-friendly).
