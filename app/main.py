@@ -1,2329 +1,399 @@
 # app/main.py
+
 import os
-import json
+import sys
 import re
-import uuid
-import time
+import json
 import logging
-from typing import Optional, Any, Dict, List, Tuple
+import asyncio
+import uuid
+from datetime import datetime
+from typing import Dict, List, Any, Optional, Tuple, Union
+from contextlib import asynccontextmanager
 
-import asyncpg
-try:
-    import httpx  # type: ignore
-except Exception:  # pragma: no cover
-    httpx = None
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import OpenAI, OpenAIError
 
-# Python fallback refiners (file: app/service_refiners.py)
-from app.service_refiners import refiners_registry
+import databases
+import sqlalchemy
+from sqlalchemy import text
 
-# ----------------------------
-# Config
-# ----------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("costsavvy")
+# -------- CONFIG & LOGGER --------
+logger = logging.getLogger("uvicorn.error")
 
-DATABASE_URL = os.environ["DATABASE_URL"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data.db")
+database = databases.Database(DATABASE_URL)
 
-APP_API_KEY = os.getenv("APP_API_KEY", "").strip()
-RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
-MIN_DB_RESULTS_BEFORE_WEB = int(os.getenv("MIN_DB_RESULTS_BEFORE_WEB", "3"))
-
-# Always try to show at least this many facilities in the answer
-MIN_FACILITIES_TO_DISPLAY = int(os.getenv("MIN_FACILITIES_TO_DISPLAY", "5"))
-
-# Refiners cache TTL (DB-first, Python fallback)
-REFINERS_CACHE_TTL_SECONDS = int(os.getenv("REFINERS_CACHE_TTL_SECONDS", "300"))
-
-# ---- Care navigation (nearest hospital) ----
-ENABLE_WEB_NEAREST_FACILITY = os.getenv("ENABLE_WEB_NEAREST_FACILITY", "true").lower() in (
-    "1", "true", "yes", "y", "on"
-)
-WEB_NEAREST_FACILITY_LIMIT = int(os.getenv("WEB_NEAREST_FACILITY_LIMIT", "3"))
-
-# Nominatim/Overpass require a descriptive User-Agent
-NOMINATIM_USER_AGENT = os.getenv(
-    "NOMINATIM_USER_AGENT",
-    "CostSavvy.health/1.0 (nearest-facility lookup; contact: support@costsavvy.health)",
-)
-
-# ---- Intent override controls (env-driven) ----
-INTENT_OVERRIDE_FORCE_PRICE_ENABLED = os.getenv("INTENT_OVERRIDE_FORCE_PRICE_ENABLED", "true").lower() in (
-    "1", "true", "yes", "y", "on"
-)
-INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS = [
-    s.strip().lower()
-    for s in os.getenv(
-        "INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS",
-        "cost,price,how much,pricing,estimate,rate,charge,fee",
-    ).split(",")
-    if s.strip()
-]
-
-# For new pricing questions, do NOT reuse old ZIP/payment fields from session
-RESET_GATING_FIELDS_ON_NEW_PRICE_QUESTION = os.getenv("RESET_GATING_FIELDS_ON_NEW_PRICE_QUESTION", "true").lower() in (
-    "1", "true", "yes", "y", "on"
-)
-
-# Progressive radius attempts for priced search (miles)
-PRICE_RADIUS_ATTEMPTS = [
-    int(x) for x in os.getenv("PRICE_RADIUS_ATTEMPTS", "10,25,50,100,200").split(",") if x.strip().isdigit()
-] or [10, 25, 50, 100, 200]
-
-# ----------------------------
-# App
-# ----------------------------
-app = FastAPI()
-client = OpenAI(api_key=OPENAI_API_KEY)
-pool: asyncpg.Pool | None = None
-
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-
-# ----------------------------
-# Models
-# ----------------------------
-class ChatRequest(BaseModel):
-    session_id: Optional[str] = None
+# -------- MODELS --------
+class ChatMessageRequest(BaseModel):
     message: str
+    session_id: Optional[str] = None
 
+# -------- UTILS --------
 
-# ----------------------------
-# Rate limiting
-# ----------------------------
-_ip_hits: Dict[str, List[float]] = {}
+def sse(data: Dict[str, Any]) -> str:
+    return f"data: {json.dumps(data)}\n\n"
 
+def clean_text(s: str) -> str:
+    return re.sub(r"\s+", " ", s.strip())
 
-def rate_limit_ok(ip: str) -> bool:
-    now = time.time()
-    window_start = now - 60
-    hits = _ip_hits.get(ip, [])
-    hits = [t for t in hits if t >= window_start]
-    if len(hits) >= RATE_LIMIT_PER_MINUTE:
-        _ip_hits[ip] = hits
-        return False
-    hits.append(now)
-    _ip_hits[ip] = hits
-    return True
+def is_zip_code(s: str) -> bool:
+    return bool(re.fullmatch(r"\d{5}", s.strip()))
 
-
-def require_auth(request: Request):
-    if not APP_API_KEY:
-        return
-    if request.headers.get("X-API-Key", "") != APP_API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-# ----------------------------
-# Startup / Shutdown
-# ----------------------------
-@app.on_event("startup")
-async def startup():
-    global pool
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    if pool:
-        await pool.close()
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
-@app.get("/")
-async def home():
-    return FileResponse("static/index.html")
-
-
-# ----------------------------
-# SSE helpers
-# ----------------------------
-def sse(obj: dict) -> str:
-    return f"data: {json.dumps(obj)}\n\n"
-
-
-def stream_llm_to_sse(system: str, user_content: str, out_text_parts: List[str]):
-    """
-    Streams OpenAI chat.completions deltas as SSE 'delta' events.
-    """
-    try:
-        stream = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_content},
-            ],
-            stream=True,
-            timeout=30,
-        )
-        for chunk in stream:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                out_text_parts.append(delta)
-                yield sse({"type": "delta", "text": delta})
-    except OpenAIError as e:
-        logger.error(f"OpenAI error: {e}")
-        yield sse({"type": "error", "message": f"OpenAI error: {type(e).__name__}"})
-    except Exception as e:
-        logger.error(f"Streaming error: {e}")
-        yield sse({"type": "error", "message": f"Streaming error: {type(e).__name__}"})
-
-
-# ----------------------------
-# DB helpers
-# ----------------------------
-def _coerce_jsonb_to_dict(val) -> dict:
-    if val is None:
-        return {}
-    if isinstance(val, dict):
-        return val
-    if isinstance(val, str):
-        try:
-            parsed = json.loads(val)
-            return parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            return {}
-    return {}
-
-
-async def get_or_create_session(conn: asyncpg.Connection, session_id: Optional[str]) -> Tuple[str, Dict[str, Any]]:
-    if not session_id:
-        session_id = str(uuid.uuid4())
-    row = await conn.fetchrow("SELECT session_state FROM public.chat_session WHERE id = $1", session_id)
-    if row:
-        await conn.execute("UPDATE public.chat_session SET last_seen = now() WHERE id = $1", session_id)
-        return session_id, _coerce_jsonb_to_dict(row["session_state"])
-    await conn.execute(
-        "INSERT INTO public.chat_session (id, session_state) VALUES ($1, $2::jsonb)",
-        session_id,
-        json.dumps({}),
-    )
-    return session_id, {}
-
-
-async def save_message(conn: asyncpg.Connection, session_id: str, role: str, content: str, metadata: Optional[dict] = None):
-    await conn.execute(
-        "INSERT INTO public.chat_message (session_id, role, content, metadata) VALUES ($1,$2,$3,$4::jsonb)",
-        session_id,
-        role,
-        content,
-        json.dumps(metadata or {}),
-    )
-
-
-async def update_session_state(conn: asyncpg.Connection, session_id: str, state: Dict[str, Any]):
-    await conn.execute(
-        "UPDATE public.chat_session SET session_state = $2::jsonb, last_seen = now() WHERE id = $1",
-        session_id,
-        json.dumps(state),
-    )
-
-
-async def log_query(
-    conn: asyncpg.Connection,
-    session_id: str,
-    question: str,
-    intent: dict,
-    used_radius: Optional[float],
-    result_count: int,
-    used_web: bool,
-    answer_text: str,
-):
-    await conn.execute(
-        """
-        INSERT INTO public.query_log
-          (session_id, question, intent_json, used_radius_miles, result_count, used_web_search, answer_text)
-        VALUES ($1,$2,$3::jsonb,$4,$5,$6,$7)
-        """,
-        session_id,
-        question,
-        json.dumps(intent),
-        used_radius,
-        result_count,
-        used_web,
-        answer_text,
-    )
-
-
-# ----------------------------
-# Intent extraction
-# ----------------------------
-INTENT_RULES = """
-Return ONLY JSON with:
-mode: "general" | "price" | "hybrid" | "clarify"
-zipcode: 5-digit ZIP or null
-radius_miles: number or null
-payer_like: string like "Aetna" or null
-plan_like: string like "PPO" or null
-payment_mode: "cash" | "insurance" | null
-service_query: short phrase like "chest x-ray" or null
-code_type: string or null (usually "CPT")
-code: string or null (like "71046")
-clarifying_question: string or null
-cash_only: boolean
-
-Notes:
-- If user says "cash price", "self-pay", "out of pocket" => payment_mode="cash" and cash_only=true.
-- If user mentions insurance or a carrier name => payment_mode="insurance".
-"""
-
-
-def merge_state(state: Dict[str, Any], intent: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(state or {})
-    for k in ["zipcode", "radius_miles", "payer_like", "plan_like", "payment_mode", "service_query", "code_type", "code", "cash_only"]:
-        v = intent.get(k)
-        if v is not None and v != "":
-            out[k] = v
-    return out
-
-
-def _is_zip_only_message(msg: str) -> bool:
-    s = (msg or "").strip()
-    return len(s) == 5 and s.isdigit()
-
-
-def _normalize_payment_mode(merged: Dict[str, Any]) -> None:
-    if merged.get("cash_only") is True:
-        merged["payment_mode"] = "cash"
-        merged["payer_like"] = None
-        merged["plan_like"] = None
-        return
-
-    pm = merged.get("payment_mode")
-    if pm == "cash":
-        merged["cash_only"] = True
-        merged["payer_like"] = None
-        merged["plan_like"] = None
-    elif pm == "insurance":
-        merged["cash_only"] = False
-
-
-async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Deterministic session-aware intent extraction.
-
-    Key goals:
-      - Keep the user in the pricing flow once they started it.
-      - Ask for ZIP first if missing (geo-first).
-      - Accept short replies like "Cash", "Self pay", "Insurance", "Aetna" as continuations.
-      - Allow the user to change ZIP/payment/payer mid-session and rerun pricing accordingly.
-    """
-    msg = (message or "").strip()
-    msg_l = msg.lower()
-
-    # Pull existing context
-    st = state or {}
-    awaiting = st.get("_awaiting")
-    have_service = bool(st.get("service_query") or st.get("code"))
-    have_zip = bool(st.get("zipcode"))
-
-    if is_symptom_message(msg) and not any(kw in msg_l for kw in INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS) and not is_care_navigation_message(msg):
-        return {"mode": "general", "clarifying_question": None}
-
-    # 0) ZIP detection anywhere in the message
-    zip_match = re.search(r"\b(\d{5})\b", msg)
-    if zip_match:
-        z = zip_match.group(1)
-        # If we already have a service in session, treat this as continuation of pricing flow.
-        if have_service or awaiting in {"zip", "payment", "payer"}:
-            return {
-                "mode": "price",
-                "zipcode": z,
-                "service_query": st.get("service_query"),
-                "code_type": st.get("code_type"),
-                "code": st.get("code"),
-                "payment_mode": st.get("payment_mode"),
-                "payer_like": st.get("payer_like"),
-                "plan_like": st.get("plan_like"),
-                "clarifying_question": None,
-            }
-
-    # Helpers
-    cash_terms = {
-        "cash", "self pay", "self-pay", "selfpay", "out of pocket", "oop",
-        "paying cash", "pay cash", "cash pay", "self pay patient", "selfpay patient",
-    }
-    insurance_terms = {"insurance", "insured", "use insurance", "with insurance"}
-
-    carrier_map = {
-        "aetna": "Aetna",
-        "cigna": "Cigna",
-        "anthem": "Anthem",
-        "blue cross": "Blue Cross Blue Shield",
-        "bcbs": "Blue Cross Blue Shield",
-        "united": "UnitedHealthcare",
-        "uhc": "UnitedHealthcare",
-        "humana": "Humana",
-        "kaiser": "Kaiser Permanente",
-        "molina": "Molina",
-        "centene": "Centene",
-        "wellcare": "Wellcare",
-        "medicaid": "Medicaid",
-        "medicare": "Medicare",
-    }
-
-    def extract_carrier(m: str) -> Optional[str]:
-        ml = (m or "").lower()
-        # direct map matches
-        for k, v in carrier_map.items():
-            if k in ml:
-                return v
-
-        # Filter out common filler words so we don't accidentally treat
-        # "I have insurance" or "use insurance" as the carrier name "I Have Insurance".
-        clean = m
-        for stop in ["i have", "i use", "use", "with", "insurance", "my", "have", "paying"]:
-            # Word-boundary aware case-insensitive replacement
-            clean = re.sub(r'\b' + re.escape(stop) + r'\b', '', clean, flags=re.IGNORECASE)
-
-        clean = clean.strip()
-        tokens = re.findall(r"[a-zA-Z]+", clean)
-
-        # if the user replies with just a single word, treat it as a carrier candidate
-        if len(tokens) == 1 and len(tokens[0]) >= 3:
-            return tokens[0].title()
-        
-        # two-word carrier (e.g., "Harvard Pilgrim")
-        if 2 <= len(tokens) <= 3:
-            return " ".join([t.title() for t in tokens])
-            
-        return None
-
-    # 1) If we are explicitly awaiting ZIP, only accept ZIP (or a cancel/new question handled by LLM below).
-    if awaiting == "zip":
-        # If they didn't provide a ZIP, keep asking.
-        return {"mode": "clarify", "clarifying_question": "What’s your 5-digit ZIP code?"}
-
-    # 2) If we are awaiting payment, accept cash/insurance quickly.
-    if awaiting == "payment":
-        if any(t in msg_l for t in cash_terms):
-            return {
-                "mode": "price",
-                "zipcode": st.get("zipcode"),
-                "service_query": st.get("service_query"),
-                "code_type": st.get("code_type"),
-                "code": st.get("code"),
-                "payment_mode": "cash",
-                "payer_like": None,
-                "plan_like": None,
-                "clarifying_question": None,
-                "cash_only": True,
-            }
-
-        if any(t in msg_l for t in insurance_terms) or extract_carrier(msg):
-            payer_like = extract_carrier(msg)
-            return {
-                "mode": "price",
-                "zipcode": st.get("zipcode"),
-                "service_query": st.get("service_query"),
-                "code_type": st.get("code_type"),
-                "code": st.get("code"),
-                "payment_mode": "insurance",
-                "payer_like": payer_like,
-                "plan_like": None,
-                "clarifying_question": None,
-                "cash_only": False,
-            }
-
-        return {"mode": "clarify", "clarifying_question": "Are you paying cash (self-pay) or using insurance? If insurance, what carrier (e.g., Aetna)?"}
-
-    # 3) Session-aware continuation even when not awaiting:
-    # If the session already has service + zip, treat "cash"/"insurance"/carrier-only as updates and rerun pricing.
-    if have_service and have_zip:
-        if any(t in msg_l for t in cash_terms):
-            return {
-                "mode": "price",
-                "zipcode": st.get("zipcode"),
-                "service_query": st.get("service_query"),
-                "code_type": st.get("code_type"),
-                "code": st.get("code"),
-                "payment_mode": "cash",
-                "payer_like": None,
-                "plan_like": None,
-                "clarifying_question": None,
-                "cash_only": True,
-            }
-
-        carrier = extract_carrier(msg)
-        if any(t in msg_l for t in insurance_terms) or carrier:
-            return {
-                "mode": "price",
-                "zipcode": st.get("zipcode"),
-                "service_query": st.get("service_query"),
-                "code_type": st.get("code_type"),
-                "code": st.get("code"),
-                "payment_mode": "insurance",
-                "payer_like": carrier or st.get("payer_like"),
-                "plan_like": None,
-                "clarifying_question": None,
-                "cash_only": False,
-            }
-
-    # 4) If the user is asking a new price question but we lack ZIP, we will ask for ZIP (geo-first).
-    inferred_service = infer_service_query_from_message(msg)
-    if inferred_service and not have_zip:
-        # Force clarifying ZIP instead of letting the LLM ask for payment first.
-        return {"mode": "price", "service_query": inferred_service, "clarifying_question": None, "_new_price_question": True}
-
-    # 5) Otherwise fall back to LLM-based intent extraction (general Q&A, non-price).
-    try:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            temperature=0,
-            messages=[
-                {"role": "system", "content": "You extract intent for healthcare Q&A and price lookup. Be conservative."},
-                {"role": "system", "content": INTENT_RULES},
-                {"role": "user", "content": json.dumps({"message": msg, "session_state": st})},
-            ],
-            timeout=10,
-        )
-        content = resp.choices[0].message.content or "{}"
-        return json.loads(content)
-    except Exception as e:
-        logger.warning(f"Intent extraction failed: {e}")
-        return {"mode": "clarify", "clarifying_question": "What 5-digit ZIP code should I search near?"}
-
-def infer_service_query_from_message(message: str) -> Optional[str]:
-    msg = (message or "").lower()
-    if "colonoscopy" in msg:
-        return "colonoscopy"
-    if "mammogram" in msg or "mammo" in msg:
-        return "mammogram"
-    if "ultrasound" in msg:
-        return "ultrasound"
-    if "cat scan" in msg or "ct scan" in msg or (" ct " in f" {msg} "):
-        return "ct scan"
-    if "mri" in msg:
+def infer_parent_service_key(query: str) -> Optional[str]:
+    """Map free-text query to known parent_service keys (e.g., 'mri', 'ct', 'xray')."""
+    query = query.lower()
+    # Prioritize longer matches to avoid false positives (e.g., "ultrasound" not "sound")
+    if "mri" in query or "magnetic resonance" in query:
         return "mri"
-    if "x-ray" in msg or "xray" in msg:
-        return "x-ray"
-    if "blood test" in msg or "lab test" in msg or "labs" in msg:
-        return "lab test"
-    if "office visit" in msg or "doctor visit" in msg:
-        return "office visit"
-    return None
-
-
-
-def should_force_price_mode(message: str, merged: Dict[str, Any]) -> bool:
-    if not INTENT_OVERRIDE_FORCE_PRICE_ENABLED:
-        return False
-
-    msg = (message or "").lower()
-
-    if is_symptom_message(msg) and not any(kw in msg for kw in INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS):
-        return False
-
-    if (merged or {}).get("service_query") and (merged or {}).get("zipcode") and not (merged or {}).get("payment_mode"):
-        return True
-    if (merged or {}).get("_awaiting") in {"zip", "payment"}:
-        return True
-
-    return any(kw in msg for kw in INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS)
-
-
-def apply_intent_override_if_needed(intent: Dict[str, Any], message: str, merged: Dict[str, Any], session_id: str) -> Dict[str, Any]:
-    if should_force_price_mode(message, merged):
-        prev = intent.get("mode")
-        if prev != "price":
-            logger.info(
-                "Intent override applied: forcing mode=price",
-                extra={"session_id": session_id, "prev_mode": prev, "keywords": INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS},
-            )
-        intent["mode"] = "price"
-        intent["intent_overridden"] = True
-        intent["override_reason"] = "cost_keyword"
-
-        if not (merged.get("service_query") or "").strip():
-            inferred = infer_service_query_from_message(message)
-            if inferred:
-                merged["service_query"] = inferred
-                logger.info("Service query inferred from message", extra={"session_id": session_id, "service_query": inferred})
-    else:
-        intent["intent_overridden"] = False
-
-    return intent
-
-
-def message_contains_zip(message: str) -> bool:
-    msg = (message or "").strip()
-    tokens = [t.strip(",.()[]{}") for t in msg.split()]
-    return any(len(t) == 5 and t.isdigit() for t in tokens)
-
-
-def message_contains_payment_info(message: str) -> bool:
-    msg = (message or "").lower()
-    cash_terms = ["cash", "self pay", "self-pay", "out of pocket", "out-of-pocket", "uninsured", "no insurance"]
-    ins_terms = ["insurance", "insured", "copay", "coinsurance", "deductible"]
-    return any(t in msg for t in cash_terms) or any(t in msg for t in ins_terms)
-
-
-def reset_gating_fields_for_new_price_question(message: str, merged: Dict[str, Any]) -> None:
-    if not message_contains_zip(message):
-        merged.pop("zipcode", None)
-
-    if not message_contains_payment_info(message):
-        merged.pop("payment_mode", None)
-        merged.pop("payer_like", None)
-        merged.pop("plan_like", None)
-        merged.pop("cash_only", None)
-
-    # For a new pricing question, avoid reusing the previous service/code/variant context
-    # unless the user explicitly included a code in the message.
-    if not re.search(r"\b\d{4,5}[A-Z]?\b", (message or ""), flags=re.IGNORECASE):
-        merged.pop("code_type", None)
-        merged.pop("code", None)
-        merged.pop("service_id", None)
-        merged.pop("refiner_id", None)
-        merged.pop("refiner_choice", None)
-        merged.pop("variant_id", None)
-        merged.pop("variant_name", None)
-        merged.pop("variant_free_text", None)
-        merged.pop("variant_patient_summary", None)
-        merged.pop("_variant_choices", None)
-        merged.pop("variant_parent_service", None)
-        # Clear any in-progress gating prompts related to the prior service.
-        merged.pop("_awaiting", None)
-
-
-# ----------------------------
-# Care navigation (nearest hospital/urgent care)
-# ----------------------------
-
-def is_symptom_message(message: str) -> bool:
-    msg = (message or "").lower()
-    symptomish = [
-        "hurts", "hurt", "pain", "swollen", "swelling", "injury", "bleeding",
-        "nausea", "vomit", "vomiting", "dizzy", "dizziness",
-        "shortness of breath", "can't breathe", "cant breathe",
-        "stomach hurts", "abdominal pain", "fever",
-        "chest hurts", "chest pain",
-    ]
-    return any(s in msg for s in symptomish)
-
-
-def is_care_navigation_message(message: str) -> bool:
-    msg = (message or "").lower()
-
-    triggers = [
-        "go to hospital",
-        "need to go to hospital",
-        "i need to go to hospital",
-        "i need to go to the hospital",
-        "nearest hospital",
-        "closest hospital",
-        "which is the closest hospital",
-        "need a hospital",
-        "urgent care",
-        "emergency room",
-        "er ",
-        " er",
-    ]
-
-    # If the user is describing symptoms, proactively offer navigation help.
-    # (Pricing-mode overrides are handled elsewhere so price questions aren't hijacked.)
-    if is_symptom_message(msg):
-        return True
-
-    symptomish = [
-        "hurts",
-        "pain",
-        "swollen",
-        "swelling",
-        "injury",
-        "bleeding",
-        "can't walk",
-        "cant walk",
-        "broken",
-        "shortness of breath",
-        "can't breathe",
-        "cant breathe",
-        "stomach hurts",
-        "abdominal pain",
-        "chest hurts",
-        "chest pain",
-    ]
-    return any(t in msg for t in triggers) or ("hospital" in msg and any(s in msg for s in symptomish))
-
-
-def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    import math
-
-    R = 3959.0
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dl / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(a))
-
-
-async def get_zip_latlon(conn: asyncpg.Connection, zipcode: str) -> Optional[Tuple[float, float]]:
-    row = await conn.fetchrow(
-        "SELECT latitude, longitude FROM public.zip_locations WHERE zipcode = $1 LIMIT 1",
-        zipcode,
-    )
-    if row and row.get("latitude") is not None and row.get("longitude") is not None:
-        return float(row["latitude"]), float(row["longitude"])
-    return None
-
-
-async def geocode_zip_nominatim(zipcode: str) -> Optional[Tuple[float, float]]:
-    """Web fallback for ZIP -> lat/lon. Requires httpx and ENABLE_WEB_NEAREST_FACILITY."""
-    if not ENABLE_WEB_NEAREST_FACILITY or httpx is None:
-        return None
-    url = "https://nominatim.openstreetmap.org/search"
-    params = {"postalcode": zipcode, "country": "USA", "format": "json", "limit": 1}
-    headers = {"User-Agent": NOMINATIM_USER_AGENT}
-    async with httpx.AsyncClient(timeout=15, headers=headers) as client_http:
-        r = await client_http.get(url, params=params)
-        r.raise_for_status()
-        data = r.json()
-        if not data:
-            return None
-        return float(data[0]["lat"]), float(data[0]["lon"])
-
-
-async def find_nearest_hospitals_overpass(lat: float, lon: float, limit: int = 3) -> List[Dict[str, Any]]:
-    """Web lookup for nearby hospitals/ER-like clinics near a point."""
-    if not ENABLE_WEB_NEAREST_FACILITY or httpx is None:
-        return []
-
-    radius_m = 20000
-    query = f"""
-    [out:json][timeout:25];
-    (
-      node(around:{radius_m},{lat},{lon})["amenity"="hospital"];
-      way(around:{radius_m},{lat},{lon})["amenity"="hospital"];
-      relation(around:{radius_m},{lat},{lon})["amenity"="hospital"];
-      node(around:{radius_m},{lat},{lon})["amenity"="clinic"]["emergency"="yes"];
-      way(around:{radius_m},{lat},{lon})["amenity"="clinic"]["emergency"="yes"];
-      relation(around:{radius_m},{lat},{lon})["amenity"="clinic"]["emergency"="yes"];
-    );
-    out center tags;
-    """
-
-    url = "https://overpass-api.de/api/interpreter"
-    headers = {"User-Agent": NOMINATIM_USER_AGENT}
-
-    async with httpx.AsyncClient(timeout=30, headers=headers) as client_http:
-        r = await client_http.post(url, data=query)
-        r.raise_for_status()
-        payload = r.json()
-
-    elems = payload.get("elements", []) or []
-
-    def pick_point(e: dict) -> Optional[Tuple[float, float]]:
-        if "lat" in e and "lon" in e:
-            return float(e["lat"]), float(e["lon"])
-        c = e.get("center")
-        if c and "lat" in c and "lon" in c:
-            return float(c["lat"]), float(c["lon"])
-        return None
-
-    results: List[Dict[str, Any]] = []
-    for e in elems:
-        tags = e.get("tags", {}) or {}
-        pt = pick_point(e)
-        if not pt:
-            continue
-
-        name = (tags.get("name") or "Hospital/Clinic").strip()
-        street = tags.get("addr:street") or ""
-        housenumber = tags.get("addr:housenumber") or ""
-        city = tags.get("addr:city") or ""
-        state = tags.get("addr:state") or ""
-        postcode = tags.get("addr:postcode") or ""
-        phone = tags.get("phone") or tags.get("contact:phone") or ""
-
-        address = " ".join([p for p in [housenumber, street] if p]).strip()
-        addr_parts = [p for p in [address, city, state, postcode] if p]
-        full_addr = ", ".join(addr_parts)
-
-        d = haversine_miles(lat, lon, pt[0], pt[1])
-
-        results.append(
-            {
-                "name": name,
-                "address": full_addr,
-                "phone": phone,
-                "distance_miles": d,
-                "lat": pt[0],
-                "lon": pt[1],
-            }
-        )
-
-    results.sort(key=lambda x: x["distance_miles"])
-    return results[: max(1, int(limit or 3))]
-
-
-# ----------------------------
-# DB: resolve code + price lookup
-# ----------------------------
-async def resolve_service_code(conn: asyncpg.Connection, merged: Dict[str, Any]) -> Optional[Tuple[str, str]]:
-    if merged.get("code_type") and merged.get("code"):
-        return merged["code_type"], merged["code"]
-
-    q = (merged.get("service_query") or "").strip()
-    if not q:
-        return None
-
-    # 1) Canonical lookup from `services`
-    rows = await conn.fetch(
-        """
-        SELECT code_type, code
-        FROM public.services
-        WHERE (cpt_explanation ILIKE '%' || $1 || '%'
-            OR service_description ILIKE '%' || $1 || '%'
-            OR patient_summary ILIKE '%' || $1 || '%')
-        ORDER BY code_type, code
-        LIMIT 5
-        """,
-        q,
-    )
-    if rows:
-        return rows[0]["code_type"], rows[0]["code"]
-
-    # 2) Fallback: staged hospital file often has the right CPT even when `services` lacks the keyword
-    srows = await conn.fetch(
-        """
-        SELECT code_type, code, COUNT(*) AS n
-        FROM public.stg_hospital_rates
-        WHERE code_type IS NOT NULL AND code IS NOT NULL
-          AND (
-                service_description ILIKE '%' || $1 || '%'
-             OR code ILIKE '%' || $1 || '%'
-          )
-        GROUP BY code_type, code
-        ORDER BY n DESC, code_type, code
-        LIMIT 5
-        """,
-        q,
-    )
-    if srows:
-        return srows[0]["code_type"], srows[0]["code"]
-
-    return None
-
-async def price_lookup_v3(
-    conn: asyncpg.Connection,
-    zipcode: str,
-    code_type: str,
-    code: str,
-    payer_like: Optional[str],
-    plan_like: Optional[str],
-    radius_array: Optional[List[int]] = None,
-) -> List[Dict[str, Any]]:
-    radius_array = radius_array or [10, 25, 50]
-    rows = await conn.fetch(
-        """
-        SELECT *
-        FROM public.get_prices_by_zip_radius_v3(
-          $1, $2, $3, $4, $5,
-          $6::int[], 10, 25
-        );
-        """,
-        zipcode,
-        code_type,
-        code,
-        payer_like,
-        plan_like,
-        radius_array,
-    )
-    return [dict(r) for r in rows]
-
-
-async def price_lookup_staging(
-    conn: asyncpg.Connection,
-    zipcode: str,
-    service_query: str,
-    payer_like: Optional[str],
-    plan_like: Optional[str],
-    limit: int = 25,
-) -> List[Dict[str, Any]]:
-    """
-    DB-first fallback when we cannot resolve a code or the pricing function returns no rows.
-    It searches `stg_hospital_rates` by service_description and joins to `hospitals` + `zip_locations`
-    to compute distance (when possible). Returns a row shape compatible with `build_facility_block`.
-    """
-    q = (service_query or "").strip()
-    if not q:
-        return []
-
-    z = await conn.fetchrow(
-        "SELECT latitude, longitude FROM public.zip_locations WHERE zipcode = $1 LIMIT 1",
-        zipcode,
-    )
-    zlat = float(z["latitude"]) if z and z["latitude"] is not None else None
-    zlon = float(z["longitude"]) if z and z["longitude"] is not None else None
-
-    where_bits = ["r.service_description ILIKE '%' || $2 || '%'"]
-    args = [zipcode, q, payer_like, plan_like, limit]
-    # payer/plan filters are optional
-    payer_clause = "($3::text IS NULL OR r.payer_name ILIKE '%' || $3 || '%')"
-    plan_clause = "($4::text IS NULL OR r.plan_name ILIKE '%' || $4 || '%')"
-
-    if zlat is not None and zlon is not None:
-        sql = """
-        SELECT
-          h.name AS hospital_name,
-          h.address AS address,
-          h.state AS state,
-          h.zipcode AS zipcode,
-          h.phone AS phone,
-          h.latitude AS latitude,
-          h.longitude AS longitude,
-          (3959 * acos(
-              cos(radians($6)) * cos(radians(h.latitude)) * cos(radians(h.longitude) - radians($7)) +
-              sin(radians($6)) * sin(radians(h.latitude))
-          )) AS distance_miles,
-          r.code_type,
-          r.code,
-          r.payer_name,
-          r.plan_name,
-          r.standard_charge_discounted_cash AS standard_charge_cash,
-          r.standard_charge_negotiated_dollar AS negotiated_dollar,
-          r.estimated_amount AS estimated_amount
-        FROM public.stg_hospital_rates r
-        LEFT JOIN public.hospitals h ON h.id = r.hospital_id
-        WHERE r.service_description ILIKE '%' || $2 || '%'
-          AND """ + payer_clause + """ 
-          AND """ + plan_clause + """ 
-          AND h.latitude IS NOT NULL AND h.longitude IS NOT NULL
-        ORDER BY distance_miles ASC NULLS LAST
-        LIMIT $5
-        """
-        rows = await conn.fetch(sql, zipcode, q, payer_like, plan_like, limit, zlat, zlon)
-        return [dict(r) for r in rows]
-
-# ----------------------------
-# Nearest-facility pricing (geo-first, ensures a facility list)
-# ----------------------------
-async def get_service_id(conn: asyncpg.Connection, code_type: str, code: str) -> Optional[int]:
-    row = await conn.fetchrow(
-        "SELECT id FROM public.services WHERE code_type = $1 AND code = $2 LIMIT 1",
-        code_type,
-        code,
-    )
-    return int(row["id"]) if row else None
-
-
-async def get_service_ids(conn: asyncpg.Connection, service_query: str, code_type: Optional[str] = None, code: Optional[str] = None, limit: int = 25) -> List[int]:
-    """Return a list of candidate service_ids for a user query.
-
-    We prefer keyword matches in `services` (description/explanations), and we also include the
-    explicitly-resolved (code_type, code) id when provided.
-    """
-    q = (service_query or "").strip()
-    ids: List[int] = []
-
-    # 1) Keyword matches
-    if q:
-        rows = await conn.fetch(
-            """
-            SELECT id
-            FROM public.services
-            WHERE (cpt_explanation ILIKE '%' || $1 || '%'
-                OR service_description ILIKE '%' || $1 || '%'
-                OR patient_summary ILIKE '%' || $1 || '%')
-            ORDER BY id
-            LIMIT $2
-            """,
-            q,
-            limit,
-        )
-        ids.extend([int(r["id"]) for r in rows if r and r["id"] is not None])
-
-    # 2) Explicit code match (ensures at least one id if the keyword search is sparse)
-    if code_type and code:
-        sid = await get_service_id(conn, code_type, code)
-        if sid is not None:
-            ids.append(int(sid))
-
-    # de-dup, preserve order
-    out: List[int] = []
-    seen = set()
-    for i in ids:
-        if i not in seen:
-            out.append(i)
-            seen.add(i)
-    return out
-
-
-
-async def price_lookup_nearest_facilities(
-    conn: asyncpg.Connection,
-    zipcode: str,
-    code_type: str,
-    code: str,
-    service_query: str,
-    payment_mode: str,
-    payer_like: Optional[str],
-    plan_like: Optional[str],
-    limit: int = 10,
-    radius_array: Optional[List[int]] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Returns nearest facilities (by distance to ZIP centroid) with best-available price fields.
-
-    For cash: pulls MIN(standard_charge_cash) (fallback to MIN(estimated_amount), MIN(standard_charge_gross))
-    For insurance: pulls the first matching plan row by payer/plan filters with negotiated_dollar preferred.
-    """
-    radius_array = radius_array or [10, 25, 50, 100]
-    z = await conn.fetchrow("SELECT latitude, longitude FROM public.zip_locations WHERE zipcode = $1", zipcode)
-    if not z:
-        return []
-
-    zlat, zlon = float(z["latitude"]), float(z["longitude"])
-    service_ids = await get_service_ids(conn, service_query=service_query, code_type=code_type, code=code, limit=25)
-    if not service_ids:
-        return []
-
-    # We expand radius until we have enough rows, then return the best set.
-    last_rows: List[Dict[str, Any]] = []
-    for r in radius_array:
-        if payment_mode.lower() == "cash":
-            rows = await conn.fetch(
-                """
-                WITH user_zip AS (
-                    SELECT $1::double precision AS zlat, $2::double precision AS zlon
-                )
-                SELECT
-                    h.id AS hospital_id,
-                    h.name AS hospital_name,
-                    h.address,
-                    h.state,
-                    h.zipcode,
-                    h.phone,
-                    (3959 * acos(
-                        cos(radians((SELECT zlat FROM user_zip))) * cos(radians(h.latitude)) *
-                        cos(radians(h.longitude) - radians((SELECT zlon FROM user_zip))) +
-                        sin(radians((SELECT zlat FROM user_zip))) * sin(radians(h.latitude))
-                    )) AS distance_miles,
-                    nr.best_price,
-                    nr.standard_charge_cash,
-                    nr.estimated_amount,
-                    nr.standard_charge_gross
-                FROM public.hospitals h
-                JOIN LATERAL (
-                    SELECT
-                        COALESCE(
-                            MIN(standard_charge_cash),
-                            MIN(estimated_amount),
-                            MIN(standard_charge_gross)
-                        ) AS best_price,
-                        MIN(standard_charge_cash) AS standard_charge_cash,
-                        MIN(estimated_amount) AS estimated_amount,
-                        MIN(standard_charge_gross) AS standard_charge_gross
-                    FROM public.negotiated_rates
-                    WHERE hospital_id = h.id
-                      AND service_id = ANY($3::int[])
-                ) nr ON TRUE
-                WHERE h.latitude IS NOT NULL AND h.longitude IS NOT NULL
-                  AND (3959 * acos(
-                        cos(radians((SELECT zlat FROM user_zip))) * cos(radians(h.latitude)) *
-                        cos(radians(h.longitude) - radians((SELECT zlon FROM user_zip))) +
-                        sin(radians((SELECT zlat FROM user_zip))) * sin(radians(h.latitude))
-                  )) <= $4
-                  AND nr.best_price IS NOT NULL
-                ORDER BY distance_miles ASC
-                LIMIT $5
-                """,
-                zlat, zlon, service_ids, r, limit,
-            )
-        else:
-            payer_pat = f"%{payer_like}%" if payer_like else "%"
-            plan_pat = f"%{plan_like}%" if plan_like else "%"
-            rows = await conn.fetch(
-                """
-                WITH user_zip AS (
-                    SELECT $1::double precision AS zlat, $2::double precision AS zlon
-                )
-                SELECT
-                    h.id AS hospital_id,
-                    h.name AS hospital_name,
-                    h.address,
-                    h.state,
-                    h.zipcode,
-                    h.phone,
-                    (3959 * acos(
-                        cos(radians((SELECT zlat FROM user_zip))) * cos(radians(h.latitude)) *
-                        cos(radians(h.longitude) - radians((SELECT zlon FROM user_zip))) +
-                        sin(radians((SELECT zlat FROM user_zip))) * sin(radians(h.latitude))
-                    )) AS distance_miles,
-                    pick.best_price,
-                    pick.negotiated_dollar,
-                    pick.estimated_amount,
-                    pick.standard_charge_cash,
-                    pick.payer_name,
-                    pick.plan_name
-                FROM public.hospitals h
-                JOIN LATERAL (
-                    SELECT
-                        COALESCE(nr.negotiated_dollar, nr.estimated_amount, nr.standard_charge_cash) AS best_price,
-                        nr.negotiated_dollar,
-                        nr.estimated_amount,
-                        nr.standard_charge_cash,
-                        ip.payer_name,
-                        ip.plan_name
-                    FROM public.negotiated_rates nr
-                    JOIN public.insurance_plans ip ON ip.id = nr.plan_id
-                    WHERE nr.hospital_id = h.id
-                      AND nr.service_id = ANY($3::int[])
-                      AND ip.payer_name ILIKE $4
-                      AND ip.plan_name ILIKE $5
-                      AND (nr.negotiated_dollar IS NOT NULL OR nr.estimated_amount IS NOT NULL OR nr.standard_charge_cash IS NOT NULL)
-                    ORDER BY
-                        nr.negotiated_dollar NULLS LAST,
-                        nr.estimated_amount NULLS LAST,
-                        nr.standard_charge_cash NULLS LAST
-                    LIMIT 1
-                ) pick ON TRUE
-                WHERE h.latitude IS NOT NULL AND h.longitude IS NOT NULL
-                  AND (3959 * acos(
-                        cos(radians((SELECT zlat FROM user_zip))) * cos(radians(h.latitude)) *
-                        cos(radians(h.longitude) - radians((SELECT zlon FROM user_zip))) +
-                        sin(radians((SELECT zlat FROM user_zip))) * sin(radians(h.latitude))
-                  )) <= $6
-                ORDER BY distance_miles ASC
-                LIMIT $7
-                """,
-                zlat, zlon, service_ids, payer_pat, plan_pat, r, limit,
-            )
-
-        last_rows = [dict(rr) for rr in rows] if rows else last_rows
-        if len(last_rows) >= MIN_FACILITIES_TO_DISPLAY:
-            return last_rows
-
-    return last_rows
-
-
-    # No lat/lon available, return without distance ordering
-    sql2 = """
-    SELECT
-      COALESCE(h.name, r.hospital_name) AS hospital_name,
-      h.address AS address,
-      h.state AS state,
-      h.zipcode AS zipcode,
-      h.phone AS phone,
-      NULL::float AS distance_miles,
-      r.code_type,
-      r.code,
-      r.payer_name,
-      r.plan_name,
-      r.standard_charge_discounted_cash AS standard_charge_cash,
-      r.standard_charge_negotiated_dollar AS negotiated_dollar,
-      r.estimated_amount AS estimated_amount
-    FROM public.stg_hospital_rates r
-    LEFT JOIN public.hospitals h ON h.id = r.hospital_id
-    WHERE r.service_description ILIKE '%' || $2 || '%'
-      AND """ + payer_clause + """ 
-      AND """ + plan_clause + """ 
-    ORDER BY COALESCE(h.state, ''), COALESCE(h.zipcode, ''), COALESCE(h.name, r.hospital_name, '')
-    LIMIT $5
-    """
-    rows = await conn.fetch(sql2, zipcode, q, payer_like, plan_like, limit)
-    return [dict(r) for r in rows]
-
-
-async def price_lookup_progressive(
-    conn: asyncpg.Connection,
-    zipcode: str,
-    code_type: str,
-    code: str,
-    service_query: str,
-    payer_like: Optional[str],
-    plan_like: Optional[str],
-    payment_mode: str,
-) -> Tuple[List[Dict[str, Any]], Optional[int]]:
-    """Geo-first nearest-facility pricing lookup with expanding radius."""
-    radius_array = [10, 25, 50, 100]
-
-    rows = await price_lookup_nearest_facilities(
-        conn,
-        zipcode=zipcode,
-        code_type=code_type,
-        code=code,
-        service_query=service_query,
-        payment_mode=payment_mode,
-        payer_like=payer_like,
-        plan_like=plan_like,
-        limit=max(MIN_FACILITIES_TO_DISPLAY, 10),
-        radius_array=radius_array,
-    )
-
-    used_radius = None
-    if rows:
-        used_radius = radius_array[-1]
-    return rows, used_radius
-
-# ----------------------------
-# Nearby hospitals (for facility list even when no prices)
-# ----------------------------
-async def get_nearby_hospitals(conn: asyncpg.Connection, zipcode: str, limit: int = 5) -> List[Dict[str, Any]]:
-    """
-    Returns nearby hospitals with name/address/state/zipcode/phone (+ distance if possible).
-    Uses public.hospital_details for facility directory fields:
-      name, address, state, zipcode, phone, latitude, longitude
-    """
-    z = await conn.fetchrow(
-        "SELECT latitude, longitude FROM public.zip_locations WHERE zipcode = $1 LIMIT 1",
-        zipcode,
-    )
-    zlat = float(z["latitude"]) if z and z["latitude"] is not None else None
-    zlon = float(z["longitude"]) if z and z["longitude"] is not None else None
-
-    if zlat is not None and zlon is not None:
-        q = """
-        SELECT
-          h.name AS hospital_name,
-          h.address AS address,
-          h.state AS state,
-          h.zipcode AS zipcode,
-          h.phone AS phone,
-          h.latitude AS latitude,
-          h.longitude AS longitude,
-          (3959 * acos(
-              cos(radians($2)) * cos(radians(h.latitude)) * cos(radians(h.longitude) - radians($3)) +
-              sin(radians($2)) * sin(radians(h.latitude))
-          )) AS distance_miles
-        FROM public.hospital_details h
-        WHERE h.latitude IS NOT NULL AND h.longitude IS NOT NULL
-        ORDER BY distance_miles ASC
-        LIMIT $1
-        """
-        rows = await conn.fetch(q, limit, zlat, zlon)
-        return [dict(r) for r in rows]
-
-    # If we can’t compute distance, still return facilities
-    q2 = """
-    SELECT
-      h.name AS hospital_name,
-      h.address AS address,
-      h.state AS state,
-      h.zipcode AS zipcode,
-      h.phone AS phone,
-      NULL::float AS distance_miles
-    FROM public.hospital_details h
-    ORDER BY h.state, h.zipcode, h.name
-    LIMIT $1
-    """
-    rows = await conn.fetch(q2, limit)
-    return [dict(r) for r in rows]
-
-
-# ----------------------------
-# Estimated range (when DB price missing)
-# ----------------------------
-def estimate_cost_range(service_query: str, payment_mode: str) -> str:
-    """
-    Returns a short '$X–$Y' range, explicitly an estimate.
-    This is used ONLY when DB pricing is missing.
-    """
-    system = (
-        "You output ONLY a short numeric range for a U.S. healthcare service.\n"
-        "Format: '$X–$Y'. No extra text.\n"
-        "Be conservative and plausible."
-    )
-    user = json.dumps({"service": service_query, "payment_mode": payment_mode})
-    try:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            timeout=12,
-        )
-        txt = (resp.choices[0].message.content or "").strip()
-        # basic sanity
-        if "$" in txt and any(ch.isdigit() for ch in txt):
-            return txt
-        return "$1,000–$3,000"
-    except Exception:
-        return "$1,000–$3,000"
-
-
-# ----------------------------
-# Service variants (variant-first, DB-driven)
-# ----------------------------
-_service_variants_has_patient_summary: Optional[bool] = None
-
-def infer_parent_service_key(service_query: str) -> Optional[str]:
-    """Normalize a user service query into a parent_service key used by public.service_variants."""
-    q = (service_query or "").strip().lower()
-    if not q:
-        return None
-    if "mri" in q:
-        return "mri"
-    if "ct" in q or "cat scan" in q or "ct scan" in q:
+    if "ct scan" in query or "cat scan" in query or "computed tomography" in query:
         return "ct"
-    if "x-ray" in q or "xray" in q:
-        return "x-ray"
-    if "ultrasound" in q or "sonogram" in q:
+    if "x-ray" in query or "xray" in query:
+        return "xray"
+    if "ultrasound" in query or "sonogram" in query:
         return "ultrasound"
+    if "mammogram" in query:
+        return "mammogram"
     return None
 
-
-def is_generic_imaging_request(message: str, parent_service: str) -> bool:
-    """Return True when the user asked for a modality price (MRI/CT/X-ray/US) without specifying body part / contrast."""
-    msg = (message or "").lower()
-    # Contrast hints
-    if "with contrast" in msg or "without contrast" in msg or "w/ contrast" in msg or "wo contrast" in msg:
-        return False
-    # Common body-part/region hints (not exhaustive, just to avoid false-gating)
-    body_terms = [
-        "brain", "head", "neck", "spine", "cervical", "thoracic", "lumbar",
-        "knee", "hip", "shoulder", "ankle", "wrist", "elbow", "hand", "foot",
-        "abdomen", "pelvis", "chest", "heart", "cardiac", "coronary",
-        "breast", "prostate",
-    ]
-    if any(t in msg for t in body_terms):
-        return False
-
-    # If they mention just the modality, treat as generic.
-    key = (parent_service or "").lower()
-    if key == "mri" and "mri" in msg:
-        return True
-    if key == "ct" and ("ct" in msg or "ct scan" in msg or "cat scan" in msg):
-        return True
-    if key in ("x-ray", "xray") and ("x-ray" in msg or "xray" in msg):
-        return True
-    if key == "ultrasound" and ("ultrasound" in msg or "sonogram" in msg):
-        return True
-
-    return False
-
-
-async def _detect_service_variants_summary_column(conn: asyncpg.Connection) -> bool:
-    """Detect whether public.service_variants uses patient_summary or the legacy patient_summar."""
-    global _service_variants_has_patient_summary
-    if _service_variants_has_patient_summary is not None:
-        return _service_variants_has_patient_summary
-
-    row = await conn.fetchrow(
-        """
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema='public'
-          AND table_name='service_variants'
-          AND column_name='patient_summary'
-        LIMIT 1
-        """
-    )
-    _service_variants_has_patient_summary = bool(row)
-    return _service_variants_has_patient_summary
-
-
-async def get_service_variants_for_parent(conn: asyncpg.Connection, parent_service: str) -> List[Dict[str, Any]]:
-    """Fetch variants for a parent_service from public.service_variants."""
-    if not parent_service:
-        return []
-
-    has_summary = await _detect_service_variants_summary_column(conn)
-    summary_col = "patient_summary" if has_summary else "patient_summar"
-
-    rows = await conn.fetch(
-        f"""
-        SELECT
-          id,
-          parent_service,
-          cpt_code,
-          variant_name,
-          {summary_col} AS patient_summary,
-          is_preventive
-        FROM public.service_variants
-        WHERE lower(parent_service) = lower($1)
-        ORDER BY is_preventive DESC NULLS LAST, variant_name ASC, id ASC
-        """,
-        parent_service,
-    )
-    return [dict(r) for r in rows]
-
+def apply_service_variant_choice(user_input: str, state: Dict[str, Any], variants: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Applies variant choice (e.g., '2') to session state."""
+    try:
+        choice_idx = int(clean_text(user_input)) - 1
+        if 0 <= choice_idx < len(variants):
+            v = variants[choice_idx]
+            state["variant_id"] = v["id"]
+            state["code_type"] = "cpt"
+            state["code"] = v["cpt_code"]
+            state["variant_name"] = v["variant_name"]
+            state["patient_summary"] = v["patient_summary"]
+            state["is_preventive"] = v["is_preventive"]
+            state["parent_service"] = v["parent_service"]
+            # Clear awaiting flags
+            state.pop("_awaiting", None)
+            state.pop("_variant_choices", None)
+            logger.info(f"Variant selected: {v['variant_name']} (CPT {v['cpt_code']})")
+            return state
+    except (ValueError, IndexError, KeyError):
+        pass
+    # Invalid choice — leave state unchanged (will reprompt)
+    return state
 
 def build_service_variant_prompt(parent_service: str, variants: List[Dict[str, Any]]) -> str:
-    """Ask user to choose a variant BEFORE collecting ZIP."""
+    """Ask user to choose a variant BEFORE collecting ZIP.
+    Emphasize body part, contrast, modality, and clinical purpose."""
     lines: List[str] = []
-    lines.append(f"Before I look up prices, which specific type of **{parent_service.upper()}** do you mean?")
+    lines.append(f"Before I look up prices, which specific type of **{parent_service.upper()}** do you need?")
     lines.append("")
-    lines.append("Common variants include different body parts and whether contrast is used.")
+    lines.append("The exact exam matters for accurate pricing (e.g., body part, contrast use, clinical purpose).")
     lines.append("")
     for i, v in enumerate(variants, start=1):
-        label = (v.get("variant_name") or "").strip() or "Variant"
+        name = (v.get("variant_name") or "Variant").strip()
         summary = (v.get("patient_summary") or "").strip()
         cpt = (v.get("cpt_code") or "").strip()
-        tail = []
+        parts = [f"{i}) **{name}**"]
         if cpt:
-            tail.append(f"CPT {cpt}")
+            parts.append(f"(CPT {cpt})")
         if summary:
-            tail.append(summary)
-        suffix = " – " + " | ".join(tail) if tail else ""
-        lines.append(f"{i}) {label}{suffix}")
+            parts.append(f"— {summary}")
+        lines.append(" ".join(parts))
     lines.append("")
-    lines.append("Reply with the number that matches what you want.")
+    lines.append("👉 Reply with the **number** (e.g., `2`) that matches your exam.")
     return "\n".join(lines)
 
+# -------- DB HELPERS --------
 
-def build_generic_imaging_variant_prompt(parent_service: str) -> str:
-    ps = (parent_service or "").lower()
-    if ps == "mri":
-        examples = [
-            "MRI brain (with or without contrast)",
-            "MRI knee (usually without contrast)",
-            "MRI lumbar spine (with or without contrast)",
-            "MRI shoulder (with or without contrast)",
-            "MRI abdomen/pelvis (often with contrast)",
-        ]
-    elif ps == "ct":
-        examples = [
-            "CT head without contrast",
-            "CT chest with contrast",
-            "CT abdomen/pelvis with contrast",
-            "CT angiography (CTA)",
-            "CT coronary calcium score (no contrast)",
-        ]
-    elif ps == "x-ray":
-        examples = [
-            "X-ray chest (1 view or 2 views)",
-            "X-ray knee (2–4 views)",
-            "X-ray shoulder",
-            "X-ray ankle/foot",
-        ]
-    elif ps == "ultrasound":
-        examples = [
-            "Ultrasound abdomen (complete)",
-            "Ultrasound pelvis",
-            "Ultrasound pregnancy/OB",
-            "Ultrasound venous Doppler leg",
-        ]
-    else:
-        examples = []
-
-    lines: List[str] = []
-    lines.append(f"Before I look up prices, which specific **{ps.upper()}** do you mean?")
-    lines.append("")
-    if examples:
-        lines.append("For example:")
-        for ex in examples:
-            lines.append(f"- {ex}")
-        lines.append("")
-    lines.append('Reply with the exact variant in a few words (example: "MRI knee without contrast").')
-    return "\n".join(lines)
-
-
-def apply_service_variant_choice(message: str, merged: Dict[str, Any], variants: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Apply a numeric variant choice to session state."""
-    s = (message or "").strip()
-    if not s.isdigit():
-        return merged
-    idx = int(s) - 1
-    if idx < 0 or idx >= len(variants):
-        return merged
-
-    picked = variants[idx]
-    merged["code_type"] = "CPT"
-    merged["code"] = str(picked.get("cpt_code") or "").strip() or merged.get("code")
-    merged["variant_id"] = picked.get("id")
-    merged["variant_name"] = picked.get("variant_name")
-    merged["variant_parent_service"] = picked.get("parent_service")
-    merged["variant_patient_summary"] = picked.get("patient_summary")
-    merged.pop("_awaiting", None)
-    return merged
-
-
-
-async def price_lookup_staging_by_cpt_with_variants(
-    conn: asyncpg.Connection,
-    zipcode: str,
-    cpt_code: str,
-    payment_mode: str,
-    payer_like: Optional[str] = None,
-    plan_like: Optional[str] = None,
-    limit: int = 25,
-) -> List[Dict[str, Any]]:
-    """Pricing using stg_hospital_rates + service_variants, ranked by distance.
-
-    - cash: prefers discounted cash, then estimated, then gross
-    - insurance: prefers negotiated dollar, then estimated, then cash, then gross
-    """
-    if not zipcode or not cpt_code:
-        return []
-
-    z = await conn.fetchrow(
-        "SELECT latitude, longitude FROM public.zip_locations WHERE zipcode = $1 LIMIT 1",
-        zipcode,
-    )
-    if not z or z["latitude"] is None or z["longitude"] is None:
-        return []
-
-    zlat = float(z["latitude"])
-    zlon = float(z["longitude"])
-
-    pm = (payment_mode or "cash").lower()
-    payer_pat = f"%{payer_like}%" if payer_like else "%"
-    plan_pat = f"%{plan_like}%" if plan_like else "%"
-
-    rows = await conn.fetch(
-        """
-        SELECT
-          h.name AS hospital_name,
-          h.address AS address,
-          h.state AS state,
-          h.zipcode AS zipcode,
-          h.phone AS phone,
-          h.latitude AS latitude,
-          h.longitude AS longitude,
-          (3959 * acos(
-              cos(radians($2)) * cos(radians(h.latitude)) * cos(radians(h.longitude) - radians($3)) +
-              sin(radians($2)) * sin(radians(h.latitude))
-          )) AS distance_miles,
-          r.code_type,
-          r.code,
-          r.payer_name,
-          r.plan_name,
-          r.standard_charge_discounted_cash AS standard_charge_cash,
-          r.standard_charge_negotiated_dollar AS negotiated_dollar,
-          r.estimated_amount AS estimated_amount,
-          r.standard_charge_gross AS standard_charge_gross,
-          sv.variant_name AS variant_name,
-          sv.patient_summary AS variant_patient_summary,
-          CASE
-            WHEN $6 = 'insurance' THEN COALESCE(
-              r.standard_charge_negotiated_dollar,
-              r.estimated_amount,
-              r.standard_charge_discounted_cash,
-              r.standard_charge_gross
-            )
-            ELSE COALESCE(
-              r.standard_charge_discounted_cash,
-              r.estimated_amount,
-              r.standard_charge_gross
-            )
-          END AS best_price
-        FROM public.stg_hospital_rates r
-        LEFT JOIN public.hospitals h ON h.id = r.hospital_id
-        LEFT JOIN public.service_variants sv
-          ON sv.cpt_code = r.code
-        WHERE r.code_type ILIKE 'CPT'
-          AND r.code = $1
-          AND h.latitude IS NOT NULL AND h.longitude IS NOT NULL
-          AND ($4::text IS NULL OR r.payer_name ILIKE $7)
-          AND ($5::text IS NULL OR r.plan_name ILIKE $8)
-        ORDER BY distance_miles ASC NULLS LAST, best_price ASC NULLS LAST
-        LIMIT $9
-        """,
-        cpt_code, zlat, zlon, payer_like, plan_like, pm, payer_pat, plan_pat, limit,
-    )
-    return [dict(r) for r in rows]
-
-# ----------------------------
-# Service education bullets (service-specific, avoids colonoscopy-only text)
-# ----------------------------
-def build_service_education_bullets(service_query: str, payment_mode: str) -> List[str]:
-    q = (service_query or "").lower()
-
-    if "colonoscopy" in q:
-        return [
-            "- Colonoscopies can be **screening** (preventive) or **diagnostic** (symptoms/abnormal finding).",
-            "- Facility setting matters, **outpatient endoscopy centers** often differ from **hospital outpatient** pricing.",
-            "- If a biopsy or polyp removal happens, total cost can increase.",
-        ]
-
-    if "mri" in q:
-        return [
-            "- MRI prices vary by **body part** and whether it’s **with or without contrast**.",
-            "- Many totals include both the **technical** fee (scanner/facility) and the **professional** fee (radiologist read).",
-            "- If sedation is used, that can add to the total.",
-        ]
-
-    if "ct" in q or "cat scan" in q:
-        return [
-            "- CT prices vary by **body part** and whether it’s **with or without contrast**.",
-            "- If contrast is used, there may be additional charges for the contrast material and administration.",
-            "- Hospital outpatient CT is often priced differently than freestanding imaging centers.",
-        ]
-
-    if "x-ray" in q or "xray" in q:
-        return [
-            "- X-ray prices vary by **body part** and the number of views.",
-            "- There may be separate charges for the **facility** and the **radiologist interpretation**.",
-        ]
-
-    if "ultrasound" in q:
-        return [
-            "- Ultrasound prices vary by **body part** and whether it’s a **limited** vs **complete** study.",
-            "- Some totals include the **facility** fee and the **radiologist interpretation** separately.",
-        ]
-
-    return [
-        "- Prices can vary by facility setting (hospital outpatient vs freestanding clinic).",
-        "- Additional services (contrast, anesthesia, labs, interpretation fees) can change the total.",
-    ]
-
-# ----------------------------
-# Facility formatting
-# ----------------------------
-def _pick_price_fields(row: Dict[str, Any]) -> Optional[float]:
-    """
-    Best-effort: try common column names returned by your SQL function.
-    """
-    for k in ["best_price","standard_charge_cash","standard_charge_discounted_cash","cash_price","cash","negotiated_dollar","standard_charge_negotiated_dollar","negotiated_percentage","standard_charge_negotiated_percentage","estimated_amount","standard_charge","standard_charge_gross","rate","price","allowed_amount"]:
-        v = row.get(k)
-        if isinstance(v, (int, float)):
-            return float(v)
-        # sometimes Decimal
-        try:
-            if v is not None and str(v).replace(".", "", 1).isdigit():
-                return float(v)
-        except Exception:
-            pass
-    return None
-
-
-def _pick_hospital_name(row: Dict[str, Any]) -> str:
-    return (row.get("hospital_name") or row.get("name") or "Unknown facility").strip()
-
-def _pick_phone(row: Dict[str, Any]) -> str:
-    return (row.get("phone") or "").strip()
-
-
-def _pick_address(row: Dict[str, Any]) -> str:
-    # Build a readable one-liner from common fields
-    addr = row.get("address") or row.get("street_address") or ""
-    city = row.get("city") or ""
-    state = row.get("state") or ""
-    z = row.get("zipcode") or row.get("zip") or ""
-    parts = [p for p in [addr, city, state, z] if p]
-    return ", ".join(parts).strip()
-
-
-def _format_money(v: Optional[float]) -> str:
-    if v is None:
-        return ""
+async def get_service_variants_for_parent(conn, parent_service: str) -> List[Dict[str, Any]]:
+    """Fetch variants from DB. Fallback to empty list on error."""
     try:
-        return f"${v:,.0f}"
-    except Exception:
-        return f"${v}"
-
-
-def build_facility_block(
-    service_query: str,
-    payment_mode: str,
-    priced_results: List[Dict[str, Any]],
-    fallback_hospitals: List[Dict[str, Any]],
-    variant_info: Optional[Dict[str, Any]] = None,
-) -> Tuple[str, List[Dict[str, Any]]]:
-    """
-    Returns (text_answer, facilities_payload_for_ui).
-    Always produces at least MIN_FACILITIES_TO_DISPLAY facilities in text when possible.
-    """
-    facilities: List[Dict[str, Any]] = []
-
-    # 1) Start with priced results (dedupe by name)
-    seen = set()
-    for r in priced_results:
-        name = _pick_hospital_name(r)
-        key = name.lower().strip()
-        if key in seen:
-            continue
-        seen.add(key)
-        facilities.append(r)
-        if len(facilities) >= MIN_FACILITIES_TO_DISPLAY:
-            break
-
-    # 2) Top up with nearby hospitals if we still need more
-    for h in fallback_hospitals:
-        if len(facilities) >= MIN_FACILITIES_TO_DISPLAY:
-            break
-        name = (h.get("hospital_name") or "").strip() or "Unknown facility"
-        key = name.lower().strip()
-        if key in seen:
-            continue
-        seen.add(key)
-        facilities.append(h)
-
-    # If still empty, return a graceful message (should be rare if hospitals are loaded)
-    if not facilities:
-        return (
-            "I couldn’t find hospitals near that ZIP code in my database yet. "
-            "Try another nearby ZIP, or expand the search radius.",
-            [],
-        )
-
-    # Prepare an estimate range if needed
-    est_range = estimate_cost_range(service_query or "this service", payment_mode or "cash")
-
-    # Build answer text
-    bullets = build_service_education_bullets(service_query or "this service", payment_mode or "cash")
-
-    lines = []
-    # If we have a selected variant, show it clearly (and keep it patient-friendly).
-    if variant_info:
-        v_name = (variant_info.get("variant_name") or "").strip()
-        v_code = (variant_info.get("cpt_code") or variant_info.get("code") or "").strip()
-        v_sum = (variant_info.get("patient_summary") or variant_info.get("variant_patient_summary") or "").strip()
-        if v_name or v_code:
-            label = v_name if v_name else "Selected service"
-            code_txt = f" (CPT {v_code})" if v_code else ""
-            lines.append(f"Selected: **{label}**{code_txt}")
-            if v_sum:
-                lines.append(f"- {v_sum}")
-            lines.append("")
-    lines.extend(bullets)
-    lines.append("")
-    lines.append(f"Here are nearby options for **{service_query or 'this service'}** ({payment_mode}):")
-
-    for i, f in enumerate(facilities[:MIN_FACILITIES_TO_DISPLAY], start=1):
-        name = _pick_hospital_name(f) if "hospital_name" not in f else (f.get("hospital_name") or _pick_hospital_name(f))
-        addr = _pick_address(f)
-        phone = _pick_phone(f) if "phone" not in f else (f.get("phone") or _pick_phone(f))
-        dist = f.get("distance_miles") or f.get("distance") or f.get("miles")
-        dist_txt = ""
-        try:
-            if dist is not None:
-                dist_txt = f" ({float(dist):.1f} mi)"
-        except Exception:
-            pass
-
-        price = _pick_price_fields(f)
-        if price is not None:
-            price_txt = _format_money(price)
-            price_note = "DB price"
-        else:
-            price_txt = est_range
-            price_note = "ESTIMATE (no DB price yet)"
-
-        detail_bits = []
-        if addr:
-            detail_bits.append(addr)
-        if phone:
-            detail_bits.append(f"Tel: {phone}")
-        if detail_bits:
-            detail = " | ".join(detail_bits)
-        else:
-            detail = "Contact info not available in DB."
-
-        lines.append(f"{i}) **{name}**{dist_txt}")
-        lines.append(f"   - {detail}")
-        lines.append(f"   - Price: **{price_txt}** ({price_note})")
-
-    lines.append("")
-    lines.append("Confirm with the facility and your insurer.")
-
-    # Build facility payload for UI
-    ui_payload = []
-    for f in facilities[:MIN_FACILITIES_TO_DISPLAY]:
-        ui_payload.append(
-            {
-                "hospital_name": f.get("hospital_name") or _pick_hospital_name(f),
-                "address": _pick_address(f),
-                "phone": f.get("phone") or _pick_phone(f),
-                "distance_miles": f.get("distance_miles") or f.get("distance"),
-                "price": _pick_price_fields(f),
-                "estimated_range": None if _pick_price_fields(f) is not None else est_range,
-                "price_is_estimate": _pick_price_fields(f) is None,
-            }
-        )
-
-    return "\n".join(lines), ui_payload
-
-
-# ----------------------------
-# Service refiners (DB-first, Python fallback)
-# ----------------------------
-_refiners_cache: Optional[dict] = None
-_refiners_cache_loaded_at: float = 0.0
-
-
-def _norm(s: str) -> str:
-    return (s or "").strip().lower()
-
-
-async def load_refiners_from_db(conn: asyncpg.Connection) -> dict:
-    rows = await conn.fetch(
-        """
-        SELECT id, title, keywords, require_choice_before_pricing,
-               preview_code_type, preview_code, question_text
-        FROM public.service_refiner
-        WHERE is_active = true
-        ORDER BY id
-        """
-    )
-    if not rows:
-        return {"version": 1, "refiners": []}
-
-    ids = [r["id"] for r in rows]
-    crows = await conn.fetch(
-        """
-        SELECT refiner_id, choice_key, choice_label, code_type, code, sort_order
-        FROM public.service_refiner_choice
-        WHERE is_active = true AND refiner_id = ANY($1::text[])
-        ORDER BY refiner_id, sort_order, choice_key
-        """,
-        ids,
-    )
-
-    choices_by_ref: Dict[str, List[dict]] = {}
-    for c in crows:
-        choices_by_ref.setdefault(c["refiner_id"], []).append(
-            {"key": c["choice_key"], "label": c["choice_label"], "code_type": c["code_type"], "code": c["code"]}
-        )
-
-    refiners: List[dict] = []
-    for r in rows:
-        preview = None
-        if r["preview_code_type"] and r["preview_code"]:
-            preview = {"code_type": r["preview_code_type"], "code": r["preview_code"]}
-        refiners.append(
-            {
-                "id": r["id"],
-                "title": r["title"],
-                "match": {"keywords": list(r["keywords"] or [])},
-                "require_choice_before_pricing": bool(r["require_choice_before_pricing"]),
-                "preview_code": preview,
-                "question": r["question_text"],
-                "choices": choices_by_ref.get(r["id"], []),
-            }
-        )
-
-    return {"version": 1, "refiners": refiners}
-
-
-async def get_refiners(conn: asyncpg.Connection) -> dict:
-    global _refiners_cache, _refiners_cache_loaded_at
-    now = time.time()
-    if _refiners_cache and (now - _refiners_cache_loaded_at) < REFINERS_CACHE_TTL_SECONDS:
-        return _refiners_cache
-
-    data = None
-    try:
-        data = await load_refiners_from_db(conn)
+        query = text("""
+            SELECT id, parent_service, cpt_code, variant_name, patient_summary, is_preventive
+            FROM service_variants
+            WHERE LOWER(parent_service) = LOWER(:ps)
+            ORDER BY variant_name
+        """)
+        rows = await conn.fetch_all(query, {"ps": parent_service})
+        return [dict(row) for row in rows]
     except Exception as e:
-        logger.warning(f"Refiners DB load failed, using Python fallback: {e}")
+        logger.error(f"Error fetching variants for {parent_service}: {e}")
+        return []
 
-    if not data or not data.get("refiners"):
-        data = refiners_registry()
+async def price_lookup_staging_by_cpt_with_variants(conn, cpt_code: str, zip_code: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """Join stg_hospital_rates + service_variants for richer output."""
+    try:
+        query = text("""
+            SELECT
+                h.hospital_name,
+                h.city,
+                h.state,
+                h.zip_code,
+                h.distance_miles,
+                h.standard_charge,
+                h.cash_price,
+                h.payer_name,
+                h.payer_type,
+                v.variant_name,
+                v.patient_summary
+            FROM stg_hospital_rates h
+            LEFT JOIN service_variants v ON h.cpt_code = v.cpt_code
+            WHERE h.cpt_code = :cpt
+              AND h.zip_code = :zip
+            ORDER BY h.distance_miles ASC NULLS LAST, 
+                     COALESCE(h.cash_price, h.standard_charge) ASC NULLS LAST
+            LIMIT :limit
+        """)
+        rows = await conn.fetch_all(query, {"cpt": cpt_code, "zip": zip_code, "limit": limit})
+        return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Pricing query failed: {e}")
+        return []
 
-    _refiners_cache = data
-    _refiners_cache_loaded_at = now
-    return data
+# -------- LIFECYCLE --------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await database.connect()
+    yield
+    await database.disconnect()
 
+app = FastAPI(lifespan=lifespan)
 
-def match_refiner(service_query: str, refiners_doc: dict) -> Optional[dict]:
-    q = _norm(service_query)
-    if not q:
-        return None
-    for ref in refiners_doc.get("refiners", []):
-        kws = [_norm(k) for k in (ref.get("match", {}).get("keywords") or [])]
-        if any(k and k in q for k in kws):
-            return ref
-    return None
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-
-def apply_refiner_choice(message: str, merged: dict, refiner: Optional[dict]) -> dict:
-    if not refiner:
-        return merged
-    choice_key = (message or "").strip()
-    if not choice_key:
-        return merged
-    for ch in refiner.get("choices", []):
-        if str(ch.get("key")) == choice_key:
-            merged["code_type"] = ch.get("code_type")
-            merged["code"] = ch.get("code")
-            merged["refiner_id"] = refiner.get("id")
-            merged["refiner_choice"] = choice_key
-            return merged
-    return merged
-
-
-def maybe_apply_preview_code(merged: dict, refiner: Optional[dict]) -> dict:
-    if not refiner:
-        return merged
-    if refiner.get("require_choice_before_pricing") is True:
-        return merged
-    if merged.get("code_type") and merged.get("code"):
-        return merged
-    preview = refiner.get("preview_code")
-    if preview and preview.get("code_type") and preview.get("code"):
-        merged["code_type"] = preview["code_type"]
-        merged["code"] = preview["code"]
-        merged["refiner_id"] = refiner.get("id")
-    return merged
-
-
-def needs_refinement(merged: dict, refiner: Optional[dict]) -> bool:
-    if not refiner:
-        return False
-    if merged.get("refiner_choice"):
-        return False
-
-    code_type = merged.get("code_type")
-    code = merged.get("code")
-    preview = refiner.get("preview_code")
-
-    if refiner.get("require_choice_before_pricing") is True:
-        return True
-    if not (code_type and code):
-        return True
-    if preview and code_type == preview.get("code_type") and code == preview.get("code"):
-        return True
-    return False
-
-
-def get_refinement_prompt(refiner: dict) -> str:
-    lines = [refiner.get("question", "").strip(), ""]
-    for ch in refiner.get("choices", []):
-        lines.append(f"{ch.get('key')}) {ch.get('label')}")
-    lines.append("")
-    lines.append("Reply with the number that fits best.")
-    return "\n".join([l for l in lines if l])
-
-
-# ----------------------------
-# Main streaming endpoint
-# ----------------------------
+# -------- ENDPOINTS --------
 @app.post("/chat_stream")
-async def chat_stream(req: ChatRequest, request: Request):
-    require_auth(request)
-    ip = request.client.host if request.client else "unknown"
-    if not rate_limit_ok(ip):
-        raise HTTPException(429, detail="Rate limit exceeded.")
-    if not pool:
-        raise HTTPException(500, detail="Database not ready")
-
+async def chat_stream(req: ChatMessageRequest):
     async def event_gen():
-        try:
-            async with pool.acquire() as conn:
-                session_id, state = await get_or_create_session(conn, req.session_id)
-                yield sse({"type": "session", "session_id": session_id})
-                await save_message(conn, session_id, "user", req.message)
+        session_id = req.session_id or str(uuid.uuid4())
+        async with database.transaction() as conn:
+            # Load or init session state
+            query = text("SELECT state FROM sessions WHERE id = :id")
+            row = await conn.fetch_one(query, {"id": session_id})
+            merged = json.loads(row["state"]) if row else {}
 
-                # 1) Intent + state merge
-                intent = await extract_intent(req.message, state)
-                merged = merge_state(state, intent)
+            # Save user message
+            await save_message(conn, session_id, "user", req.message, {})
 
-                # If this message is a NEW pricing question (service inferred) and the user did not provide a ZIP,
-                # do not reuse a prior ZIP/payment from the session. Force ZIP collection first.
-                if intent.get("_new_price_question"):
-                    if not message_contains_zip(req.message):
-                        merged.pop("zipcode", None)
-                    # Always reset payment/payer/plan for a new pricing question unless explicitly stated
-                    if not message_contains_payment_info(req.message):
-                        merged.pop("payment_mode", None)
-                        merged.pop("payer_like", None)
-                        merged.pop("plan_like", None)
-                        merged.pop("cash_only", None)
-                    merged.pop("_awaiting", None)
-                _normalize_payment_mode(merged)
+            # High-level intent: pricing?
+            intent = "pricing" if re.search(r"(price|cost|how much|charge|pay|afford)", req.message.lower()) else "general"
 
-                # 2) Force/override pricing intent when we are mid-flow
-                intent = apply_intent_override_if_needed(intent, req.message, merged, session_id)
-                mode = intent.get("mode") or "hybrid"
+            # ----------------------------
+            # SERVICE VARIANT SELECTION (BEFORE ZIP OR PAYMENT)
+            # ----------------------------
+            parent_service = infer_parent_service_key((merged.get("service_query") or "").strip())
+            if not parent_service:
+                # Try current query if service_query not set
+                parent_service = infer_parent_service_key(req.message)
 
-                # 3) OPTIONAL: reset gating fields only when this message looks like a NEW pricing question
-                # (Never reset while we are awaiting ZIP/payment/payer)
-                if (
-                    RESET_GATING_FIELDS_ON_NEW_PRICE_QUESTION
-                    and mode in ["price", "hybrid"]
-                    and not (merged.get("_awaiting") in {"zip", "payment", "payer"})
-                ):
-                    # Only reset if the message itself contains a price keyword AND a service hint
-                    msg_l = (req.message or "").lower()
-                    inferred_service = infer_service_query_from_message(req.message)
-                    if inferred_service and any(kw in msg_l for kw in INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS):
-                        reset_gating_fields_for_new_price_question(req.message, merged)
-
-                # 4) Load refiners + apply choice (if user replies 1/2/3)
-                refiners_doc = await get_refiners(conn)
-                refiner = match_refiner(merged.get("service_query") or "", refiners_doc)
-                merged = apply_refiner_choice(req.message, merged, refiner)
-                merged = maybe_apply_preview_code(merged, refiner)
-
-                # ----------------------------
-                # CARE NAVIGATION (nearest hospital) - DB-first for ZIP lat/lon, then web
-                # ----------------------------
-                if is_care_navigation_message(req.message):
-                    zipcode = merged.get("zipcode")
-                    if not zipcode:
-                        merged["_awaiting"] = "zip"
-                        msg = "What’s your 5-digit ZIP code so I can find the nearest hospital or urgent care?"
-                        yield sse({"type": "delta", "text": msg})
-                        await save_message(conn, session_id, "assistant", msg, {"mode": "care_navigation"})
-                        await update_session_state(conn, session_id, merged)
-                        await log_query(conn, session_id, req.message, {"mode": "care_navigation"}, None, 0, True, msg)
-                        yield sse({"type": "final", "used_web_search": True})
-                        return
-
-                    # Clear awaiting ZIP if it was set
-                    if merged.get("_awaiting") == "zip":
+            if parent_service:
+                # If already awaiting variant, apply choice
+                if merged.get("_awaiting") == "service_variant" and isinstance(merged.get("_variant_choices"), list):
+                    merged = apply_service_variant_choice(req.message, merged, merged.get("_variant_choices") or [])
+                    # If valid, update service_query
+                    if merged.get("variant_name"):
+                        merged["service_query"] = f"{parent_service.upper()}: {merged.get('variant_name')}"
                         merged.pop("_awaiting", None)
+                        merged.pop("_variant_choices", None)
 
-                    # 1) DB-first ZIP -> lat/lon, then web geocode fallback
-                    latlon = await get_zip_latlon(conn, zipcode)
-                    if not latlon:
-                        try:
-                            latlon = await geocode_zip_nominatim(zipcode)
-                        except Exception as e:
-                            logger.warning(f"Nominatim geocode failed: {e}")
-                            latlon = None
+                # Proceed only if no variant/CPT yet
+                if not (merged.get("variant_id") or (merged.get("code_type") and merged.get("code"))):
+                    variants = await get_service_variants_for_parent(conn, parent_service)
+                    lite = []
+                    for v in variants:
+                        lite.append({
+                            "id": v.get("id"),
+                            "parent_service": v.get("parent_service"),
+                            "cpt_code": v.get("cpt_code"),
+                            "variant_name": v.get("variant_name"),
+                            "patient_summary": v.get("patient_summary"),
+                            "is_preventive": v.get("is_preventive"),
+                        })
 
-                    if not latlon:
-                        msg = "I couldn’t locate that ZIP code. Can you double-check it (5 digits)?"
+                    if not lite:
+                        pass  # fall back to generic resolution later
+                    elif len(lite) == 1:
+                        merged = apply_service_variant_choice("1", merged, lite)
+                        if merged.get("variant_name"):
+                            merged["service_query"] = f"{parent_service.upper()}: {merged.get('variant_name')}"
+                    elif len(lite) >= 2:
+                        merged["_variant_choices"] = lite
+                        merged["_awaiting"] = "service_variant"
+                        msg = build_service_variant_prompt(parent_service, lite)
                         yield sse({"type": "delta", "text": msg})
-                        await save_message(conn, session_id, "assistant", msg, {"mode": "care_navigation"})
+                        await save_message(conn, session_id, "assistant", msg, {
+                            "mode": "clarify_service_variant",
+                            "intent": intent,
+                            "parent_service": parent_service,
+                            "variant_count": len(lite),
+                        })
                         await update_session_state(conn, session_id, merged)
-                        await log_query(conn, session_id, req.message, {"mode": "care_navigation"}, None, 0, True, msg)
-                        yield sse({"type": "final", "used_web_search": True})
+                        await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
+                        yield sse({"type": "final", "used_web_search": False})
                         return
 
-                    zlat, zlon = latlon
-
-                    # 2) Web: find nearest hospitals/urgent care
-                    try:
-                        places = await find_nearest_hospitals_overpass(zlat, zlon, limit=WEB_NEAREST_FACILITY_LIMIT)
-                    except Exception as e:
-                        logger.warning(f"Overpass lookup failed: {e}")
-                        places = []
-
-                    safety = (
-                        "If your pain is severe, you can’t bear weight, you have major swelling, fever, numbness, "
-                        "deformity, or you think it’s an emergency, call local emergency services."
-                    )
-
-                    if not places:
-                        msg = (
-                            safety
-                            + "\n\nI couldn’t find nearby hospitals online right now. If you tell me your city, I can try again."
-                        )
-                        yield sse({"type": "delta", "text": msg})
-                        await save_message(conn, session_id, "assistant", msg, {"mode": "care_navigation", "used_web": True})
-                        await update_session_state(conn, session_id, merged)
-                        await log_query(conn, session_id, req.message, {"mode": "care_navigation"}, None, 0, True, msg)
-                        yield sse({"type": "final", "used_web_search": True})
-                        return
-
-                    lines = [safety, "", f"Nearest hospitals/urgent care near **{zipcode}**:"]
-                    for i, p in enumerate(places, start=1):
-                        dist = f"{float(p.get('distance_miles') or 0):.1f} mi"
-                        addr = p.get("address") or "Address not available"
-                        phone = p.get("phone") or ""
-                        lines.append(f"{i}) **{p.get('name') or 'Hospital/Clinic'}** ({dist})")
-                        lines.append(f"   - {addr}" + (f" | Tel: {phone}" if phone else ""))
-
-                    msg = "\n".join(lines)
+            # ----------------------------
+            # ZIP CODE GATE
+            # ----------------------------
+            if not merged.get("zip_code"):
+                if is_zip_code(req.message):
+                    merged["zip_code"] = clean_text(req.message)
+                else:
+                    # Prompt for ZIP
+                    msg = "What’s your 5-digit ZIP code? (e.g., 90210)"
                     yield sse({"type": "delta", "text": msg})
-                    await save_message(conn, session_id, "assistant", msg, {"mode": "care_navigation", "used_web": True})
+                    await save_message(conn, session_id, "assistant", msg, {"mode": "awaiting_zip"})
+                    merged["_awaiting"] = "zip_code"
                     await update_session_state(conn, session_id, merged)
-                    await log_query(conn, session_id, req.message, {"mode": "care_navigation"}, None, len(places), True, msg)
-                    yield sse({"type": "final", "used_web_search": True})
-                    return
-
-                # ----------------------------
-                # GENERAL mode
-                # ----------------------------
-                if mode == "general":
-                    system = "You are CostSavvy.health. Answer clearly in plain language. Avoid medical advice."
-                    parts: List[str] = []
-                    for chunk in stream_llm_to_sse(system, req.message, parts):
-                        yield chunk
-                    full_answer = "".join(parts).strip() or "I couldn’t generate a response."
-                    await save_message(conn, session_id, "assistant", full_answer, {"mode": "general", "intent": intent})
-                    await update_session_state(conn, session_id, merged)
-                    await log_query(conn, session_id, req.message, intent, None, 0, False, full_answer)
+                    await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
                     yield sse({"type": "final", "used_web_search": False})
                     return
 
-                # ----------------------------
-                # PRICE / HYBRID mode (deterministic, DB-first)
-                # ----------------------------
-                if mode in ["price", "hybrid"]:
-                    # Gate 0: need a service (or a code)
-                    if not (merged.get("service_query") or "").strip() and not (merged.get("code_type") and merged.get("code")):
-                        # Try deterministic inference for common services
-                        inferred = infer_service_query_from_message(req.message)
-                        if inferred:
-                            merged["service_query"] = inferred
+            # ----------------------------
+            # FINAL PRICING LOOKUP
+            # ----------------------------
+            code_type = merged.get("code_type")
+            code = merged.get("code")
+            zip_code = merged.get("zip_code")
 
-
-                    # Variant-first (DB): for imaging services (MRI/CT/X-ray/Ultrasound), ask the user to pick a specific variant
-                    # BEFORE collecting ZIP or doing any pricing lookup.
-                    parent_service = infer_parent_service_key((merged.get("service_query") or "").strip())
-                    if parent_service:
-                        generic_imaging = is_generic_imaging_request(req.message, parent_service)
-                        # If we're awaiting a variant choice (numeric), try to apply it.
-                        if merged.get("_awaiting") == "service_variant" and isinstance(merged.get("_variant_choices"), list):
-                            merged = apply_service_variant_choice(req.message, merged, merged.get("_variant_choices") or [])
-
-                        # If we're awaiting a free-text variant, accept it and proceed (still before ZIP).
-                        if merged.get("_awaiting") == "service_variant_text":
-                            free = (req.message or "").strip()
-                            if free:
-                                merged["variant_free_text"] = free
-                                merged["service_query"] = f"{parent_service.upper()}: {free}"
-                                merged.pop("_awaiting", None)
-
-                        # If no CPT code yet, prompt for variant now (and do not collect ZIP yet).
-                        if not (merged.get("code_type") and merged.get("code")) and merged.get("variant_id") is None and not merged.get("variant_free_text"):
-                            variants = await get_service_variants_for_parent(conn, parent_service)
-
-                            lite = []
-                            for v in variants:
-                                lite.append(
-                                    {
-                                        "id": v.get("id"),
-                                        "parent_service": v.get("parent_service"),
-                                        "cpt_code": v.get("cpt_code"),
-                                        "variant_name": v.get("variant_name"),
-                                        "patient_summary": v.get("patient_summary"),
-                                        "is_preventive": v.get("is_preventive"),
-                                    }
-                                )
-
-                            # If the user asked generically (e.g., "How much is an MRI?"),
-                            # require a variant selection even if the DB only has 1 variant.
-                            if len(lite) >= 1 and generic_imaging:
-                                merged["_variant_choices"] = lite
-                                merged["_awaiting"] = "service_variant"
-                                msg = build_service_variant_prompt(parent_service, lite)
-                                yield sse({"type": "delta", "text": msg})
-                                await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_service_variant", "intent": intent})
-                                await update_session_state(conn, session_id, merged)
-                                await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-                                yield sse({"type": "final", "used_web_search": False})
-                                return
-
-                            if len(lite) >= 2:
-                                merged["_variant_choices"] = lite
-                                merged["_awaiting"] = "service_variant"
-                                msg = build_service_variant_prompt(parent_service, lite)
-                                yield sse({"type": "delta", "text": msg})
-                                await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_service_variant", "intent": intent})
-                                await update_session_state(conn, session_id, merged)
-                                await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-                                yield sse({"type": "final", "used_web_search": False})
-                                return
-
-                            if len(lite) == 1:
-                                merged = apply_service_variant_choice("1", merged, lite)
-
-                            if len(lite) == 0:
-                                merged["_awaiting"] = "service_variant_text"
-                                msg = build_generic_imaging_variant_prompt(parent_service)
-                                yield sse({"type": "delta", "text": msg})
-                                await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_service_variant", "intent": intent})
-                                await update_session_state(conn, session_id, merged)
-                                await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-                                yield sse({"type": "final", "used_web_search": False})
-                                return
-
-                        if merged.get("variant_name") and parent_service:
-                            merged["service_query"] = f"{parent_service.upper()}: {merged.get('variant_name')}"
-
-                    # Gate 1: ZIP required
-                    zipcode = merged.get("zipcode")
-                    if not zipcode:
-                        merged["_awaiting"] = "zip"
-                        msg = "What’s your 5-digit ZIP code?"
-                        yield sse({"type": "delta", "text": msg})
-                        await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_zip", "intent": intent})
-                        await update_session_state(conn, session_id, merged)
-                        await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-                        yield sse({"type": "final", "used_web_search": False})
-                        return
-                    if merged.get("_awaiting") == "zip":
-                        merged.pop("_awaiting", None)
-
-                    # Gate 2: payment mode required
-                    payment_mode = merged.get("payment_mode")
-                    if not payment_mode:
-                        merged["_awaiting"] = "payment"
-                        msg = "Are you paying cash (self-pay) or using insurance? If insurance, what carrier (e.g., Aetna)?"
-                        yield sse({"type": "delta", "text": msg})
-                        await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_payment", "intent": intent})
-                        await update_session_state(conn, session_id, merged)
-                        await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-                        yield sse({"type": "final", "used_web_search": False})
-                        return
-                    if merged.get("_awaiting") == "payment":
-                        merged.pop("_awaiting", None)
-
-                    _normalize_payment_mode(merged)
-                    payment_mode = merged.get("payment_mode") or payment_mode
-
-                    # Gate 3 (insurance): require payer
-                    if payment_mode == "insurance" and not (merged.get("payer_like") or "").strip():
-                        merged["_awaiting"] = "payer"
-                        msg = "Which insurance carrier should I match prices for (e.g., Aetna, UnitedHealthcare, Blue Cross)?"
-                        yield sse({"type": "delta", "text": msg})
-                        await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_payer", "intent": intent})
-                        await update_session_state(conn, session_id, merged)
-                        await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-                        yield sse({"type": "final", "used_web_search": False})
-                        return
-                    if merged.get("_awaiting") == "payer" and (merged.get("payer_like") or "").strip():
-                        merged.pop("_awaiting", None)
-
-                    # Refiners: ask for choice before pricing when required
-                    if refiner and refiner.get("require_choice_before_pricing") is True and not merged.get("refiner_choice"):
-                        msg = get_refinement_prompt(refiner)
-                        yield sse({"type": "delta", "text": msg})
-                        await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_variant", "refiner_id": refiner.get("id"), "intent": intent})
-                        await update_session_state(conn, session_id, merged)
-                        await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-                        yield sse({"type": "final", "used_web_search": False})
-                        return
-
-                    # Resolve code if needed
-                    if not (merged.get("code_type") and merged.get("code")):
-                        resolved = await resolve_service_code(conn, merged)
-                        if resolved:
-                            merged["code_type"], merged["code"] = resolved
-
-                    # If still no service, ask
-                    if not (merged.get("service_query") or "").strip() and not (merged.get("code_type") and merged.get("code")):
-                        msg = "What service are you pricing (for example: colonoscopy, MRI brain, chest x-ray, office visit, lab test)?"
-                        yield sse({"type": "delta", "text": msg})
-                        await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_service", "intent": intent})
-                        await update_session_state(conn, session_id, merged)
-                        await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-                        yield sse({"type": "final", "used_web_search": False})
-                        return
-
-                    # If code is still missing, ask for more detail
-                    if not (merged.get("code_type") and merged.get("code")):
-                        msg = "I can price this, but I need a bit more detail on the exact service. What exactly is being ordered?"
-                        yield sse({"type": "delta", "text": msg})
-                        await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_service_detail", "intent": intent})
-                        await update_session_state(conn, session_id, merged)
-                        await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-                        yield sse({"type": "final", "used_web_search": False})
-                        return
-
-
-                    # ---- PRICED LOOKUP (DB-first) ----
-                    # 1) Try the staging table + variants explanation first (stg_hospital_rates JOIN service_variants)
-                    results: List[Dict[str, Any]] = []
-                    used_max_radius = None
-
-                    if (merged.get("code_type") or "").upper() == "CPT" and (merged.get("code") or "").strip():
-                        try:
-                            results = await price_lookup_staging_by_cpt_with_variants(
-                                conn,
-                                merged["zipcode"],
-                                str(merged["code"]).strip(),
-                                payment_mode=merged.get("payment_mode") or "cash",
-                                payer_like=merged.get("payer_like"),
-                                plan_like=merged.get("plan_like"),
-                                limit=max(25, MIN_FACILITIES_TO_DISPLAY * 10),
-                            )
-                        except Exception as e:
-                            logger.warning(f"Staging CPT lookup failed: {e}")
-                            results = []
-
-                    # 2) If staging does not have enough, fall back to existing normalized pricing lookup
-                    if len(results) < MIN_DB_RESULTS_BEFORE_WEB:
-                        results, used_max_radius = await price_lookup_progressive(
-                            conn,
-                            merged["zipcode"],
-                            merged["code_type"],
-                            merged["code"],
-                            merged.get("service_query") or "",
-                            merged.get("payer_like"),
-                            merged.get("plan_like"),
-                            merged.get("payment_mode") or "cash",
-                        )
-                    # Always fetch at least 5 facilities for display
-                    try:
-                        # Pull more than we need so de-duping can still leave us with >= MIN_FACILITIES_TO_DISPLAY.
-                        nearby_hospitals = await get_nearby_hospitals(
-                            conn,
-                            merged["zipcode"],
-                            limit=max(20, MIN_FACILITIES_TO_DISPLAY * 5),
-                        )
-                    except Exception as e:
-                        logger.warning(f"Nearby hospitals lookup failed: {e}")
-                        nearby_hospitals = []
-
-                    facility_text, facility_payload = build_facility_block(
-                        service_query=merged.get("service_query") or "this service",
-                        payment_mode=merged.get("payment_mode") or "cash",
-                        priced_results=results,
-                        fallback_hospitals=nearby_hospitals,
-                        variant_info={
-                            "variant_name": merged.get("variant_name"),
-                            "cpt_code": merged.get("code"),
-                            "patient_summary": merged.get("variant_patient_summary"),
-                        } if merged.get("variant_name") or merged.get("variant_patient_summary") else None,
-                    )
-
-                    yield sse(
-                        {
-                            "type": "results",
-                            "results": results[:25],
-                            "facilities": facility_payload,
-                            "state": {
-                                k: merged.get(k)
-                                for k in [
-                                    "zipcode",
-                                    "payment_mode",
-                                    "payer_like",
-                                    "plan_like",
-                                    "service_query",
-                                    "code_type",
-                                    "code",
-                                    "refiner_id",
-                                    "refiner_choice",
-                                ]
-                            },
-                        }
-                    )
-                    yield sse({"type": "delta", "text": facility_text})
-
-                    full_answer = facility_text
-                    await save_message(
-                        conn,
-                        session_id,
-                        "assistant",
-                        full_answer,
-                        {
-                            "mode": mode,
-                            "intent": intent,
-                            "result_count": len(results),
-                            "used_max_radius": used_max_radius,
-                            "refiner_id": (refiner or {}).get("id"),
-                        },
-                    )
+            if not (code_type and code and zip_code):
+                # Fallback: try to resolve service from query
+                ## NOTE: No external resolver available in this deployable build.
+                # If we cannot resolve a CPT/code deterministically, we will ask the user for more detail.
+                code_type, code = None, None
+                if False:
+                    pass
+                else:
+                    msg = "I couldn’t identify the service code. Try being more specific (e.g., 'MRI of the knee without contrast')."
+                    yield sse({"type": "delta", "text": msg})
+                    await save_message(conn, session_id, "assistant", msg, {"error": "no_code"})
                     await update_session_state(conn, session_id, merged)
-
-                    used_web = False
-                    await log_query(conn, session_id, req.message, intent, used_max_radius, len(results), used_web, full_answer)
-                    yield sse({"type": "final", "used_web_search": used_web})
+                    yield sse({"type": "final", "used_web_search": False})
                     return
 
-                # Fallback: ask to rephrase (should be rare)
-                msg = "I’m not sure what you need. Can you rephrase?"
-                yield sse({"type": "delta", "text": msg})
-                await save_message(conn, session_id, "assistant", msg, {"mode": "fallback", "intent": intent})
-                await update_session_state(conn, session_id, merged)
-                await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-                yield sse({"type": "final", "used_web_search": False})
+            # Do pricing lookup
+            results = await price_lookup_staging_by_cpt_with_variants(conn, code, zip_code, limit=10)
 
-        except Exception as e:
-            logger.exception("Unhandled error")
-            yield sse({"type": "error", "message": f"{type(e).__name__}: {str(e)}"})
+            if not results:
+                # Fallback to simpler query
+                try:
+                    query = text("""
+                        SELECT hospital_name, city, state, zip_code, distance_miles,
+                               standard_charge, cash_price
+                        FROM stg_hospital_rates
+                        WHERE cpt_code = :cpt AND zip_code = :zip
+                        ORDER BY distance_miles ASC, cash_price ASC
+                        LIMIT 10
+                    """)
+                    rows = await conn.fetch_all(query, {"cpt": code, "zip": zip_code})
+                    results = [dict(row) for row in rows]
+                except Exception as e:
+                    logger.error(f"Fallback pricing failed: {e}")
+
+            if results:
+                # Build response
+                top = results[:5] if len(results) >= 5 else results
+                lines = [f"Here are the closest facilities for **{merged.get('service_query', code)}** near {zip_code}:"]
+                lines.append("")
+                for i, r in enumerate(top, 1):
+                    name = r.get("hospital_name") or "Unnamed Facility"
+                    city = r.get("city") or ""
+                    state = r.get("state") or ""
+                    loc = f"{city}, {state}".strip(", ")
+                    if loc == ",": loc = ""
+
+                    cash = r.get("cash_price")
+                    std = r.get("standard_charge")
+                    price = None
+                    if cash is not None and cash > 0:
+                        price = f"${cash:,.0f} (cash)"
+                    elif std is not None and std > 0:
+                        price = f"${std:,.0f} (standard)"
+                    else:
+                        price = "Price unavailable"
+
+                    dist = r.get("distance_miles")
+                    dist_str = f"{dist:.1f} mi away" if dist is not None else "Location unknown"
+
+                    variant = r.get("variant_name") or ""
+                    if variant:
+                        lines.append(f"{i}) **{name}** — {variant}")
+                    else:
+                        lines.append(f"{i}) **{name}**")
+                    lines.append(f"   • {loc} • {dist_str}")
+                    lines.append(f"   • {price}")
+                    lines.append("")
+
+                msg = "\n".join(lines)
+                yield sse({"type": "delta", "text": msg})
+                await save_message(conn, session_id, "assistant", msg, {
+                    "mode": "pricing_result",
+                    "intent": intent,
+                    "code": code,
+                    "zip": zip_code,
+                    "count": len(results),
+                })
+            else:
+                msg = f"No pricing found for this service (CPT {code}) near {zip_code}. Try a nearby ZIP or check spelling."
+                yield sse({"type": "delta", "text": msg})
+                await save_message(conn, session_id, "assistant", msg, {"error": "no_results"})
+
+            # Finalize
+            await update_session_state(conn, session_id, merged)
+            await log_query(conn, session_id, req.message, intent, code, len(results) if results else 0, False, msg)
             yield sse({"type": "final", "used_web_search": False})
 
-    headers = {"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
-    return StreamingResponse(event_gen(), media_type="text/event-stream", headers=headers)
 
+    # -------- DB WRAPPERS (stub implementations) --------
 
-@app.post("/chat")
+    async def save_message(conn, session_id: str, role: str, content: str, meta: Dict):
+        ts = datetime.utcnow().isoformat()
+        stmt = text("""
+            INSERT INTO messages (session_id, role, content, metadata, created_at)
+            VALUES (:sid, :role, :content, :meta, :ts)
+            ON CONFLICT DO NOTHING
+        """)
+        await conn.execute(stmt, {
+            "sid": session_id,
+            "role": role,
+            "content": content,
+            "meta": json.dumps(meta),
+            "ts": ts,
+        })
 
-async def chat(_req: ChatRequest, _request: Request):
-    raise HTTPException(410, detail="Use /chat_stream")
+    async def update_session_state(conn, session_id: str, state: Dict):
+        ts = datetime.utcnow().isoformat()
+        stmt = text("""
+            INSERT INTO sessions (id, state, updated_at)
+            VALUES (:id, :state, :ts)
+            ON CONFLICT (id) DO UPDATE SET state = :state, updated_at = :ts
+        """)
+        await conn.execute(stmt, {
+            "id": session_id,
+            "state": json.dumps(state),
+            "ts": ts,
+        })
+
+    async def log_query(conn, session_id: str, query: str, intent: str, code: Optional[str], result_count: int, used_web: bool, response: str):
+        stmt = text("""
+            INSERT INTO query_log (session_id, query, intent, code, result_count, used_web_search, response, created_at)
+            VALUES (:sid, :q, :intent, :code, :cnt, :web, :resp, :ts)
+        """)
+        await conn.execute(stmt, {
+            "sid": session_id,
+            "q": query,
+            "intent": intent,
+            "code": code,
+            "cnt": result_count,
+            "web": used_web,
+            "resp": response[:1000],
+            "ts": datetime.utcnow().isoformat(),
+        })
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
