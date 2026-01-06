@@ -5,6 +5,8 @@ import uuid
 import time
 import logging
 from typing import Optional, Any, Dict, List, Tuple
+from decimal import Decimal
+from datetime import datetime, date
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, Request
@@ -131,8 +133,29 @@ async def home():
 # ----------------------------
 # SSE helpers
 # ----------------------------
+
+def _json_default(o):
+    """JSON serializer for objects not serializable by default json code."""
+    if isinstance(o, Decimal):
+        # Preserve cents if present, but JSON needs a native number
+        return float(o)
+    if isinstance(o, (datetime, date)):
+        return o.isoformat()
+    if isinstance(o, set):
+        return list(o)
+    # asyncpg.Record and other mapping-like objects
+    try:
+        import asyncpg  # type: ignore
+        if isinstance(o, asyncpg.Record):
+            return dict(o)
+    except Exception:
+        pass
+    return str(o)
+
 def sse(obj: dict) -> str:
-    return f"data: {json.dumps(obj)}\n\n"
+    return f"data: {json.dumps(obj, default=_json_default)}
+
+"
 
 
 def stream_llm_to_sse(system: str, user_content: str, out_text_parts: List[str]):
