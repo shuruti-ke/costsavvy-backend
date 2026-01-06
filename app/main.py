@@ -1288,11 +1288,45 @@ def infer_parent_service_key(service_query: str) -> Optional[str]:
 
 
 def is_generic_imaging_request(message: str, parent_service: str) -> bool:
-    """Return True when the user asked for a modality price (MRI/CT/X-ray/US) without specifying body part / contrast."""
+    """Return True when the user asked for a modality price (MRI/CT/X-ray/US) without enough detail
+    to pick a specific CPT-backed variant.
+
+    Key behavior:
+      - MRI/CT/US: body part or protocol usually makes it specific enough.
+      - X-ray: body part alone is often still ambiguous because view-count (and sometimes laterality)
+        changes the CPT. Example: "x-ray chest" still needs 1 view vs 2 views.
+    """
     msg = (message or "").lower()
-    # Contrast hints
+    ps = (parent_service or "").lower()
+
+    # Contrast hints: if present, it's not "generic"
     if "with contrast" in msg or "without contrast" in msg or "w/ contrast" in msg or "wo contrast" in msg:
         return False
+
+    # Modality presence checks (handles "x ray", "x-ray", "xray")
+    has_mri = "mri" in msg
+    has_ct = ("ct scan" in msg) or ("cat scan" in msg) or (re.search(r"\bct\b", msg) is not None)
+    has_xray = ("x-ray" in msg) or ("xray" in msg) or (re.search(r"\bx\s*ray\b", msg) is not None)
+    has_us = ("ultrasound" in msg) or ("sonogram" in msg)
+
+    # X-ray special case: require view-count for common exams
+    if ps in ("x-ray", "xray"):
+        if not has_xray:
+            return False
+        # If the user included view count, treat as specific enough
+        has_views = ("view" in msg or "views" in msg) or (re.search(r"\b[1-4]\s*[- ]?view\b", msg) is not None)
+        if has_views:
+            return False
+        # If they only said the body part (e.g., "x ray chest", "x-ray knee"), we still need views.
+        body_terms = [
+            "chest", "knee", "shoulder", "ankle", "foot", "wrist", "hand", "elbow", "hip",
+            "pelvis", "spine", "cervical", "thoracic", "lumbar", "abdomen", "rib", "ribs",
+        ]
+        if any(t in msg for t in body_terms):
+            return True
+        # Generic "x-ray" with no body part at all is also generic
+        return True
+
     # Common body-part/region hints (not exhaustive, just to avoid false-gating)
     body_terms = [
         "brain", "head", "neck", "spine", "cervical", "thoracic", "lumbar",
@@ -1303,6 +1337,15 @@ def is_generic_imaging_request(message: str, parent_service: str) -> bool:
     if any(t in msg for t in body_terms):
         return False
 
+    # If they mention just the modality, treat as generic.
+    if ps == "mri" and has_mri:
+        return True
+    if ps == "ct" and has_ct:
+        return True
+    if ps == "ultrasound" and has_us:
+        return True
+
+    return False
     # If they mention just the modality, treat as generic.
     key = (parent_service or "").lower()
     if key == "mri" and "mri" in msg:
@@ -2213,15 +2256,28 @@ async def chat_stream(req: ChatRequest, request: Request):
 
                     # If code is still missing, ask for more detail
                     if not (merged.get("code_type") and merged.get("code")):
-                        msg = "I can price this, but I need a bit more detail on the exact service. What exactly is being ordered?"
+                        parent = (merged.get("parent_service") or "").strip()
+                        variants: List[Dict[str, Any]] = []
+                        if parent:
+                            try:
+                                variants = await get_service_variants_for_parent(conn, parent)
+                            except Exception:
+                                variants = []
+                        if variants:
+                            msg = build_service_variant_prompt(parent, variants[:8])
+                            merged["awaiting_service_variant"] = True
+                            merged["service_variant_parent"] = parent
+                            merged["service_variant_options"] = [
+                                (v.get("variant_name") or "").strip() for v in variants[:8]
+                            ]
+                        else:
+                            msg = "I can price this, but I need a bit more detail on the exact service. What exactly is being ordered?"
                         yield sse({"type": "delta", "text": msg})
                         await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_service_detail", "intent": intent})
                         await update_session_state(conn, session_id, merged)
                         await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
                         yield sse({"type": "final", "used_web_search": False})
                         return
-
-
                     # ---- PRICED LOOKUP (DB-first) ----
                     # 1) Try the staging table + variants explanation first (stg_hospital_rates JOIN service_variants)
                     results: List[Dict[str, Any]] = []
