@@ -153,7 +153,7 @@ def _json_default(o):
     return str(o)
 
 def sse(obj: dict) -> str:
-    return f"data: {json.dumps(obj, default=_json_default)}
+    return f"data: {json.dumps(obj, default=_json_default)}\n\n"
 
 "
 
