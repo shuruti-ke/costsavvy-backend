@@ -8,10 +8,6 @@ import logging
 from typing import Optional, Any, Dict, List, Tuple
 
 import asyncpg
-try:
-    import httpx  # type: ignore
-except Exception:  # pragma: no cover
-    httpx = None
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -41,16 +37,19 @@ MIN_FACILITIES_TO_DISPLAY = int(os.getenv("MIN_FACILITIES_TO_DISPLAY", "5"))
 # Refiners cache TTL (DB-first, Python fallback)
 REFINERS_CACHE_TTL_SECONDS = int(os.getenv("REFINERS_CACHE_TTL_SECONDS", "300"))
 
-# ---- Care navigation (nearest hospital) ----
+# ---- Care navigation (nearest hospital/urgent care) ----
 ENABLE_WEB_NEAREST_FACILITY = os.getenv("ENABLE_WEB_NEAREST_FACILITY", "true").lower() in (
-    "1", "true", "yes", "y", "on"
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
 )
 WEB_NEAREST_FACILITY_LIMIT = int(os.getenv("WEB_NEAREST_FACILITY_LIMIT", "3"))
-
-# Nominatim/Overpass require a descriptive User-Agent
+# Nominatim/Overpass requests should identify your app per typical usage policies.
 NOMINATIM_USER_AGENT = os.getenv(
     "NOMINATIM_USER_AGENT",
-    "CostSavvy.health/1.0 (nearest-facility lookup; contact: support@costsavvy.health)",
+    "CostSavvy.health/1.0 (care navigation; contact: support@costsavvy.health)",
 )
 
 # ---- Intent override controls (env-driven) ----
@@ -578,43 +577,54 @@ def reset_gating_fields_for_new_price_question(message: str, merged: Dict[str, A
 # Care navigation (nearest hospital/urgent care)
 # ----------------------------
 def is_care_navigation_message(message: str) -> bool:
+    """Detect when the user is asking for help getting to care (not pricing).
+
+    We keep this deterministic and conservative: it should trigger on common "need help" + symptom
+    language even if the user didn't explicitly say "hospital".
+    """
     msg = (message or "").lower()
-    triggers = [
+
+    # explicit navigation / facility requests
+    explicit = [
         "go to hospital",
         "need to go to hospital",
-        "i need to go to hospital",
-        "i need to go to the hospital",
         "nearest hospital",
         "closest hospital",
-        "need a hospital",
         "urgent care",
+        "walk in clinic",
+        "walk-in clinic",
         "emergency room",
-        "er ",
-        " er",
+        "er",
     ]
-    symptomish = [
+    if any(t in msg for t in explicit):
+        return True
+
+    # "I need help" + symptom language (e.g., "my stomach hurts I need help")
+    help_terms = ["i need help", "need help", "help me", "need medical help", "i feel sick"]
+    symptom_terms = [
         "hurts",
         "pain",
+        "severe",
         "swollen",
-        "swelling",
-        "injury",
         "bleeding",
-        "can't walk",
-        "cant walk",
-        "broken",
+        "vomit",
+        "vomiting",
+        "fever",
+        "faint",
+        "dizzy",
+        "can't breathe",
+        "cant breathe",
+        "chest pain",
     ]
-    return any(t in msg for t in triggers) or ("hospital" in msg and any(s in msg for s in symptomish))
+    body_terms = ["stomach", "abdomen", "belly", "knee", "back", "head", "throat", "arm", "leg"]
+    if any(h in msg for h in help_terms) and (any(s in msg for s in symptom_terms) or any(b in msg for b in body_terms)):
+        return True
 
+    # If they mention "hospital" plus any pain term, treat as navigation.
+    if "hospital" in msg and any(s in msg for s in symptom_terms):
+        return True
 
-def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    import math
-
-    R = 3959.0
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dl / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(a))
+    return False
 
 
 async def get_zip_latlon(conn: asyncpg.Connection, zipcode: str) -> Optional[Tuple[float, float]]:
@@ -627,8 +637,19 @@ async def get_zip_latlon(conn: asyncpg.Connection, zipcode: str) -> Optional[Tup
     return None
 
 
+def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    import math
+
+    r = 3959.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
 async def geocode_zip_nominatim(zipcode: str) -> Optional[Tuple[float, float]]:
-    """Web fallback for ZIP -> lat/lon. Requires httpx and ENABLE_WEB_NEAREST_FACILITY."""
+    """Online fallback: ZIP -> lat/lon via Nominatim."""
     if not ENABLE_WEB_NEAREST_FACILITY or httpx is None:
         return None
     url = "https://nominatim.openstreetmap.org/search"
@@ -637,42 +658,41 @@ async def geocode_zip_nominatim(zipcode: str) -> Optional[Tuple[float, float]]:
     async with httpx.AsyncClient(timeout=15, headers=headers) as client_http:
         r = await client_http.get(url, params=params)
         r.raise_for_status()
-        data = r.json()
+        data = r.json() or []
         if not data:
             return None
         return float(data[0]["lat"]), float(data[0]["lon"])
 
 
 async def find_nearest_hospitals_overpass(lat: float, lon: float, limit: int = 3) -> List[Dict[str, Any]]:
-    """Web lookup for nearby hospitals/ER-like clinics near a point."""
+    """Online: Find hospitals/urgent care near a point using Overpass (OSM)."""
     if not ENABLE_WEB_NEAREST_FACILITY or httpx is None:
         return []
 
-    radius_m = 20000
+    radius_m = 20000  # 20km
     query = f"""
     [out:json][timeout:25];
     (
       node(around:{radius_m},{lat},{lon})["amenity"="hospital"];
       way(around:{radius_m},{lat},{lon})["amenity"="hospital"];
       relation(around:{radius_m},{lat},{lon})["amenity"="hospital"];
-      node(around:{radius_m},{lat},{lon})["amenity"="clinic"]["emergency"="yes"];
-      way(around:{radius_m},{lat},{lon})["amenity"="clinic"]["emergency"="yes"];
-      relation(around:{radius_m},{lat},{lon})["amenity"="clinic"]["emergency"="yes"];
+      node(around:{radius_m},{lat},{lon})["amenity"="clinic"];
+      way(around:{radius_m},{lat},{lon})["amenity"="clinic"];
+      relation(around:{radius_m},{lat},{lon})["amenity"="clinic"];
     );
     out center tags;
     """
 
     url = "https://overpass-api.de/api/interpreter"
     headers = {"User-Agent": NOMINATIM_USER_AGENT}
-
     async with httpx.AsyncClient(timeout=30, headers=headers) as client_http:
         r = await client_http.post(url, data=query)
         r.raise_for_status()
-        payload = r.json()
+        payload = r.json() or {}
 
     elems = payload.get("elements", []) or []
 
-    def pick_point(e: dict) -> Optional[Tuple[float, float]]:
+    def _pick_point(e: dict) -> Optional[Tuple[float, float]]:
         if "lat" in e and "lon" in e:
             return float(e["lat"]), float(e["lon"])
         c = e.get("center")
@@ -683,36 +703,23 @@ async def find_nearest_hospitals_overpass(lat: float, lon: float, limit: int = 3
     results: List[Dict[str, Any]] = []
     for e in elems:
         tags = e.get("tags", {}) or {}
-        pt = pick_point(e)
+        pt = _pick_point(e)
         if not pt:
             continue
-
         name = (tags.get("name") or "Hospital/Clinic").strip()
-        street = tags.get("addr:street") or ""
-        housenumber = tags.get("addr:housenumber") or ""
-        city = tags.get("addr:city") or ""
-        state = tags.get("addr:state") or ""
-        postcode = tags.get("addr:postcode") or ""
-        phone = tags.get("phone") or tags.get("contact:phone") or ""
+        street = (tags.get("addr:street") or "").strip()
+        housenumber = (tags.get("addr:housenumber") or "").strip()
+        city = (tags.get("addr:city") or "").strip()
+        state = (tags.get("addr:state") or "").strip()
+        postcode = (tags.get("addr:postcode") or "").strip()
+        phone = (tags.get("phone") or tags.get("contact:phone") or "").strip()
 
         address = " ".join([p for p in [housenumber, street] if p]).strip()
-        addr_parts = [p for p in [address, city, state, postcode] if p]
-        full_addr = ", ".join(addr_parts)
+        full_addr = ", ".join([p for p in [address, city, state, postcode] if p]).strip()
+        dist = haversine_miles(lat, lon, pt[0], pt[1])
+        results.append({"name": name, "address": full_addr, "phone": phone, "distance_miles": dist})
 
-        d = haversine_miles(lat, lon, pt[0], pt[1])
-
-        results.append(
-            {
-                "name": name,
-                "address": full_addr,
-                "phone": phone,
-                "distance_miles": d,
-                "lat": pt[0],
-                "lon": pt[1],
-            }
-        )
-
-    results.sort(key=lambda x: x["distance_miles"])
+    results.sort(key=lambda x: x.get("distance_miles") or 9e9)
     return results[: max(1, int(limit or 3))]
 
 
@@ -1570,9 +1577,13 @@ async def chat_stream(req: ChatRequest, request: Request):
                 merged = maybe_apply_preview_code(merged, refiner)
 
                 # ----------------------------
-                # CARE NAVIGATION (nearest hospital) - DB-first for ZIP lat/lon, then web
+                # CARE NAVIGATION MODE (nearest hospital/urgent care)
                 # ----------------------------
-                if is_care_navigation_message(req.message):
+                # If the user is seeking help getting to care (e.g., "my stomach hurts I need help"),
+                # ask for ZIP then return nearest facilities. We skip this when the user is clearly
+                # asking about PRICE (to avoid hijacking price lookups).
+                if is_care_navigation_message(req.message) and not should_force_price_mode(req.message, merged):
+                    # Ask for ZIP if missing
                     zipcode = merged.get("zipcode")
                     if not zipcode:
                         merged["_awaiting"] = "zip"
@@ -1584,60 +1595,63 @@ async def chat_stream(req: ChatRequest, request: Request):
                         yield sse({"type": "final", "used_web_search": True})
                         return
 
-                    # Clear awaiting ZIP if it was set
                     if merged.get("_awaiting") == "zip":
                         merged.pop("_awaiting", None)
 
-                    # 1) DB-first ZIP -> lat/lon, then web geocode fallback
+                    # Safety message, non-diagnostic
+                    safety = (
+                        "If your pain is severe, you have fever, repeated vomiting, blood in vomit/stool, "
+                        "fainting, trouble breathing, or you think it’s an emergency, call local emergency services right now."
+                    )
+
+                    # DB-first zip -> lat/lon, then web geocode fallback
                     latlon = await get_zip_latlon(conn, zipcode)
                     if not latlon:
                         try:
                             latlon = await geocode_zip_nominatim(zipcode)
                         except Exception as e:
-                            logger.warning(f"Nominatim geocode failed: {e}")
+                            logger.warning(f"Web geocode failed: {e}")
                             latlon = None
 
-                    if not latlon:
-                        msg = "I couldn’t locate that ZIP code. Can you double-check it (5 digits)?"
-                        yield sse({"type": "delta", "text": msg})
-                        await save_message(conn, session_id, "assistant", msg, {"mode": "care_navigation"})
-                        await update_session_state(conn, session_id, merged)
-                        await log_query(conn, session_id, req.message, {"mode": "care_navigation"}, None, 0, True, msg)
-                        yield sse({"type": "final", "used_web_search": True})
-                        return
+                    places: List[Dict[str, Any]] = []
+                    if latlon:
+                        try:
+                            places = await find_nearest_hospitals_overpass(latlon[0], latlon[1], limit=WEB_NEAREST_FACILITY_LIMIT)
+                        except Exception as e:
+                            logger.warning(f"Overpass lookup failed: {e}")
 
-                    zlat, zlon = latlon
-
-                    # 2) Web: find nearest hospitals/urgent care
-                    try:
-                        places = await find_nearest_hospitals_overpass(zlat, zlon, limit=WEB_NEAREST_FACILITY_LIMIT)
-                    except Exception as e:
-                        logger.warning(f"Overpass lookup failed: {e}")
-                        places = []
-
-                    safety = (
-                        "If your pain is severe, you can’t bear weight, you have major swelling, fever, numbness, "
-                        "deformity, or you think it’s an emergency, call local emergency services."
-                    )
-
+                    # If web lookup fails, fall back to DB facility directory (no hallucination)
                     if not places:
-                        msg = (
-                            safety
-                            + "\n\nI couldn’t find nearby hospitals online right now. If you tell me your city, I can try again."
-                        )
+                        try:
+                            db_places = await get_nearby_hospitals(conn, zipcode, limit=max(WEB_NEAREST_FACILITY_LIMIT, 3))
+                        except Exception:
+                            db_places = []
+
+                        lines = [safety, "", f"Nearest hospitals near **{zipcode}** (from our directory):"]
+                        for i, p in enumerate(db_places[:WEB_NEAREST_FACILITY_LIMIT], start=1):
+                            name = p.get("hospital_name") or _pick_hospital_name(p)
+                            addr = _pick_address(p) or "Address not available"
+                            phone = p.get("phone") or ""
+                            dist = p.get("distance_miles")
+                            dist_txt = f" ({float(dist):.1f} mi)" if dist is not None else ""
+                            lines.append(f"{i}) **{name}**{dist_txt}")
+                            lines.append(f"   - {addr}" + (f" | Tel: {phone}" if phone else ""))
+
+                        msg = "\n".join(lines) if db_places else (safety + "\n\nI couldn’t find nearby facilities for that ZIP. Please double-check the ZIP code.")
                         yield sse({"type": "delta", "text": msg})
-                        await save_message(conn, session_id, "assistant", msg, {"mode": "care_navigation", "used_web": True})
+                        await save_message(conn, session_id, "assistant", msg, {"mode": "care_navigation", "used_web": False})
                         await update_session_state(conn, session_id, merged)
-                        await log_query(conn, session_id, req.message, {"mode": "care_navigation"}, None, 0, True, msg)
-                        yield sse({"type": "final", "used_web_search": True})
+                        await log_query(conn, session_id, req.message, {"mode": "care_navigation"}, None, len(db_places), False, msg)
+                        yield sse({"type": "final", "used_web_search": False})
                         return
 
-                    lines = [safety, "", f"Nearest hospitals/urgent care near **{zipcode}**:"]
+                    lines = [safety, "", f"Nearest hospitals/urgent care near **{zipcode}** (online):"]
                     for i, p in enumerate(places, start=1):
-                        dist = f"{float(p.get('distance_miles') or 0):.1f} mi"
+                        dist = p.get("distance_miles")
+                        dist_txt = f" ({float(dist):.1f} mi)" if dist is not None else ""
                         addr = p.get("address") or "Address not available"
                         phone = p.get("phone") or ""
-                        lines.append(f"{i}) **{p.get('name') or 'Hospital/Clinic'}** ({dist})")
+                        lines.append(f"{i}) **{p.get('name','Hospital/Clinic')}**{dist_txt}")
                         lines.append(f"   - {addr}" + (f" | Tel: {phone}" if phone else ""))
 
                     msg = "\n".join(lines)
