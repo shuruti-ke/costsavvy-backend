@@ -311,6 +311,27 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
     have_service = bool(st.get("service_query") or st.get("code"))
     have_zip = bool(st.get("zipcode"))
 
+    # --- New price question detection (session-safe) ---
+    # If the user asks a *new* price question mid-session (e.g.,
+    # "How much does an arthroscopy cost?") we should not reuse the
+    # previous service context (like colonoscopy). We detect this
+    # deterministically using price keywords + a known service inference.
+    price_kw = any(kw in msg_l for kw in INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS)
+    inferred_new_service = infer_service_query_from_message(msg)
+    if price_kw and inferred_new_service:
+        prev_service = (st.get("service_query") or "").strip().lower()
+        if inferred_new_service.strip().lower() != prev_service:
+            return {
+                "mode": "price",
+                "service_query": inferred_new_service,
+                "zipcode": st.get("zipcode"),
+                "payment_mode": st.get("payment_mode"),
+                "payer_like": st.get("payer_like"),
+                "plan_like": st.get("plan_like"),
+                "clarifying_question": None,
+                "_new_price_question": True,
+            }
+
     # 0) ZIP detection anywhere in the message
     zip_match = re.search(r"\b(\d{5})\b", msg)
     if zip_match:
@@ -478,6 +499,13 @@ def infer_service_query_from_message(message: str) -> Optional[str]:
     msg = (message or "").lower()
     if "colonoscopy" in msg:
         return "colonoscopy"
+    # Arthroscopy (include common misspellings)
+    if "arthroscopy" in msg or "athroscopy" in msg or "athrosocopy" in msg:
+        return "arthroscopy"
+    if "vasectomy" in msg:
+        return "vasectomy"
+    if "biopsy" in msg:
+        return "biopsy"
     if "mammogram" in msg or "mammo" in msg:
         return "mammogram"
     if "ultrasound" in msg:
@@ -1135,15 +1163,18 @@ def build_facility_block(
     est_range = estimate_cost_range(service_query or "this service", payment_mode or "cash")
 
     # Build answer text
+    # Keep these bullets generic so we don't mistakenly show colonoscopy-specific
+    # education for unrelated services.
+    svc = (service_query or "this service").strip() or "this service"
     bullets = []
-    bullets.append(f"- Colonoscopies can be **screening** (preventive) or **diagnostic** (symptoms/abnormal finding).")
-    bullets.append(f"- Facility setting matters: **outpatient endoscopy centers** often differ from **hospital outpatient** pricing.")
-    bullets.append(f"- If a biopsy or polyp removal happens, total cost can increase.")
+    bullets.append(f"- The exact billed service for **{svc}** can vary based on what your clinician orders and what happens during the visit/procedure.")
+    bullets.append(f"- Facility setting matters: **independent/outpatient centers** can price differently than **hospital outpatient** departments.")
+    bullets.append(f"- Add-ons (labs, imaging, pathology, supplies, anesthesia, extra procedure steps) can change the total cost.")
 
     lines = []
     lines.extend(bullets)
     lines.append("")
-    lines.append(f"Here are nearby options for **{service_query or 'colonoscopy'}** ({payment_mode}):")
+    lines.append(f"Here are nearby options for **{svc}** ({payment_mode}):")
 
     for i, f in enumerate(facilities[:MIN_FACILITIES_TO_DISPLAY], start=1):
         name = _pick_hospital_name(f) if "hospital_name" not in f else (f.get("hospital_name") or _pick_hospital_name(f))
@@ -1200,115 +1231,6 @@ def build_facility_block(
     return "\n".join(lines), ui_payload
 
 
-
-
-# ----------------------------
-# Service variants (DB-first)
-# ----------------------------
-_service_variants_cols_cache: Optional[set] = None
-
-
-async def _load_service_variants_columns(conn: asyncpg.Connection) -> set:
-    """Load and cache column names for public.service_variants.
-
-    This allows us to support either 'patient_summary' or the shorter 'patient_summar'
-    column name, depending on how the table was created.
-    """
-    global _service_variants_cols_cache
-    if _service_variants_cols_cache is not None:
-        return _service_variants_cols_cache
-    rows = await conn.fetch(
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = 'service_variants'
-        """
-    )
-    _service_variants_cols_cache = set([r["column_name"] for r in rows]) if rows else set()
-    return _service_variants_cols_cache
-
-
-async def get_service_variants(conn: asyncpg.Connection, parent_service: str) -> List[dict]:
-    """Fetch active service variants for a parent service (e.g., 'colonoscopy')."""
-    ps = (parent_service or "").strip().lower()
-    if not ps:
-        return []
-
-    cols = await _load_service_variants_columns(conn)
-
-    # Support either column name depending on the user's actual schema.
-    if "patient_summary" in cols:
-        patient_col = "patient_summary"
-    elif "patient_summar" in cols:
-        patient_col = "patient_summar"
-    else:
-        patient_col = None
-
-    select_bits = [
-        "id",
-        "parent_service",
-        "cpt_code",
-        "variant_name",
-        "is_preventive",
-    ]
-    if patient_col:
-        select_bits.append(f"{patient_col} AS patient_summary")
-    else:
-        select_bits.append("NULL::text AS patient_summary")
-
-    sql = f"""
-        SELECT {', '.join(select_bits)}
-        FROM public.service_variants
-        WHERE lower(parent_service) = $1
-        ORDER BY is_preventive DESC NULLS LAST, variant_name ASC, id ASC
-    """
-
-    rows = await conn.fetch(sql, ps)
-    return [dict(r) for r in rows]
-
-
-def build_service_variant_prompt(parent_service: str, variants: List[dict]) -> str:
-    """Build a user-facing prompt explaining and enumerating variants."""
-    svc = (parent_service or "this service").strip() or "this service"
-    lines = [
-        f'“{svc}” can be billed a few different ways. Which one matches what you mean?',
-        "",
-    ]
-
-    for i, v in enumerate(variants, start=1):
-        label = (v.get("variant_name") or "Option").strip() or "Option"
-        summary = (v.get("patient_summary") or "").strip()
-        if summary:
-            lines.append(f"{i}) {label} – {summary}")
-        else:
-            lines.append(f"{i}) {label}")
-
-    lines.append("")
-    lines.append("Reply with the number that fits best.")
-    return "\n".join(lines)
-
-
-def apply_service_variant_choice(message: str, merged: dict, variants: List[dict]) -> dict:
-    """If the user replied with a number, apply the selected variant (sets CPT code)."""
-    s = (message or "").strip()
-    if not s.isdigit():
-        return merged
-
-    idx = int(s) - 1
-    if idx < 0 or idx >= len(variants):
-        return merged
-
-    picked = variants[idx]
-    cpt = (picked.get("cpt_code") or "").strip()
-    if not cpt:
-        return merged
-
-    merged["code_type"] = "CPT"
-    merged["code"] = cpt
-    merged["variant_id"] = picked.get("id")
-    merged["variant_name"] = picked.get("variant_name")
-    merged.pop("_awaiting", None)
-    return merged
 # ----------------------------
 # Service refiners (DB-first, Python fallback)
 # ----------------------------
@@ -1486,6 +1408,18 @@ async def chat_stream(req: ChatRequest, request: Request):
                 # If this message is a NEW pricing question (service inferred) and the user did not provide a ZIP,
                 # do not reuse a prior ZIP/payment from the session. Force ZIP collection first.
                 if intent.get("_new_price_question"):
+                    # Always clear prior service-specific context so we don't reuse the last service
+                    # (e.g., previous colonoscopy) for a new question.
+                    merged.pop("code_type", None)
+                    merged.pop("code", None)
+                    merged.pop("refiner_id", None)
+                    merged.pop("refiner_choice", None)
+                    merged.pop("variant_id", None)
+                    merged.pop("variant_name", None)
+                    # If we were in the middle of a variant selection for the prior service, clear it.
+                    if merged.get("_awaiting") == "variant":
+                        merged.pop("_awaiting", None)
+
                     if not message_contains_zip(req.message):
                         merged.pop("zipcode", None)
                     # Always reset payment/payer/plan for a new pricing question unless explicitly stated
@@ -1600,78 +1534,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                         yield sse({"type": "final", "used_web_search": False})
                         return
 
-
-
-                    # ----------------------------
-                    # Service variants: ask user to choose a specific billed variant (DB-first)
-                    # ----------------------------
-                    try:
-                        # If we're already awaiting a variant choice, try to apply it.
-                        if merged.get("_awaiting") == "variant":
-                            vlist = await get_service_variants(conn, merged.get("service_query") or "")
-                            merged = apply_service_variant_choice(req.message, merged, vlist)
-
-                            # Still awaiting (invalid reply), re-ask the same variant question.
-                            if merged.get("_awaiting") == "variant" and not (merged.get("code_type") and merged.get("code")):
-                                if vlist:
-                                    msg = build_service_variant_prompt(merged.get("service_query") or "this service", vlist)
-                                    yield sse({"type": "delta", "text": msg})
-                                    await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_service_variant", "intent": intent})
-                                    await update_session_state(conn, session_id, merged)
-                                    await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-                                    yield sse({"type": "final", "used_web_search": False})
-                                    return
-                                else:
-                                    # No variants found anymore, clear awaiting and continue.
-                                    merged.pop("_awaiting", None)
-
-                        # If we have a service query but no code yet, and variants exist, ask the variant question.
-                        if (merged.get("service_query") or "").strip() and not (merged.get("code_type") and merged.get("code")) and merged.get("_awaiting") is None:
-                            vlist = await get_service_variants(conn, merged.get("service_query") or "")
-                            if vlist and len(vlist) >= 2:
-                                merged["_awaiting"] = "variant"
-                                msg = build_service_variant_prompt(merged.get("service_query") or "this service", vlist)
-                                yield sse({"type": "delta", "text": msg})
-                                await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_service_variant", "intent": intent})
-                                await update_session_state(conn, session_id, merged)
-                                await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-                                yield sse({"type": "final", "used_web_search": False})
-                                return
-                    except Exception as e:
-                        logger.warning(f"Service variants lookup failed: {e}")
-                    # Service variants (DB-first): ask user to choose a specific billed service before pricing
-                    # try:
-                        # If we were awaiting a variant choice, attempt to apply it first
-                    # if merged.get("_awaiting") == "variant":
-                    # variants = await get_service_variants(conn, merged.get("service_query") or "")
-                    # merged = apply_service_variant_choice(req.message, merged, variants)
-                    #                             # If the user input wasn't a valid choice, re-ask the same variant question
-                    # if merged.get("_awaiting") == "variant" and not (merged.get("code_type") and merged.get("code")) and variants:
-                    # msg = build_service_variant_prompt(merged.get("service_query") or "this service", variants)
-                    # yield sse({"type": "delta", "text": msg})
-                    # await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_variant", "intent": intent})
-                    # await update_session_state(conn, session_id, merged)
-                    # await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-                    # yield sse({"type": "final", "used_web_search": False})
-                    # return
-                    #                             # If we're still marked as awaiting but have no variants, clear it
-                    # if merged.get("_awaiting") == "variant" and not variants:
-                    # merged.pop("_awaiting", None)
-                    #                         # If we have a parent service and no code yet, and variants exist, force a choice
-                    # if (merged.get("service_query") or "").strip() and not (merged.get("code_type") and merged.get("code")):
-                    # variants = await get_service_variants(conn, merged.get("service_query") or "")
-                    # if variants and len(variants) >= 2:
-                    # merged["_awaiting"] = "variant"
-                    # msg = build_service_variant_prompt(merged.get("service_query") or "this service", variants)
-                    # yield sse({"type": "delta", "text": msg})
-                    # await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_variant", "intent": intent})
-                    # await update_session_state(conn, session_id, merged)
-                    # await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-                    # yield sse({"type": "final", "used_web_search": False})
-                    # return
-                    # except Exception as e:
-                    # logger.warning(f"Service variants lookup failed: {e}")
-                    #                     # Resolve code if needed
+                    # Resolve code if needed
                     if not (merged.get("code_type") and merged.get("code")):
                         resolved = await resolve_service_code(conn, merged)
                         if resolved:
@@ -1740,8 +1603,6 @@ async def chat_stream(req: ChatRequest, request: Request):
                                     "code",
                                     "refiner_id",
                                     "refiner_choice",
-                                    "variant_id",
-                                    "variant_name",
                                 ]
                             },
                         }
