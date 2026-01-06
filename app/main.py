@@ -1114,46 +1114,46 @@ async def chat_stream(req: ChatRequest, request: Request):
                         return
 
                     
-# Variants (subtypes): if this service maps to multiple CPT variants, ask user to choose before pricing.
-# Also handle numeric replies while awaiting variant choice.
-if merged.get("_awaiting") == "variant" and not merged.get("variant_cpt_code"):
-    # If the user replied with something we couldn't match, repeat guidance (do not fall back to "rephrase")
-    msg = merged.get("_variant_prompt") or "Please reply with one of the numbers shown above, or a 5-digit CPT code."
-    yield sse({"type": "delta", "text": msg})
-    await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_variant", "intent": intent})
-    await update_session_state(conn, session_id, merged)
-    await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-    yield sse({"type": "final", "used_web_search": False})
-    return
+                    # Variants (subtypes): if this service maps to multiple CPT variants, ask user to choose before pricing.
+                    # Also handle numeric replies while awaiting variant choice.
+                    if merged.get("_awaiting") == "variant" and not merged.get("variant_cpt_code"):
+                        # If the user replied with something we couldn't match, repeat guidance (do not fall back to "rephrase")
+                        msg = merged.get("_variant_prompt") or "Please reply with one of the numbers shown above, or a 5-digit CPT code."
+                        yield sse({"type": "delta", "text": msg})
+                        await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_variant", "intent": intent})
+                        await update_session_state(conn, session_id, merged)
+                        await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
+                        yield sse({"type": "final", "used_web_search": False})
+                        return
 
-if not (merged.get("variant_cpt_code") or "").strip():
-    variants = []
-    try:
-        variants = await fetch_service_variants(conn, merged.get("service_query") or "", limit=10)
-    except Exception as e:
-        logger.warning(f"Service variants lookup failed: {e}")
+                    if not (merged.get("variant_cpt_code") or "").strip():
+                        variants = []
+                        try:
+                            variants = await fetch_service_variants(conn, merged.get("service_query") or "", limit=10)
+                        except Exception as e:
+                            logger.warning(f"Service variants lookup failed: {e}")
 
-    # Narrow variants to those that clearly match the service term (reduce cross-service leakage)
-    sq = (merged.get("service_query") or "").strip().lower()
-    sq = {"colonscopy": "colonoscopy", "colonscoppy": "colonoscopy", "colonocopy": "colonoscopy"}.get(sq, sq)
-    if sq:
-        variants = [v for v in variants if sq in (str(v.get("variant_name") or "").lower())]
+                        # Narrow variants to those that clearly match the service term (reduce cross-service leakage)
+                        sq = (merged.get("service_query") or "").strip().lower()
+                        sq = {"colonscopy": "colonoscopy", "colonscoppy": "colonoscopy", "colonocopy": "colonoscopy"}.get(sq, sq)
+                        if sq:
+                            variants = [v for v in variants if sq in (str(v.get("variant_name") or "").lower())]
 
-    if len(variants) >= 2:
-        merged["_awaiting"] = "variant"
-        merged["_variant_options"] = [
-            {"cpt_code": str(v.get("cpt_code") or "").strip(), "variant_name": (v.get("variant_name") or "").strip()}
-            for v in variants[:10]
-            if v.get("cpt_code")
-        ]
-        msg = _variant_question(merged.get("service_query") or "this service", variants[:10])
-        merged["_variant_prompt"] = msg
-        yield sse({"type": "delta", "text": msg})
-        await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_variant", "intent": intent})
-        await update_session_state(conn, session_id, merged)
-        await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-        yield sse({"type": "final", "used_web_search": False})
-        return
+                        if len(variants) >= 2:
+                            merged["_awaiting"] = "variant"
+                            merged["_variant_options"] = [
+                                {"cpt_code": str(v.get("cpt_code") or "").strip(), "variant_name": (v.get("variant_name") or "").strip()}
+                                for v in variants[:10]
+                                if v.get("cpt_code")
+                            ]
+                            msg = _variant_question(merged.get("service_query") or "this service", variants[:10])
+                            merged["_variant_prompt"] = msg
+                            yield sse({"type": "delta", "text": msg})
+                            await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_variant", "intent": intent})
+                            await update_session_state(conn, session_id, merged)
+                            await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
+                            yield sse({"type": "final", "used_web_search": False})
+                            return
 # If a refiner requires choice before pricing and user has not chosen yet, ask now
                     if refiner and refiner.get("require_choice_before_pricing") is True and not merged.get("refiner_choice"):
                         msg = get_refinement_prompt(refiner)
