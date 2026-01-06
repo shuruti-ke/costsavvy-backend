@@ -37,21 +37,6 @@ MIN_FACILITIES_TO_DISPLAY = int(os.getenv("MIN_FACILITIES_TO_DISPLAY", "5"))
 # Refiners cache TTL (DB-first, Python fallback)
 REFINERS_CACHE_TTL_SECONDS = int(os.getenv("REFINERS_CACHE_TTL_SECONDS", "300"))
 
-# ---- Care navigation (nearest hospital/urgent care) ----
-ENABLE_WEB_NEAREST_FACILITY = os.getenv("ENABLE_WEB_NEAREST_FACILITY", "true").lower() in (
-    "1",
-    "true",
-    "yes",
-    "y",
-    "on",
-)
-WEB_NEAREST_FACILITY_LIMIT = int(os.getenv("WEB_NEAREST_FACILITY_LIMIT", "3"))
-# Nominatim/Overpass requests should identify your app per typical usage policies.
-NOMINATIM_USER_AGENT = os.getenv(
-    "NOMINATIM_USER_AGENT",
-    "CostSavvy.health/1.0 (care navigation; contact: support@costsavvy.health)",
-)
-
 # ---- Intent override controls (env-driven) ----
 INTENT_OVERRIDE_FORCE_PRICE_ENABLED = os.getenv("INTENT_OVERRIDE_FORCE_PRICE_ENABLED", "true").lower() in (
     "1", "true", "yes", "y", "on"
@@ -320,6 +305,27 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
     msg = (message or "").strip()
     msg_l = msg.lower()
 
+    # Nearest facility intent (symptoms / injury and asking for help or a hospital)
+    symptom_terms = {"hurt", "hurts", "pain", "injury", "injured", "swelling", "bleeding", "fever", "vomit", "vomiting", "nausea", "stomach", "abdomen", "knee", "chest", "shortness of breath"}
+    care_terms = {"hospital", "er", "emergency", "urgent care", "doctor", "need help", "help", "i need help", "need to go", "go to"}
+    if any(t in msg_l for t in symptom_terms) and any(t in msg_l for t in care_terms) and not any(k in msg_l for k in ["how much", "cost", "price", "$", "pricing"]):
+        # Use zip from message if present, else keep session zip if available
+        z0 = None
+        m = re.search(r"\b(\d{5})\b", msg)
+        if m:
+            z0 = m.group(1)
+        return {
+            "mode": "nearest_facility",
+            "zipcode": z0 or st.get("zipcode"),
+            "service_query": None,
+            "code_type": None,
+            "code": None,
+            "payment_mode": None,
+            "payer_like": None,
+            "plan_like": None,
+            "clarifying_question": None,
+        }
+
     # Pull existing context
     st = state or {}
     awaiting = st.get("_awaiting")
@@ -574,156 +580,6 @@ def reset_gating_fields_for_new_price_question(message: str, merged: Dict[str, A
 
 
 # ----------------------------
-# Care navigation (nearest hospital/urgent care)
-# ----------------------------
-def is_care_navigation_message(message: str) -> bool:
-    """Detect when the user is asking for help getting to care (not pricing).
-
-    We keep this deterministic and conservative: it should trigger on common "need help" + symptom
-    language even if the user didn't explicitly say "hospital".
-    """
-    msg = (message or "").lower()
-
-    # explicit navigation / facility requests
-    explicit = [
-        "go to hospital",
-        "need to go to hospital",
-        "nearest hospital",
-        "closest hospital",
-        "urgent care",
-        "walk in clinic",
-        "walk-in clinic",
-        "emergency room",
-        "er",
-    ]
-    if any(t in msg for t in explicit):
-        return True
-
-    # "I need help" + symptom language (e.g., "my stomach hurts I need help")
-    help_terms = ["i need help", "need help", "help me", "need medical help", "i feel sick"]
-    symptom_terms = [
-        "hurts",
-        "pain",
-        "severe",
-        "swollen",
-        "bleeding",
-        "vomit",
-        "vomiting",
-        "fever",
-        "faint",
-        "dizzy",
-        "can't breathe",
-        "cant breathe",
-        "chest pain",
-    ]
-    body_terms = ["stomach", "abdomen", "belly", "knee", "back", "head", "throat", "arm", "leg"]
-    if any(h in msg for h in help_terms) and (any(s in msg for s in symptom_terms) or any(b in msg for b in body_terms)):
-        return True
-
-    # If they mention "hospital" plus any pain term, treat as navigation.
-    if "hospital" in msg and any(s in msg for s in symptom_terms):
-        return True
-
-    return False
-
-
-async def get_zip_latlon(conn: asyncpg.Connection, zipcode: str) -> Optional[Tuple[float, float]]:
-    row = await conn.fetchrow(
-        "SELECT latitude, longitude FROM public.zip_locations WHERE zipcode = $1 LIMIT 1",
-        zipcode,
-    )
-    if row and row.get("latitude") is not None and row.get("longitude") is not None:
-        return float(row["latitude"]), float(row["longitude"])
-    return None
-
-
-def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    import math
-
-    r = 3959.0
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dl / 2) ** 2
-    return 2 * r * math.asin(math.sqrt(a))
-
-
-async def geocode_zip_nominatim(zipcode: str) -> Optional[Tuple[float, float]]:
-    """Online fallback: ZIP -> lat/lon via Nominatim."""
-    if not ENABLE_WEB_NEAREST_FACILITY or httpx is None:
-        return None
-    url = "https://nominatim.openstreetmap.org/search"
-    params = {"postalcode": zipcode, "country": "USA", "format": "json", "limit": 1}
-    headers = {"User-Agent": NOMINATIM_USER_AGENT}
-    async with httpx.AsyncClient(timeout=15, headers=headers) as client_http:
-        r = await client_http.get(url, params=params)
-        r.raise_for_status()
-        data = r.json() or []
-        if not data:
-            return None
-        return float(data[0]["lat"]), float(data[0]["lon"])
-
-
-async def find_nearest_hospitals_overpass(lat: float, lon: float, limit: int = 3) -> List[Dict[str, Any]]:
-    """Online: Find hospitals/urgent care near a point using Overpass (OSM)."""
-    if not ENABLE_WEB_NEAREST_FACILITY or httpx is None:
-        return []
-
-    radius_m = 20000  # 20km
-    query = f"""
-    [out:json][timeout:25];
-    (
-      node(around:{radius_m},{lat},{lon})["amenity"="hospital"];
-      way(around:{radius_m},{lat},{lon})["amenity"="hospital"];
-      relation(around:{radius_m},{lat},{lon})["amenity"="hospital"];
-      node(around:{radius_m},{lat},{lon})["amenity"="clinic"];
-      way(around:{radius_m},{lat},{lon})["amenity"="clinic"];
-      relation(around:{radius_m},{lat},{lon})["amenity"="clinic"];
-    );
-    out center tags;
-    """
-
-    url = "https://overpass-api.de/api/interpreter"
-    headers = {"User-Agent": NOMINATIM_USER_AGENT}
-    async with httpx.AsyncClient(timeout=30, headers=headers) as client_http:
-        r = await client_http.post(url, data=query)
-        r.raise_for_status()
-        payload = r.json() or {}
-
-    elems = payload.get("elements", []) or []
-
-    def _pick_point(e: dict) -> Optional[Tuple[float, float]]:
-        if "lat" in e and "lon" in e:
-            return float(e["lat"]), float(e["lon"])
-        c = e.get("center")
-        if c and "lat" in c and "lon" in c:
-            return float(c["lat"]), float(c["lon"])
-        return None
-
-    results: List[Dict[str, Any]] = []
-    for e in elems:
-        tags = e.get("tags", {}) or {}
-        pt = _pick_point(e)
-        if not pt:
-            continue
-        name = (tags.get("name") or "Hospital/Clinic").strip()
-        street = (tags.get("addr:street") or "").strip()
-        housenumber = (tags.get("addr:housenumber") or "").strip()
-        city = (tags.get("addr:city") or "").strip()
-        state = (tags.get("addr:state") or "").strip()
-        postcode = (tags.get("addr:postcode") or "").strip()
-        phone = (tags.get("phone") or tags.get("contact:phone") or "").strip()
-
-        address = " ".join([p for p in [housenumber, street] if p]).strip()
-        full_addr = ", ".join([p for p in [address, city, state, postcode] if p]).strip()
-        dist = haversine_miles(lat, lon, pt[0], pt[1])
-        results.append({"name": name, "address": full_addr, "phone": phone, "distance_miles": dist})
-
-    results.sort(key=lambda x: x.get("distance_miles") or 9e9)
-    return results[: max(1, int(limit or 3))]
-
-
-# ----------------------------
 # DB: resolve code + price lookup
 # ----------------------------
 async def resolve_service_code(conn: asyncpg.Connection, merged: Dict[str, Any]) -> Optional[Tuple[str, str]]:
@@ -861,6 +717,115 @@ async def price_lookup_staging(
         """
         rows = await conn.fetch(sql, zipcode, q, payer_like, plan_like, limit, zlat, zlon)
         return [dict(r) for r in rows]
+
+    # No lat/lon available, return without distance ordering
+    sql2 = """
+    SELECT
+      COALESCE(h.name, r.hospital_name) AS hospital_name,
+      h.address AS address,
+      h.state AS state,
+      h.zipcode AS zipcode,
+      h.phone AS phone,
+      NULL::float AS distance_miles,
+      r.code_type,
+      r.code,
+      r.payer_name,
+      r.plan_name,
+      r.standard_charge_discounted_cash AS standard_charge_cash,
+      r.standard_charge_negotiated_dollar AS negotiated_dollar,
+      r.estimated_amount AS estimated_amount
+    FROM public.stg_hospital_rates r
+    LEFT JOIN public.hospitals h ON h.id = r.hospital_id
+    WHERE r.service_description ILIKE '%' || $2 || '%'
+      AND """ + payer_clause + """ 
+      AND """ + plan_clause + """ 
+    ORDER BY COALESCE(h.state, ''), COALESCE(h.zipcode, ''), COALESCE(h.name, r.hospital_name, '')
+    LIMIT $5
+    """
+    rows = await conn.fetch(sql2, zipcode, q, payer_like, plan_like, limit)
+    return [dict(r) for r in rows]
+
+
+async def price_lookup_staging_by_code(conn: asyncpg.Connection, zipcode: str, code_type: str, code: str, payer_like: Optional[str], plan_like: Optional[str], payment_mode: str, limit: int = 25) -> List[Dict[str, Any]]:
+    """Lookup prices from stg_hospital_rates for a specific code and join to service_variants for explanations."""
+    if not code_type or not code or not zipcode:
+        return []
+
+    z = await conn.fetchrow(
+        "SELECT latitude, longitude FROM public.zip_locations WHERE zipcode = $1 LIMIT 1",
+        zipcode,
+    )
+    zlat = float(z["latitude"]) if z and z["latitude"] is not None else None
+    zlon = float(z["longitude"]) if z and z["longitude"] is not None else None
+
+    payer_clause = "($4::text IS NULL OR r.payer_name ILIKE '%' || $4 || '%')"
+    plan_clause = "($5::text IS NULL OR r.plan_name ILIKE '%' || $5 || '%')"
+
+    # Join service_variants for patient-facing explanations
+    # NOTE: table name is expected to be public.service_variants (loaded from service_variants.csv)
+    if zlat is not None and zlon is not None:
+        sql = """
+        SELECT
+          h.name AS hospital_name,
+          h.address AS address,
+          h.state AS state,
+          h.zipcode AS zipcode,
+          h.phone AS phone,
+          (3959 * acos(
+              cos(radians($6)) * cos(radians(h.latitude)) * cos(radians(h.longitude) - radians($7)) +
+              sin(radians($6)) * sin(radians(h.latitude))
+          )) AS distance_miles,
+          r.code_type,
+          r.code,
+          r.payer_name,
+          r.plan_name,
+          r.standard_charge_discounted_cash AS standard_charge_cash,
+          r.standard_charge_negotiated_dollar AS negotiated_dollar,
+          r.estimated_amount AS estimated_amount,
+          sv.variant_name AS variant_name,
+          sv.patient_summary AS variant_patient_summary
+        FROM public.stg_hospital_rates r
+        LEFT JOIN public.hospitals h ON h.id = r.hospital_id
+        LEFT JOIN public.service_variants sv ON sv.code_type = r.code_type AND sv.code = r.code
+        WHERE r.code_type = $2 AND r.code = $3
+          AND """ + payer_clause + """
+          AND """ + plan_clause + """
+          AND h.latitude IS NOT NULL AND h.longitude IS NOT NULL
+        ORDER BY distance_miles ASC NULLS LAST
+        LIMIT $1
+        """
+        rows = await conn.fetch(sql, limit, code_type, code, payer_like, plan_like, zlat, zlon)
+        return [dict(r) for r in rows]
+
+    sql2 = """
+    SELECT
+      COALESCE(h.name, r.hospital_name) AS hospital_name,
+      h.address AS address,
+      h.state AS state,
+      h.zipcode AS zipcode,
+      h.phone AS phone,
+      NULL::float AS distance_miles,
+      r.code_type,
+      r.code,
+      r.payer_name,
+      r.plan_name,
+      r.standard_charge_discounted_cash AS standard_charge_cash,
+      r.standard_charge_negotiated_dollar AS negotiated_dollar,
+      r.estimated_amount AS estimated_amount,
+      sv.variant_name AS variant_name,
+      sv.patient_summary AS variant_patient_summary
+    FROM public.stg_hospital_rates r
+    LEFT JOIN public.hospitals h ON h.id = r.hospital_id
+    LEFT JOIN public.service_variants sv ON sv.code_type = r.code_type AND sv.code = r.code
+    WHERE r.code_type = $2 AND r.code = $3
+      AND """ + payer_clause + """
+      AND """ + plan_clause + """
+    ORDER BY COALESCE(h.state, ''), COALESCE(h.zipcode, ''), COALESCE(h.name, r.hospital_name, '')
+    LIMIT $1
+    """
+    rows = await conn.fetch(sql2, limit, code_type, code, payer_like, plan_like)
+    return [dict(r) for r in rows]
+
 
 # ----------------------------
 # Nearest-facility pricing (geo-first, ensures a facility list)
@@ -1253,6 +1218,25 @@ def _format_money(v: Optional[float]) -> str:
         return f"${v}"
 
 
+
+
+def build_service_education_bullets(service_query: str, payment_mode: str) -> List[str]:
+    """Short, patient-facing caveats that apply to many services (not colonoscopy-specific)."""
+    s = (service_query or "this service").strip()
+    pm = (payment_mode or "cash").strip().lower()
+
+    bullets: List[str] = []
+    bullets.append(
+        "- Prices vary by **setting** (hospital outpatient vs ambulatory center) and what’s included (facility, physician, anesthesia, supplies, pathology/reading fees)."
+    )
+    bullets.append("- If extra work is done (additional imaging sequences, complications, biopsies, hardware), the total can increase.")
+
+    if pm == "insurance":
+        bullets.append("- Your **out-of-pocket** depends on your deductible, copay/coinsurance, and whether the facility is in-network.")
+    else:
+        bullets.append("- For self-pay, ask the facility for an **all-in cash bundle** and confirm what it includes.")
+
+    return bullets
 def build_facility_block(
     service_query: str,
     payment_mode: str,
@@ -1300,15 +1284,28 @@ def build_facility_block(
     est_range = estimate_cost_range(service_query or "this service", payment_mode or "cash")
 
     # Build answer text
-    bullets = []
-    bullets.append(f"- Colonoscopies can be **screening** (preventive) or **diagnostic** (symptoms/abnormal finding).")
-    bullets.append(f"- Facility setting matters: **outpatient endoscopy centers** often differ from **hospital outpatient** pricing.")
-    bullets.append(f"- If a biopsy or polyp removal happens, total cost can increase.")
+    lines: List[str] = []
 
-    lines = []
-    lines.extend(bullets)
+    # Optional service-variant explanation (from public.service_variants when available)
+    variant_name = None
+    variant_summary = None
+    for rr in (priced_results or []):
+        if not variant_name and rr.get("variant_name"):
+            variant_name = str(rr.get("variant_name")).strip()
+        if not variant_summary and rr.get("variant_patient_summary"):
+            variant_summary = str(rr.get("variant_patient_summary")).strip()
+
+    if variant_name or variant_summary:
+        lines.append("Service details:")
+        if variant_name:
+            lines.append(f"- **Type:** {variant_name}")
+        if variant_summary:
+            lines.append(f"- **What it is:** {variant_summary}")
+        lines.append("")
+
+    lines.extend(build_service_education_bullets(service_query or "this service", payment_mode or "cash"))
     lines.append("")
-    lines.append(f"Here are nearby options for **{service_query or 'colonoscopy'}** ({payment_mode}):")
+    lines.append(f"Here are nearby options for **{service_query or 'this service'}** ({payment_mode}):")
 
     for i, f in enumerate(facilities[:MIN_FACILITIES_TO_DISPLAY], start=1):
         name = _pick_hospital_name(f) if "hospital_name" not in f else (f.get("hospital_name") or _pick_hospital_name(f))
@@ -1557,6 +1554,68 @@ async def chat_stream(req: ChatRequest, request: Request):
                 intent = apply_intent_override_if_needed(intent, req.message, merged, session_id)
                 mode = intent.get("mode") or "hybrid"
 
+                # ----------------------------
+                # NEAREST FACILITY mode (web lookup)
+                # ----------------------------
+                if mode == "nearest_facility":
+                    zipcode = merged.get("zipcode")
+                    if not zipcode:
+                        merged["_awaiting"] = "zip"
+                        msg = "What’s your 5-digit ZIP code? I’ll pull the nearest hospitals/ERs."
+                        yield sse({"type": "delta", "text": msg})
+                        await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_zip", "intent": intent})
+                        await update_session_state(conn, session_id, merged)
+                        await log_query(conn, session_id, req.message, intent, None, 0, True, msg)
+                        yield sse({"type": "final", "used_web_search": True})
+                        return
+
+                    if merged.get("_awaiting") == "zip":
+                        merged.pop("_awaiting", None)
+
+                    latlon = await geocode_zip_nominatim(str(zipcode))
+                    if not latlon:
+                        msg = f"I couldn’t find coordinates for ZIP {zipcode}. Try a nearby 5-digit ZIP code."
+                        yield sse({"type": "delta", "text": msg})
+                        await save_message(conn, session_id, "assistant", msg, {"mode": "nearest_facility", "intent": intent})
+                        await update_session_state(conn, session_id, merged)
+                        await log_query(conn, session_id, req.message, intent, None, 0, True, msg)
+                        yield sse({"type": "final", "used_web_search": True})
+                        return
+
+                    lat, lon = latlon
+                    places = await find_nearest_hospitals_overpass(lat, lon, limit=3)
+                    if not places:
+                        msg = "I couldn’t find nearby hospitals from the online lookup right now. If this feels urgent, consider calling 911 or going to the nearest ER."
+                        yield sse({"type": "delta", "text": msg})
+                        await save_message(conn, session_id, "assistant", msg, {"mode": "nearest_facility", "intent": intent})
+                        await update_session_state(conn, session_id, merged)
+                        await log_query(conn, session_id, req.message, intent, None, 0, True, msg)
+                        yield sse({"type": "final", "used_web_search": True})
+                        return
+
+                    lines = []
+                    lines.append("I can’t give medical advice, but I can help you find nearby care. If you have severe pain, trouble breathing, fainting, or heavy bleeding, call 911.")
+                    lines.append("")
+                    lines.append(f"Nearest hospitals/ER-type facilities near **{zipcode}**:")
+                    for i, p in enumerate(places, start=1):
+                        dist = p.get("distance_miles")
+                        dist_txt = f" ({float(dist):.1f} mi)" if dist is not None else ""
+                        lines.append(f"{i}) **{p.get('name','Hospital')}**{dist_txt}")
+                        addr = p.get("address") or ""
+                        phone = p.get("phone") or ""
+                        detail_bits = [b for b in [addr, (f"Tel: {phone}" if phone else "")] if b]
+                        if detail_bits:
+                            lines.append("   - " + " | ".join(detail_bits))
+                    lines.append("")
+                    lines.append("Want urgent care instead of an ER? Say: \"urgent care\".")
+                    msg = "\n".join(lines)
+                    yield sse({"type": "delta", "text": msg})
+                    await save_message(conn, session_id, "assistant", msg, {"mode": "nearest_facility", "intent": intent})
+                    await update_session_state(conn, session_id, merged)
+                    await log_query(conn, session_id, req.message, intent, None, len(places), True, msg)
+                    yield sse({"type": "final", "used_web_search": True})
+                    return
+
                 # 3) OPTIONAL: reset gating fields only when this message looks like a NEW pricing question
                 # (Never reset while we are awaiting ZIP/payment/payer)
                 if (
@@ -1575,92 +1634,6 @@ async def chat_stream(req: ChatRequest, request: Request):
                 refiner = match_refiner(merged.get("service_query") or "", refiners_doc)
                 merged = apply_refiner_choice(req.message, merged, refiner)
                 merged = maybe_apply_preview_code(merged, refiner)
-
-                # ----------------------------
-                # CARE NAVIGATION MODE (nearest hospital/urgent care)
-                # ----------------------------
-                # If the user is seeking help getting to care (e.g., "my stomach hurts I need help"),
-                # ask for ZIP then return nearest facilities. We skip this when the user is clearly
-                # asking about PRICE (to avoid hijacking price lookups).
-                if is_care_navigation_message(req.message) and not should_force_price_mode(req.message, merged):
-                    # Ask for ZIP if missing
-                    zipcode = merged.get("zipcode")
-                    if not zipcode:
-                        merged["_awaiting"] = "zip"
-                        msg = "What’s your 5-digit ZIP code so I can find the nearest hospital or urgent care?"
-                        yield sse({"type": "delta", "text": msg})
-                        await save_message(conn, session_id, "assistant", msg, {"mode": "care_navigation"})
-                        await update_session_state(conn, session_id, merged)
-                        await log_query(conn, session_id, req.message, {"mode": "care_navigation"}, None, 0, True, msg)
-                        yield sse({"type": "final", "used_web_search": True})
-                        return
-
-                    if merged.get("_awaiting") == "zip":
-                        merged.pop("_awaiting", None)
-
-                    # Safety message, non-diagnostic
-                    safety = (
-                        "If your pain is severe, you have fever, repeated vomiting, blood in vomit/stool, "
-                        "fainting, trouble breathing, or you think it’s an emergency, call local emergency services right now."
-                    )
-
-                    # DB-first zip -> lat/lon, then web geocode fallback
-                    latlon = await get_zip_latlon(conn, zipcode)
-                    if not latlon:
-                        try:
-                            latlon = await geocode_zip_nominatim(zipcode)
-                        except Exception as e:
-                            logger.warning(f"Web geocode failed: {e}")
-                            latlon = None
-
-                    places: List[Dict[str, Any]] = []
-                    if latlon:
-                        try:
-                            places = await find_nearest_hospitals_overpass(latlon[0], latlon[1], limit=WEB_NEAREST_FACILITY_LIMIT)
-                        except Exception as e:
-                            logger.warning(f"Overpass lookup failed: {e}")
-
-                    # If web lookup fails, fall back to DB facility directory (no hallucination)
-                    if not places:
-                        try:
-                            db_places = await get_nearby_hospitals(conn, zipcode, limit=max(WEB_NEAREST_FACILITY_LIMIT, 3))
-                        except Exception:
-                            db_places = []
-
-                        lines = [safety, "", f"Nearest hospitals near **{zipcode}** (from our directory):"]
-                        for i, p in enumerate(db_places[:WEB_NEAREST_FACILITY_LIMIT], start=1):
-                            name = p.get("hospital_name") or _pick_hospital_name(p)
-                            addr = _pick_address(p) or "Address not available"
-                            phone = p.get("phone") or ""
-                            dist = p.get("distance_miles")
-                            dist_txt = f" ({float(dist):.1f} mi)" if dist is not None else ""
-                            lines.append(f"{i}) **{name}**{dist_txt}")
-                            lines.append(f"   - {addr}" + (f" | Tel: {phone}" if phone else ""))
-
-                        msg = "\n".join(lines) if db_places else (safety + "\n\nI couldn’t find nearby facilities for that ZIP. Please double-check the ZIP code.")
-                        yield sse({"type": "delta", "text": msg})
-                        await save_message(conn, session_id, "assistant", msg, {"mode": "care_navigation", "used_web": False})
-                        await update_session_state(conn, session_id, merged)
-                        await log_query(conn, session_id, req.message, {"mode": "care_navigation"}, None, len(db_places), False, msg)
-                        yield sse({"type": "final", "used_web_search": False})
-                        return
-
-                    lines = [safety, "", f"Nearest hospitals/urgent care near **{zipcode}** (online):"]
-                    for i, p in enumerate(places, start=1):
-                        dist = p.get("distance_miles")
-                        dist_txt = f" ({float(dist):.1f} mi)" if dist is not None else ""
-                        addr = p.get("address") or "Address not available"
-                        phone = p.get("phone") or ""
-                        lines.append(f"{i}) **{p.get('name','Hospital/Clinic')}**{dist_txt}")
-                        lines.append(f"   - {addr}" + (f" | Tel: {phone}" if phone else ""))
-
-                    msg = "\n".join(lines)
-                    yield sse({"type": "delta", "text": msg})
-                    await save_message(conn, session_id, "assistant", msg, {"mode": "care_navigation", "used_web": True})
-                    await update_session_state(conn, session_id, merged)
-                    await log_query(conn, session_id, req.message, {"mode": "care_navigation"}, None, len(places), True, msg)
-                    yield sse({"type": "final", "used_web_search": True})
-                    return
 
                 # ----------------------------
                 # GENERAL mode
@@ -1779,6 +1752,44 @@ async def chat_stream(req: ChatRequest, request: Request):
                         merged.get("plan_like"),
                         merged.get("payment_mode") or "cash",
                     )
+
+                    # Also try stg_hospital_rates for this exact code, and join to service_variants for a plain-language explanation
+                    stg_code_rows: List[Dict[str, Any]] = []
+                    try:
+                        stg_code_rows = await price_lookup_staging_by_code(
+                            conn,
+                            merged["zipcode"],
+                            merged["code_type"],
+                            merged["code"],
+                            merged.get("payer_like"),
+                            merged.get("plan_like"),
+                            merged.get("payment_mode") or "cash",
+                            limit=25,
+                        )
+                    except Exception as e:
+                        logger.warning(f"stg_hospital_rates by-code lookup failed: {e}")
+                        stg_code_rows = []
+
+                    # Prefer results from negotiated_rates, but fall back / top-up from staging
+                    if not results and stg_code_rows:
+                        results = stg_code_rows
+                    elif results and stg_code_rows:
+                        # Enrich variant fields if missing
+                        v0 = stg_code_rows[0]
+                        for k in ["variant_name", "variant_patient_summary", "variant_is_preventive"]:
+                            if v0.get(k) is not None:
+                                for rr in results:
+                                    rr.setdefault(k, v0.get(k))
+
+                        # Top up with additional facilities (dedupe by name)
+                        seen_names = {(_pick_hospital_name(r) or "").lower().strip() for r in results}
+                        for r in stg_code_rows:
+                            if len(results) >= 25:
+                                break
+                            nm = (_pick_hospital_name(r) or "").lower().strip()
+                            if nm and nm not in seen_names:
+                                results.append(r)
+                                seen_names.add(nm)
 
                     # Always fetch at least 5 facilities for display
                     try:
