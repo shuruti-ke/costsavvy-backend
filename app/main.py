@@ -5,6 +5,7 @@ import re
 import uuid
 import time
 import logging
+import httpx
 from typing import Optional, Any, Dict, List, Tuple
 
 import asyncpg
@@ -33,6 +34,30 @@ MIN_DB_RESULTS_BEFORE_WEB = int(os.getenv("MIN_DB_RESULTS_BEFORE_WEB", "3"))
 
 # Always try to show at least this many facilities in the answer
 MIN_FACILITIES_TO_DISPLAY = int(os.getenv("MIN_FACILITIES_TO_DISPLAY", "5"))
+
+# Web search configuration for health education
+WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "true").lower() in ("1", "true", "yes", "y", "on")
+WEB_SEARCH_TIMEOUT = int(os.getenv("WEB_SEARCH_TIMEOUT", "15"))
+BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "").strip()
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
+
+# Care navigation: symptom keywords that trigger care-finding mode (not pricing)
+SYMPTOM_KEYWORDS = [
+    "hurts", "hurt", "pain", "ache", "aching", "sore", "swollen", "swelling",
+    "bleeding", "dizzy", "diziness", "nausea", "vomiting", "fever", "cough",
+    "headache", "chest pain", "shortness of breath", "can't breathe", "broken",
+    "sprain", "twisted", "injured", "injury", "sick", "unwell", "feel bad",
+    "emergency", "urgent", "help me find", "where can i go", "need a doctor",
+    "need to see", "should i go to"
+]
+
+# Health education keywords that trigger web search for explanations
+HEALTH_EDUCATION_KEYWORDS = [
+    "what is", "what's", "explain", "tell me about", "how does", "why do",
+    "symptoms of", "causes of", "treatment for", "recovery from", "risks of",
+    "side effects", "preparation for", "after a", "before a", "difference between",
+    "is it safe", "should i worry", "normal to", "how long does"
+]
 
 # Refiners cache TTL (DB-first, Python fallback)
 REFINERS_CACHE_TTL_SECONDS = int(os.getenv("REFINERS_CACHE_TTL_SECONDS", "300"))
@@ -240,11 +265,276 @@ async def log_query(
 
 
 # ----------------------------
+# Web Search for Health Education
+# ----------------------------
+async def web_search_health_info(query: str, num_results: int = 5) -> List[Dict[str, Any]]:
+    """
+    Search the web for health education information.
+    Prioritizes authoritative medical sources.
+    Returns a list of search results with title, snippet, and url.
+    """
+    if not WEB_SEARCH_ENABLED:
+        return []
+    
+    results = []
+    
+    # Try Brave Search API first
+    if BRAVE_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=WEB_SEARCH_TIMEOUT) as client:
+                resp = await client.get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    headers={"X-Subscription-Token": BRAVE_API_KEY},
+                    params={
+                        "q": f"{query} site:mayoclinic.org OR site:webmd.com OR site:healthline.com OR site:medlineplus.gov OR site:cdc.gov",
+                        "count": num_results,
+                    }
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for item in data.get("web", {}).get("results", [])[:num_results]:
+                        results.append({
+                            "title": item.get("title", ""),
+                            "snippet": item.get("description", ""),
+                            "url": item.get("url", ""),
+                            "source": "brave"
+                        })
+        except Exception as e:
+            logger.warning(f"Brave search failed: {e}")
+    
+    # Fallback to Serper API
+    if not results and SERPER_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=WEB_SEARCH_TIMEOUT) as client:
+                resp = await client.post(
+                    "https://google.serper.dev/search",
+                    headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                    json={
+                        "q": f"{query} health medical",
+                        "num": num_results,
+                    }
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for item in data.get("organic", [])[:num_results]:
+                        results.append({
+                            "title": item.get("title", ""),
+                            "snippet": item.get("snippet", ""),
+                            "url": item.get("link", ""),
+                            "source": "serper"
+                        })
+        except Exception as e:
+            logger.warning(f"Serper search failed: {e}")
+    
+    return results
+
+
+def is_symptom_query(message: str) -> bool:
+    """Check if the message describes symptoms or care needs (not pricing)."""
+    msg = (message or "").lower()
+    return any(kw in msg for kw in SYMPTOM_KEYWORDS)
+
+
+def is_health_education_query(message: str) -> bool:
+    """Check if the user is asking for health education/explanation."""
+    msg = (message or "").lower()
+    return any(kw in msg for kw in HEALTH_EDUCATION_KEYWORDS)
+
+
+def extract_health_topic(message: str) -> str:
+    """Extract the health topic from a user's question for web search."""
+    msg = (message or "").strip()
+    # Remove common question prefixes
+    prefixes = [
+        "what is", "what's", "what are", "explain", "tell me about",
+        "how does", "why do", "can you explain", "i want to know about",
+        "help me understand"
+    ]
+    msg_lower = msg.lower()
+    for prefix in prefixes:
+        if msg_lower.startswith(prefix):
+            msg = msg[len(prefix):].strip()
+            break
+    # Remove trailing question marks and clean up
+    msg = msg.rstrip("?").strip()
+    return msg
+
+
+async def lookup_service_explanation(conn: asyncpg.Connection, topic: str) -> Optional[Dict[str, Any]]:
+    """
+    Look up a service explanation from the database before falling back to web search.
+    Returns service info with patient_summary, cpt_explanation if found.
+    """
+    if not topic:
+        return None
+    
+    # First try service_variants for patient summaries
+    row = await conn.fetchrow(
+        """
+        SELECT sv.cpt_code, sv.variant_name, sv.patient_summary,
+               s.cpt_explanation, s.service_description, s.category
+        FROM public.service_variants sv
+        LEFT JOIN public.services s ON s.code = sv.cpt_code AND s.code_type = 'CPT'
+        WHERE sv.variant_name ILIKE '%' || $1 || '%'
+           OR sv.patient_summary ILIKE '%' || $1 || '%'
+           OR s.cpt_explanation ILIKE '%' || $1 || '%'
+           OR s.patient_summary ILIKE '%' || $1 || '%'
+        LIMIT 1
+        """,
+        topic,
+    )
+    
+    if row:
+        return {
+            "cpt_code": row["cpt_code"],
+            "variant_name": row["variant_name"],
+            "patient_summary": row["patient_summary"],
+            "cpt_explanation": row["cpt_explanation"],
+            "service_description": row["service_description"],
+            "category": row["category"],
+            "source": "database"
+        }
+    
+    # Fallback to services table directly
+    row = await conn.fetchrow(
+        """
+        SELECT code, code_type, service_description, cpt_explanation, patient_summary, category
+        FROM public.services
+        WHERE cpt_explanation ILIKE '%' || $1 || '%'
+           OR service_description ILIKE '%' || $1 || '%'
+           OR patient_summary ILIKE '%' || $1 || '%'
+        LIMIT 1
+        """,
+        topic,
+    )
+    
+    if row:
+        return {
+            "cpt_code": row["code"],
+            "code_type": row["code_type"],
+            "service_description": row["service_description"],
+            "cpt_explanation": row["cpt_explanation"],
+            "patient_summary": row["patient_summary"],
+            "category": row["category"],
+            "source": "database"
+        }
+    
+    return None
+
+
+async def generate_health_education_response(
+    query: str,
+    search_results: List[Dict[str, Any]],
+    original_message: str,
+    db_service_info: Optional[Dict[str, Any]] = None
+) -> str:
+    """
+    Generate a patient-friendly health education response using LLM + web search results.
+    Optionally incorporates database service info if available.
+    """
+    # If we have database info, incorporate it
+    db_context = ""
+    if db_service_info:
+        parts = []
+        if db_service_info.get("patient_summary"):
+            parts.append(f"Patient Summary: {db_service_info['patient_summary']}")
+        if db_service_info.get("cpt_explanation"):
+            parts.append(f"Medical Description: {db_service_info['cpt_explanation']}")
+        if db_service_info.get("category"):
+            parts.append(f"Category: {db_service_info['category']}")
+        if parts:
+            db_context = "\n\nFrom our medical database:\n" + "\n".join(parts)
+    
+    if not search_results and not db_service_info:
+        # Fallback to LLM-only response with appropriate caveats
+        system = (
+            "You are CostSavvy.health, a helpful healthcare assistant. "
+            "Provide clear, patient-friendly explanations of medical topics. "
+            "Always include appropriate caveats that you are not providing medical advice "
+            "and that users should consult their healthcare provider for personal medical questions. "
+            "Be accurate and cite authoritative sources when possible."
+        )
+        try:
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": original_message}
+                ],
+                timeout=20,
+            )
+            answer = (resp.choices[0].message.content or "").strip()
+            return answer + "\n\n*This is general health information, not medical advice. Please consult your healthcare provider for questions about your specific situation.*"
+        except Exception as e:
+            logger.warning(f"LLM health education failed: {e}")
+            return "I couldn't find detailed information on that topic. Please consult a healthcare provider or visit trusted sources like MayoClinic.org or MedlinePlus.gov."
+    
+    # Build context from search results
+    context_parts = []
+    sources = []
+    
+    # Add database info first if available
+    if db_context:
+        context_parts.append(db_context)
+    
+    for i, r in enumerate(search_results[:3], 1):
+        context_parts.append(f"Source {i}: {r.get('title', 'Unknown')}\n{r.get('snippet', '')}")
+        if r.get('url'):
+            sources.append(f"- [{r.get('title', 'Source')}]({r.get('url')})")
+    
+    context = "\n\n".join(context_parts)
+    
+    system = (
+        "You are CostSavvy.health, a helpful healthcare assistant. "
+        "Use the provided information to give an accurate, patient-friendly explanation. "
+        "Prioritize information from our medical database when available. "
+        "Synthesize the information clearly. Do not make up information not in the sources. "
+        "If the sources don't fully answer the question, say so. "
+        "Keep the response concise but complete."
+    )
+    
+    user_prompt = f"""User question: {original_message}
+
+Search results:
+{context}
+
+Provide a clear, helpful response based on these sources. End with a brief disclaimer about consulting healthcare providers."""
+
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_prompt}
+            ],
+            timeout=20,
+        )
+        answer = (resp.choices[0].message.content or "").strip()
+        
+        # Add sources
+        if sources:
+            answer += "\n\n**Learn more:**\n" + "\n".join(sources[:3])
+        
+        return answer
+    except Exception as e:
+        logger.warning(f"LLM health education with search failed: {e}")
+        # Return a summary of search results
+        lines = ["Here's what I found:\n"]
+        for r in search_results[:3]:
+            lines.append(f"**{r.get('title', 'Source')}**")
+            lines.append(r.get('snippet', ''))
+            if r.get('url'):
+                lines.append(f"[Read more]({r.get('url')})\n")
+        lines.append("\n*Please consult your healthcare provider for personalized medical advice.*")
+        return "\n".join(lines)
+
+
+# ----------------------------
 # Intent extraction
 # ----------------------------
 INTENT_RULES = """
 Return ONLY JSON with:
-mode: "general" | "price" | "hybrid" | "clarify"
+mode: "general" | "price" | "hybrid" | "clarify" | "care" | "education"
 zipcode: 5-digit ZIP or null
 radius_miles: number or null
 payer_like: string like "Aetna" or null
@@ -255,10 +545,14 @@ code_type: string or null (usually "CPT")
 code: string or null (like "71046")
 clarifying_question: string or null
 cash_only: boolean
+health_topic: string or null (for education mode, the topic to explain)
 
 Notes:
 - If user says "cash price", "self-pay", "out of pocket" => payment_mode="cash" and cash_only=true.
 - If user mentions insurance or a carrier name => payment_mode="insurance".
+- If user describes symptoms like pain, injury, illness => mode="care" (help find care, not price).
+- If user asks "what is", "explain", "tell me about" a medical topic => mode="education".
+- mode="price" is for explicit pricing questions about specific services.
 """
 
 
@@ -297,6 +591,8 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
     Deterministic session-aware intent extraction.
 
     Key goals:
+      - Detect symptom/care queries and route to care navigation (not pricing).
+      - Detect health education queries and route to web search + LLM explanation.
       - Keep the user in the pricing flow once they started it.
       - Ask for ZIP first if missing (geo-first).
       - Accept short replies like "Cash", "Self pay", "Insurance", "Aetna" as continuations.
@@ -311,10 +607,39 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
     have_service = bool(st.get("service_query") or st.get("code"))
     have_zip = bool(st.get("zipcode"))
 
+    # EARLY DETECTION: Symptom/care queries (e.g., "my knee hurts")
+    # Only trigger if NOT already in a pricing flow
+    if is_symptom_query(msg) and not have_service and awaiting not in {"zip", "payment", "payer", "variant_choice"}:
+        return {
+            "mode": "care",
+            "zipcode": st.get("zipcode"),
+            "symptom_description": msg,
+            "clarifying_question": None,
+        }
+
+    # EARLY DETECTION: Health education queries (e.g., "what is a colonoscopy")
+    # Only trigger if NOT already in a pricing flow
+    if is_health_education_query(msg) and not have_service and awaiting not in {"zip", "payment", "payer", "variant_choice"}:
+        health_topic = extract_health_topic(msg)
+        return {
+            "mode": "education",
+            "health_topic": health_topic,
+            "original_question": msg,
+            "clarifying_question": None,
+        }
+
     # 0) ZIP detection anywhere in the message
     zip_match = re.search(r"\b(\d{5})\b", msg)
     if zip_match:
         z = zip_match.group(1)
+        # If we are awaiting a ZIP for care mode, return to care mode with the ZIP
+        if awaiting == "care_zip":
+            return {
+                "mode": "care",
+                "zipcode": z,
+                "symptom_description": st.get("_symptom_description"),
+                "clarifying_question": None,
+            }
         # If we already have a service in session, treat this as continuation of pricing flow.
         if have_service or awaiting in {"zip", "payment", "payer"}:
             return {
@@ -1690,6 +2015,124 @@ async def chat_stream(req: ChatRequest, request: Request):
                     return
 
                 # ----------------------------
+                # CARE mode (symptom-based, find care)
+                # ----------------------------
+                if mode == "care":
+                    # User described symptoms - help them find care, NOT price services
+                    zipcode = merged.get("zipcode") or intent.get("zipcode")
+                    
+                    if not zipcode:
+                        # Ask for ZIP to find nearby care options
+                        merged["_awaiting"] = "care_zip"
+                        merged["_symptom_description"] = intent.get("symptom_description") or req.message
+                        msg = (
+                            "I understand you're not feeling well. To help you find care options nearby, "
+                            "what's your 5-digit ZIP code?"
+                        )
+                        yield sse({"type": "delta", "text": msg})
+                        await save_message(conn, session_id, "assistant", msg, {"mode": "care", "intent": intent})
+                        await update_session_state(conn, session_id, merged)
+                        await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
+                        yield sse({"type": "final", "used_web_search": False})
+                        return
+                    
+                    # We have ZIP - find nearby hospitals/urgent care
+                    try:
+                        nearby = await get_nearby_hospitals(conn, zipcode, limit=5)
+                    except Exception as e:
+                        logger.warning(f"Care facility lookup failed: {e}")
+                        nearby = []
+                    
+                    # Build care guidance response
+                    symptom_desc = merged.get("_symptom_description") or intent.get("symptom_description") or req.message
+                    
+                    lines = []
+                    lines.append("I'm sorry you're experiencing that. Here are some nearby care options:\n")
+                    
+                    if nearby:
+                        for i, h in enumerate(nearby[:5], 1):
+                            name = h.get("hospital_name") or "Healthcare Facility"
+                            addr = _pick_address(h)
+                            phone = h.get("phone") or ""
+                            dist = h.get("distance_miles")
+                            dist_txt = f" ({dist:.1f} mi)" if dist else ""
+                            
+                            lines.append(f"**{i}. {name}**{dist_txt}")
+                            if addr:
+                                lines.append(f"   {addr}")
+                            if phone:
+                                lines.append(f"   Tel: {phone}")
+                            lines.append("")
+                    else:
+                        lines.append("I couldn't find facilities near that ZIP code in my database.")
+                        lines.append("")
+                    
+                    lines.append("**When to seek care:**")
+                    lines.append("- **Emergency (911)**: Chest pain, difficulty breathing, severe bleeding, stroke symptoms")
+                    lines.append("- **Urgent Care**: Non-life-threatening but needs same-day attention")
+                    lines.append("- **Primary Care**: Can wait 1-2 days for an appointment")
+                    lines.append("")
+                    lines.append("*If you're unsure, call ahead or use a nurse hotline. This is not medical advice.*")
+                    
+                    full_answer = "\n".join(lines)
+                    yield sse({"type": "delta", "text": full_answer})
+                    
+                    # Clear care-specific state
+                    merged.pop("_awaiting", None)
+                    merged.pop("_symptom_description", None)
+                    
+                    await save_message(conn, session_id, "assistant", full_answer, {"mode": "care", "intent": intent})
+                    await update_session_state(conn, session_id, merged)
+                    await log_query(conn, session_id, req.message, intent, None, len(nearby), False, full_answer)
+                    yield sse({"type": "final", "used_web_search": False})
+                    return
+
+                # ----------------------------
+
+                # ----------------------------
+                # EDUCATION mode (health topic explanation with web search)
+                # ----------------------------
+                if mode == "education":
+                    health_topic = intent.get("health_topic") or extract_health_topic(req.message)
+                    original_question = intent.get("original_question") or req.message
+                    
+                    # First, check if we have info in our database
+                    yield sse({"type": "status", "message": "Looking up health information..."})
+                    
+                    db_service_info = None
+                    try:
+                        db_service_info = await lookup_service_explanation(conn, health_topic)
+                    except Exception as e:
+                        logger.warning(f"Database lookup for health education failed: {e}")
+                    
+                    # Then search the web for additional authoritative information
+                    search_results = []
+                    used_web = False
+                    if WEB_SEARCH_ENABLED and (BRAVE_API_KEY or SERPER_API_KEY):
+                        try:
+                            search_results = await web_search_health_info(health_topic, num_results=5)
+                            used_web = len(search_results) > 0
+                        except Exception as e:
+                            logger.warning(f"Web search for health education failed: {e}")
+                    
+                    # Generate response
+                    full_answer = await generate_health_education_response(
+                        query=health_topic,
+                        search_results=search_results,
+                        original_message=original_question,
+                        db_service_info=db_service_info
+                    )
+                    
+                    yield sse({"type": "delta", "text": full_answer})
+                    
+                    await save_message(
+                        conn, session_id, "assistant", full_answer,
+                        {"mode": "education", "intent": intent, "health_topic": health_topic, "sources_count": len(search_results), "db_match": db_service_info is not None}
+                    )
+                    await update_session_state(conn, session_id, merged)
+                    await log_query(conn, session_id, req.message, intent, None, len(search_results), used_web, full_answer)
+                    yield sse({"type": "final", "used_web_search": used_web})
+                    return
                 # PRICE / HYBRID mode (deterministic, DB-first)
                 # ----------------------------
                 if mode in ["price", "hybrid"]:
