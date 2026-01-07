@@ -3,6 +3,9 @@ import os
 import json
 import re
 import uuid
+import urllib.parse
+import urllib.request
+import asyncio
 import time
 import logging
 from typing import Optional, Any, Dict, List, Tuple
@@ -25,6 +28,12 @@ logger = logging.getLogger("costsavvy")
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+
+# Variant summary web fallback (optional)
+ENABLE_WEB_VARIANT_SUMMARIES = os.getenv("ENABLE_WEB_VARIANT_SUMMARIES", "false").lower() in ("1","true","yes","y","on")
+WEB_VARIANT_SUMMARY_MAX = int(os.getenv("WEB_VARIANT_SUMMARY_MAX", "5"))
+WEB_VARIANT_SUMMARY_TIMEOUT_SEC = float(os.getenv("WEB_VARIANT_SUMMARY_TIMEOUT_SEC", "8"))
+
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 APP_API_KEY = os.getenv("APP_API_KEY", "").strip()
@@ -1095,6 +1104,56 @@ def _format_money(v: Optional[float]) -> str:
         return f"${v}"
 
 
+
+def build_service_education_bullets(service_query: str, payment_mode: str) -> List[str]:
+    """
+    Patient-facing, service-appropriate caveats. Keep generic unless we are confident.
+    """
+    s = (service_query or "").lower()
+    bullets: List[str] = []
+
+    # Imaging / diagnostics
+    if any(k in s for k in ["mri", "magnetic resonance"]):
+        bullets += [
+            "- MRI prices vary by **body part** and whether it’s **with or without contrast**.",
+            "- Many totals include both the **technical** fee (scanner/facility) and the **professional** fee (radiologist read).",
+            "- If sedation is used, that can add to the total.",
+        ]
+    elif any(k in s for k in ["ct", "cat scan", "computed tomography"]):
+        bullets += [
+            "- CT prices vary by **body part** and whether it’s **with or without contrast**.",
+            "- If contrast is used, there may be extra charges (supplies and monitoring).",
+            "- Facility and radiologist interpretation fees may be billed separately.",
+        ]
+    elif any(k in s for k in ["x-ray", "xray", "radiograph"]):
+        bullets += [
+            "- X-ray prices vary by **body part** and the number of views.",
+            "- There may be separate charges for the **facility** and the **radiologist interpretation**.",
+        ]
+    elif "ultrasound" in s or "sonogram" in s:
+        bullets += [
+            "- Ultrasound prices vary by **body part** and whether it’s **limited** vs **complete**.",
+            "- If Doppler/vascular components are included, the total can be higher.",
+        ]
+    # Common procedures
+    elif "colonoscopy" in s:
+        bullets += [
+            "- Colonoscopies can be **screening** (preventive) or **diagnostic** (symptoms/abnormal finding).",
+            "- Facility setting matters: **outpatient endoscopy centers** often differ from **hospital outpatient** pricing.",
+            "- If a biopsy or polyp removal happens, total cost can increase.",
+        ]
+    else:
+        bullets += [
+            "- Prices can vary by **facility**, how the service is billed, and what’s included.",
+            "- The total may include separate facility and professional fees.",
+        ]
+
+    # Payment nuance
+    if (payment_mode or "").lower().startswith("insur"):
+        bullets.append("- Your out-of-pocket cost depends on your plan (deductible, copays, coinsurance), and whether the facility is in-network.")
+    return bullets
+
+
 def build_facility_block(
     service_query: str,
     payment_mode: str,
@@ -1142,16 +1201,12 @@ def build_facility_block(
     est_range = estimate_cost_range(service_query or "this service", payment_mode or "cash")
 
     # Build answer text
-    bullets = []
-    bullets.append(f"- Colonoscopies can be **screening** (preventive) or **diagnostic** (symptoms/abnormal finding).")
-    bullets.append(f"- Facility setting matters: **outpatient endoscopy centers** often differ from **hospital outpatient** pricing.")
-    bullets.append(f"- If a biopsy or polyp removal happens, total cost can increase.")
+    bullets = build_service_education_bullets(service_query or "this service", payment_mode or "cash")
 
     lines = []
     lines.extend(bullets)
     lines.append("")
-    lines.append(f"Here are nearby options for **{service_query or 'colonoscopy'}** ({payment_mode}):")
-
+    lines.append(f"Here are nearby options for **{service_query or 'this service'}** ({payment_mode}):")
     for i, f in enumerate(facilities[:MIN_FACILITIES_TO_DISPLAY], start=1):
         name = _pick_hospital_name(f) if "hospital_name" not in f else (f.get("hospital_name") or _pick_hospital_name(f))
         addr = _pick_address(f)
@@ -1227,25 +1282,120 @@ def _tokenize_service_text(s: str) -> List[str]:
     toks = [t for t in toks if len(t) >= 2]
     return toks
 
+
+async def _fetch_duckduckgo_snippet(query: str) -> str:
+    """Very small, no-key web search snippet fetcher (DuckDuckGo HTML endpoint).
+    Returns best-effort short snippet text, or empty string on failure.
+    """
+    if not ENABLE_WEB_VARIANT_SUMMARIES:
+        return ""
+    q = (query or "").strip()
+    if not q:
+        return ""
+    url = "https://duckduckgo.com/html/?" + urllib.parse.urlencode({"q": q})
+    def _do_fetch() -> str:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "CostSavvy.health/1.0"})
+            with urllib.request.urlopen(req, timeout=WEB_VARIANT_SUMMARY_TIMEOUT_SEC) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+        # Try to capture a snippet-like element from DDG HTML
+        m = re.search(r'class="result__snippet".*?>(.*?)</a>', html, flags=re.S|re.I)
+        if not m:
+            m = re.search(r'class="result__snippet".*?>(.*?)</div>', html, flags=re.S|re.I)
+        if not m:
+            return ""
+        snippet = re.sub(r"<.*?>", " ", m.group(1))
+        snippet = re.sub(r"\s+", " ", snippet).strip()
+        return snippet[:320]
+    try:
+        return await asyncio.to_thread(_do_fetch)
+    except Exception:
+        return ""
+
+def _simple_patient_summary_fallback(variant_name: str, cpt_expl: str) -> str:
+    """Fallback summary when no patient_summary and web is disabled/unavailable."""
+    v = (variant_name or "").strip()
+    e = (cpt_expl or "").strip()
+    if e:
+        # strip overly technical boilerplate
+        e2 = re.sub(r"\bCPT\b", "", e, flags=re.I)
+        e2 = re.sub(r"\s+", " ", e2).strip()
+        return (e2[:180] + ("..." if len(e2) > 180 else ""))
+    return v
+
+async def maybe_enrich_variant_summaries(variants: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Optionally enrich variants with web-derived patient-friendly summaries.
+    Only runs when ENABLE_WEB_VARIANT_SUMMARIES is true.
+    """
+    if not ENABLE_WEB_VARIANT_SUMMARIES:
+        return variants
+    out: List[Dict[str, Any]] = []
+    for v in variants[:WEB_VARIANT_SUMMARY_MAX]:
+        vv = dict(v)
+        if (vv.get("patient_summary") or "").strip():
+            out.append(vv)
+            continue
+        name = (vv.get("variant_name") or "").strip()
+        cpt = (vv.get("cpt_code") or "").strip()
+        # Build a cautious query; avoid returning unverified clinical advice
+        q = f"{name} CPT {cpt} what is it".strip()
+        snippet = await _fetch_duckduckgo_snippet(q)
+        if snippet:
+            vv["patient_summary"] = snippet
+        else:
+            vv["patient_summary"] = _simple_patient_summary_fallback(name, vv.get("cpt_explanation") or "")
+        out.append(vv)
+    # append remaining without enrichment
+    if len(variants) > len(out):
+        out.extend(variants[len(out):])
+    return out
+
 async def search_service_variants_by_text(conn, user_text: str, limit: int = 8) -> List[Dict[str, Any]]:
     """Search service_variants for any service type using variant_name and cpt_explanation.
 
-    Returns a short list of candidates (CPT-backed).
+    Strategy:
+    - Normalize text (e.g., xray/x-ray/x ray).
+    - Remove pricing/stop words.
+    - Use token OR-matching with a simple relevance score.
     """
-    toks = _tokenize_service_text(user_text)
+    base = _normalize_service_text(user_text)
+    toks = _tokenize_service_text(base)
     if not toks:
         return []
-    # Build a conservative AND query so we don't return totally unrelated results.
-    where = []
+
+    # Keep tokens that are not generic "price" language
+    stop = {
+        "how","much","does","do","an","a","the","cost","costs","price","prices","pricing","estimate","estimated",
+        "near","nearest","in","for","of","to","please","give","me","what","is","are",
+    }
+    toks = [t for t in toks if t and t not in stop]
+    if not toks:
+        # fall back to the normalized base as a single token (still better than nothing)
+        toks = [base.strip().lower()]
+
+    toks = toks[:6]
+
+    # Build OR match conditions and a score (count of matched tokens)
+    where_parts = []
+    score_parts = []
     params = []
-    for i, tok in enumerate(toks[:6], start=1):
-        where.append(f"(LOWER(COALESCE(variant_name,'')) LIKE ${i} OR LOWER(COALESCE(cpt_explanation,'')) LIKE ${i})")
-        params.append(f"%{tok}%")
+    for i, tok in enumerate(toks, start=1):
+        like = f"%{tok}%"
+        params.append(like)
+        where_parts.append(f"(LOWER(COALESCE(variant_name,'')) LIKE ${i} OR LOWER(COALESCE(cpt_explanation,'')) LIKE ${i})")
+        score_parts.append(f"(CASE WHEN LOWER(COALESCE(variant_name,'')) LIKE ${i} OR LOWER(COALESCE(cpt_explanation,'')) LIKE ${i} THEN 1 ELSE 0 END)")
+
+    where_sql = " OR ".join(where_parts)
+    score_sql = " + ".join(score_parts)
+
     sql = f"""
-        SELECT id, parent_service, cpt_code, variant_name, cpt_explanation, patient_summary, is_preventive
+        SELECT id, parent_service, cpt_code, variant_name, cpt_explanation, patient_summary, is_preventive,
+               ({score_sql}) AS match_score
         FROM public.service_variants
-        WHERE {' AND '.join(where)}
-        ORDER BY parent_service NULLS LAST, variant_name NULLS LAST, id ASC
+        WHERE ({where_sql})
+        ORDER BY match_score DESC, parent_service NULLS LAST, variant_name NULLS LAST, id ASC
         LIMIT {int(limit)}
     """
     try:
@@ -1555,12 +1705,52 @@ async def chat_stream(req: ChatRequest, request: Request):
                                     yield sse({"type": "final", "used_web_search": False})
                                     return
 
-                        # If we still don't have a code and we're not already awaiting a choice, search variants.
-                        if not (merged.get("code_type") and merged.get("code")) and merged.get("_awaiting") not in {"zip", "payment", "payer", "variant_choice"}:
+                        
+                        # Handle yes/no confirmation for a single matched variant
+                        if merged.get("_awaiting") == "variant_confirm":
+                            cand = merged.get("_variant_confirm_candidate") or {}
+                            ans = (req.message or "").strip().lower()
+                            if ans in {"yes","y","yeah","yep","correct","right","sure","ok","okay"}:
+                                cpt = (cand.get("cpt_code") or "").strip()
+                                if cpt:
+                                    merged["code_type"] = "CPT"
+                                    merged["code"] = cpt
+                                merged["service_query"] = (cand.get("variant_name") or merged.get("service_query") or "").strip()
+                                merged["_awaiting"] = None
+                                merged.pop("_variant_confirm_candidate", None)
+                                await update_session_state(conn, session_id, merged)
+                            elif ans in {"no","n","nope","nah","incorrect","wrong"}:
+                                merged["_awaiting"] = "variant_free_text"
+                                merged.pop("_variant_confirm_candidate", None)
+                                msg = (
+                                    "No problem, please describe the exact service a bit more so I can match the correct billing code.\n"
+                                    "Example: `CT chest with contrast` or `Colonoscopy screening`."
+                                )
+                                yield sse({"type": "delta", "text": msg})
+                                await save_message(conn, session_id, "assistant", msg, {"mode": "price"})
+                                await update_session_state(conn, session_id, merged)
+                                yield sse({"type": "final", "used_web_search": False})
+                                return
+                            else:
+                                msg = "Please reply `yes` or `no` so I can confirm the exact service."
+                                yield sse({"type": "delta", "text": msg})
+                                await save_message(conn, session_id, "assistant", msg, {"mode": "price"})
+                                await update_session_state(conn, session_id, merged)
+                                yield sse({"type": "final", "used_web_search": False})
+                                return
+
+                        # If user is providing more detail after a 0-match, treat message as the new query text
+                        if merged.get("_awaiting") == "variant_free_text":
+                            merged["service_query"] = (req.message or merged.get("service_query") or "").strip()
+                            merged["_awaiting"] = None
+                            await update_session_state(conn, session_id, merged)
+# If we still don't have a code and we're not already awaiting a choice, search variants.
+                        if not (merged.get("code_type") and merged.get("code")) and merged.get("_awaiting") not in {"zip", "payment", "payer", "variant_choice", "variant_confirm", "variant_free_text"}:
                             qtext = merged.get("service_query") or req.message
                             candidates = await search_service_variants_by_text(conn, qtext, limit=8)
                             if candidates:
-                                merged["_variant_candidates"] = [
+                                # Normalize candidate shape
+                                norm_candidates = [
                                     {
                                         "id": c.get("id"),
                                         "cpt_code": c.get("cpt_code"),
@@ -1570,8 +1760,43 @@ async def chat_stream(req: ChatRequest, request: Request):
                                     }
                                     for c in candidates
                                 ]
+                                # Optional: enrich patient summaries from web snippets (best-effort)
+                                norm_candidates = await maybe_enrich_variant_summaries(norm_candidates)
+
+                                if len(norm_candidates) == 1:
+                                    # 1 match -> yes/no confirmation
+                                    only = norm_candidates[0]
+                                    merged["_awaiting"] = "variant_confirm"
+                                    merged["_variant_confirm_candidate"] = only
+                                    # Keep a small candidate list in case user says "no" and we want to show options later
+                                    merged["_variant_candidates"] = norm_candidates
+                                    vname = (only.get("variant_name") or "this service").strip()
+                                    msg = f"Just to confirm, do you mean **{vname}**? Reply `yes` or `no`."
+                                    yield sse({"type": "delta", "text": msg})
+                                    await save_message(conn, session_id, "assistant", msg, {"mode": "price"})
+                                    await update_session_state(conn, session_id, merged)
+                                    await log_query(conn, session_id, req.message, {"mode": "price"}, None, 0, False, msg)
+                                    yield sse({"type": "final", "used_web_search": ENABLE_WEB_VARIANT_SUMMARIES})
+                                    return
+
+                                # Multiple matches -> numbered list
+                                merged["_variant_candidates"] = norm_candidates
                                 merged["_awaiting"] = "variant_choice"
                                 msg = build_variant_numbered_prompt(qtext, merged["_variant_candidates"])
+                                yield sse({"type": "delta", "text": msg})
+                                await save_message(conn, session_id, "assistant", msg, {"mode": "price"})
+                                await update_session_state(conn, session_id, merged)
+                                await log_query(conn, session_id, req.message, {"mode": "price"}, None, 0, False, msg)
+                                yield sse({"type": "final", "used_web_search": ENABLE_WEB_VARIANT_SUMMARIES})
+                                return
+                            else:
+                                # 0 matches -> ask for more specificity BEFORE ZIP
+                                merged["_awaiting"] = "variant_free_text"
+                                msg = (
+                                    "I can price this, but I need a bit more detail to match the exact billed service.\n\n"
+                                    "Please reply with a more specific description (body part, purpose, with/without contrast, number of views, etc.).\n"
+                                    "Example: `X-ray chest 2 views` or `MRI knee without contrast`."
+                                )
                                 yield sse({"type": "delta", "text": msg})
                                 await save_message(conn, session_id, "assistant", msg, {"mode": "price"})
                                 await update_session_state(conn, session_id, merged)
