@@ -1624,8 +1624,10 @@ def _tokenize_service_text(s: str) -> List[str]:
     return toks
 
 async def search_service_variants_by_text(conn, user_text: str, limit: int = 8) -> List[Dict[str, Any]]:
-    """Search service_variants for any service type using variant_name and patient_summary.
-    Also joins with services table to get cpt_explanation for better matching.
+    """Search for service variants using the stg_services_cpt table.
+    
+    The stg_services_cpt table has columns: cpt_code, cpt_explanation, patient_summary, category
+    This matches the service_variants.csv data structure.
 
     Strategy:
     - Normalize text (e.g., xray/x-ray/x ray).
@@ -1649,92 +1651,73 @@ async def search_service_variants_by_text(conn, user_text: str, limit: int = 8) 
 
     toks = toks[:6]
 
-    # Build OR match conditions and a score (count of matched tokens)
-    # service_variants has: variant_name, patient_summary, parent_service
-    # services has: cpt_explanation, service_description, patient_summary
+    # Build OR match conditions and a score
+    # stg_services_cpt has: cpt_code, cpt_explanation, patient_summary, category
     where_parts = []
     score_parts = []
     params = []
     for i, tok in enumerate(toks, start=1):
         like = f"%{tok}%"
         params.append(like)
-        # Match against service_variants columns AND joined services columns
         where_parts.append(f"""(
-            LOWER(COALESCE(sv.variant_name,'')) LIKE ${i} 
-            OR LOWER(COALESCE(sv.patient_summary,'')) LIKE ${i}
-            OR LOWER(COALESCE(sv.parent_service,'')) LIKE ${i}
-            OR LOWER(COALESCE(s.cpt_explanation,'')) LIKE ${i}
-            OR LOWER(COALESCE(s.service_description,'')) LIKE ${i}
+            LOWER(COALESCE(cpt_explanation,'')) LIKE ${i} 
+            OR LOWER(COALESCE(patient_summary,'')) LIKE ${i}
+            OR LOWER(COALESCE(category,'')) LIKE ${i}
+            OR LOWER(COALESCE(cpt_code,'')) LIKE ${i}
         )""")
         score_parts.append(f"""(
-            CASE WHEN LOWER(COALESCE(sv.variant_name,'')) LIKE ${i} THEN 2 ELSE 0 END +
-            CASE WHEN LOWER(COALESCE(sv.patient_summary,'')) LIKE ${i} THEN 1 ELSE 0 END +
-            CASE WHEN LOWER(COALESCE(sv.parent_service,'')) LIKE ${i} THEN 1 ELSE 0 END +
-            CASE WHEN LOWER(COALESCE(s.cpt_explanation,'')) LIKE ${i} THEN 1 ELSE 0 END
+            CASE WHEN LOWER(COALESCE(cpt_explanation,'')) LIKE ${i} THEN 2 ELSE 0 END +
+            CASE WHEN LOWER(COALESCE(category,'')) LIKE ${i} THEN 2 ELSE 0 END +
+            CASE WHEN LOWER(COALESCE(patient_summary,'')) LIKE ${i} THEN 1 ELSE 0 END
         )""")
 
     where_sql = " OR ".join(where_parts)
     score_sql = " + ".join(score_parts)
 
+    # Query stg_services_cpt table - this is where the service_variants.csv data lives
     sql = f"""
-        SELECT sv.id, sv.parent_service, sv.cpt_code, sv.variant_name, sv.patient_summary, sv.is_preventive,
-               s.cpt_explanation, s.service_description,
-               ({score_sql}) AS match_score
-        FROM public.service_variants sv
-        LEFT JOIN public.services s ON s.code = sv.cpt_code AND s.code_type = 'CPT'
+        SELECT 
+            cpt_code,
+            cpt_explanation,
+            patient_summary,
+            category,
+            cpt_explanation as variant_name,
+            ({score_sql}) AS match_score
+        FROM public.stg_services_cpt
         WHERE ({where_sql})
-        ORDER BY match_score DESC, sv.parent_service NULLS LAST, sv.variant_name NULLS LAST, sv.id ASC
+        ORDER BY match_score DESC, category NULLS LAST, cpt_code ASC
         LIMIT {int(limit)}
     """
+    
     try:
         rows = await conn.fetch(sql, *params)
         if rows:
-            logger.info(f"service_variants search found {len(rows)} results for query: {user_text}")
+            logger.info(f"stg_services_cpt search found {len(rows)} results for query: {user_text}")
             return [dict(r) for r in rows]
         
-        logger.info(f"service_variants empty, trying services table fallback for: {user_text}")
+        logger.info(f"stg_services_cpt empty for query: {user_text}, trying services table")
         
-        # Fallback: if service_variants is empty or has no matches, search services table directly
-        # This creates "pseudo-variants" from the services table
-        # Rebuild where/score for services table columns
-        where_parts_s = []
-        score_parts_s = []
-        for i, tok in enumerate(toks, start=1):
-            where_parts_s.append(f"""(
-                LOWER(COALESCE(s.service_description,'')) LIKE ${i} 
-                OR LOWER(COALESCE(s.patient_summary,'')) LIKE ${i}
-                OR LOWER(COALESCE(s.cpt_explanation,'')) LIKE ${i}
-                OR LOWER(COALESCE(s.category,'')) LIKE ${i}
-            )""")
-            score_parts_s.append(f"""(
-                CASE WHEN LOWER(COALESCE(s.service_description,'')) LIKE ${i} THEN 2 ELSE 0 END +
-                CASE WHEN LOWER(COALESCE(s.cpt_explanation,'')) LIKE ${i} THEN 1 ELSE 0 END +
-                CASE WHEN LOWER(COALESCE(s.category,'')) LIKE ${i} THEN 1 ELSE 0 END
-            )""")
-        
-        where_sql_s = " OR ".join(where_parts_s)
-        score_sql_s = " + ".join(score_parts_s)
-        
+        # Fallback to services table
         fallback_sql = f"""
-            SELECT s.id, s.category as parent_service, s.code as cpt_code, 
-                   s.service_description as variant_name, s.patient_summary, 
-                   false as is_preventive, s.cpt_explanation, s.service_description,
-                   ({score_sql_s}) AS match_score
-            FROM public.services s
-            WHERE s.code_type = 'CPT' AND ({where_sql_s})
-            ORDER BY match_score DESC, s.category NULLS LAST, s.service_description NULLS LAST
+            SELECT 
+                code as cpt_code,
+                cpt_explanation,
+                patient_summary,
+                category,
+                service_description as variant_name,
+                ({score_sql}) AS match_score
+            FROM public.services
+            WHERE code_type = 'CPT' AND ({where_sql})
+            ORDER BY match_score DESC, category NULLS LAST, code ASC
             LIMIT {int(limit)}
         """
-        
-        try:
-            rows = await conn.fetch(fallback_sql, *params)
+        rows = await conn.fetch(fallback_sql, *params)
+        if rows:
             logger.info(f"services fallback found {len(rows)} results for query: {user_text}")
-            return [dict(r) for r in rows]
-        except Exception as fallback_err:
-            logger.error(f"services fallback SQL error: {fallback_err}")
-            return []
+        return [dict(r) for r in rows]
+        
     except Exception as e:
-        logger.error(f"service_variants search failed: {e}")
+        logger.error(f"service variant search failed: {e}")
         return []
 
 def build_variant_numbered_prompt(user_label: str, variants: List[Dict[str, Any]]) -> str:
@@ -1744,21 +1727,40 @@ def build_variant_numbered_prompt(user_label: str, variants: List[Dict[str, Any]
     lines.append(f"Before I look up prices, which exact billed **{header}** do you mean?")
     lines.append("")
     for i, v in enumerate(variants, start=1):
-        name = (v.get("variant_name") or "Option").strip()
-        cpt = (v.get("cpt_code") or "").strip()
-        summ = (v.get("patient_summary") or "").strip()
+        # Build a readable name from cpt_explanation or variant_name
         expl = (v.get("cpt_explanation") or "").strip()
-        # Prefer patient_summary, else a short snippet of cpt_explanation
-        if not summ and expl:
-            summ = expl[:140].strip()
-            if len(expl) > 140:
-                summ += "..."
-        line = f"{i}) {name}"
+        name = (v.get("variant_name") or "").strip()
+        
+        # Extract a short, meaningful name from the explanation
+        if expl:
+            # Take first sentence or first 80 chars
+            if ". " in expl:
+                display_name = expl.split(". ")[0]
+            else:
+                display_name = expl[:80]
+            if len(display_name) > 80:
+                display_name = display_name[:77] + "..."
+        elif name:
+            display_name = name[:80]
+        else:
+            display_name = "Option"
+        
+        cpt = (v.get("cpt_code") or "").strip()
+        category = (v.get("category") or "").strip()
+        summ = (v.get("patient_summary") or "").strip()
+        
+        # Build the line
+        line = f"{i}) {display_name}"
         if cpt:
             line += f" (CPT {cpt})"
-        if summ:
-            line += f" – {summ}"
+        if category:
+            line += f" [{category}]"
         lines.append(line)
+        
+        # Add summary on next line if available and different from explanation
+        if summ and summ != expl and len(summ) < 150:
+            lines.append(f"   _{summ}_")
+    
     lines.append("")
     lines.append("Reply with the **number only** (e.g., `1`).")
     return "\n".join(lines)
@@ -2333,9 +2335,10 @@ async def chat_stream(req: ChatRequest, request: Request):
                                 {
                                     "id": c.get("id"),
                                     "cpt_code": c.get("cpt_code"),
-                                    "variant_name": c.get("variant_name"),
+                                    "variant_name": c.get("variant_name") or c.get("cpt_explanation", "")[:80],
                                     "patient_summary": c.get("patient_summary"),
                                     "cpt_explanation": c.get("cpt_explanation"),
+                                    "category": c.get("category"),
                                 }
                                 for c in raw_candidates
                             ]
