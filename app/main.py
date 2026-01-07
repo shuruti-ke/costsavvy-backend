@@ -3,9 +3,6 @@ import os
 import json
 import re
 import uuid
-import urllib.parse
-import urllib.request
-import asyncio
 import time
 import logging
 from typing import Optional, Any, Dict, List, Tuple
@@ -28,12 +25,6 @@ logger = logging.getLogger("costsavvy")
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-
-# Variant summary web fallback (optional)
-ENABLE_WEB_VARIANT_SUMMARIES = os.getenv("ENABLE_WEB_VARIANT_SUMMARIES", "false").lower() in ("1","true","yes","y","on")
-WEB_VARIANT_SUMMARY_MAX = int(os.getenv("WEB_VARIANT_SUMMARY_MAX", "5"))
-WEB_VARIANT_SUMMARY_TIMEOUT_SEC = float(os.getenv("WEB_VARIANT_SUMMARY_TIMEOUT_SEC", "8"))
-
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 APP_API_KEY = os.getenv("APP_API_KEY", "").strip()
@@ -1282,76 +1273,6 @@ def _tokenize_service_text(s: str) -> List[str]:
     toks = [t for t in toks if len(t) >= 2]
     return toks
 
-
-async def _fetch_duckduckgo_snippet(query: str) -> str:
-    """Very small, no-key web search snippet fetcher (DuckDuckGo HTML endpoint).
-    Returns best-effort short snippet text, or empty string on failure.
-    """
-    if not ENABLE_WEB_VARIANT_SUMMARIES:
-        return ""
-    q = (query or "").strip()
-    if not q:
-        return ""
-    url = "https://duckduckgo.com/html/?" + urllib.parse.urlencode({"q": q})
-    def _do_fetch() -> str:
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "CostSavvy.health/1.0"})
-            with urllib.request.urlopen(req, timeout=WEB_VARIANT_SUMMARY_TIMEOUT_SEC) as resp:
-                html = resp.read().decode("utf-8", errors="ignore")
-        except Exception:
-            return ""
-        # Try to capture a snippet-like element from DDG HTML
-        m = re.search(r'class="result__snippet".*?>(.*?)</a>', html, flags=re.S|re.I)
-        if not m:
-            m = re.search(r'class="result__snippet".*?>(.*?)</div>', html, flags=re.S|re.I)
-        if not m:
-            return ""
-        snippet = re.sub(r"<.*?>", " ", m.group(1))
-        snippet = re.sub(r"\s+", " ", snippet).strip()
-        return snippet[:320]
-    try:
-        return await asyncio.to_thread(_do_fetch)
-    except Exception:
-        return ""
-
-def _simple_patient_summary_fallback(variant_name: str, cpt_expl: str) -> str:
-    """Fallback summary when no patient_summary and web is disabled/unavailable."""
-    v = (variant_name or "").strip()
-    e = (cpt_expl or "").strip()
-    if e:
-        # strip overly technical boilerplate
-        e2 = re.sub(r"\bCPT\b", "", e, flags=re.I)
-        e2 = re.sub(r"\s+", " ", e2).strip()
-        return (e2[:180] + ("..." if len(e2) > 180 else ""))
-    return v
-
-async def maybe_enrich_variant_summaries(variants: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Optionally enrich variants with web-derived patient-friendly summaries.
-    Only runs when ENABLE_WEB_VARIANT_SUMMARIES is true.
-    """
-    if not ENABLE_WEB_VARIANT_SUMMARIES:
-        return variants
-    out: List[Dict[str, Any]] = []
-    for v in variants[:WEB_VARIANT_SUMMARY_MAX]:
-        vv = dict(v)
-        if (vv.get("patient_summary") or "").strip():
-            out.append(vv)
-            continue
-        name = (vv.get("variant_name") or "").strip()
-        cpt = (vv.get("cpt_code") or "").strip()
-        # Build a cautious query; avoid returning unverified clinical advice
-        q = f"{name} CPT {cpt} what is it".strip()
-        snippet = await _fetch_duckduckgo_snippet(q)
-        if snippet:
-            vv["patient_summary"] = snippet
-        else:
-            vv["patient_summary"] = _simple_patient_summary_fallback(name, vv.get("cpt_explanation") or "")
-        out.append(vv)
-    # append remaining without enrichment
-    if len(variants) > len(out):
-        out.extend(variants[len(out):])
-    return out
-
 async def search_service_variants_by_text(conn, user_text: str, limit: int = 8) -> List[Dict[str, Any]]:
     """Search service_variants for any service type using variant_name and cpt_explanation.
 
@@ -1430,6 +1351,68 @@ def build_variant_numbered_prompt(user_label: str, variants: List[Dict[str, Any]
     lines.append("Reply with the **number only** (e.g., `1`).")
     return "\n".join(lines)
 
+
+async def maybe_fill_variant_summaries_with_llm(variants: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """If patient_summary is missing, ask the LLM for 1 short patient-friendly line per option.
+
+    We keep this optional: if the LLM errors, we fall back to cpt_explanation snippets.
+    """
+    missing = [i for i, v in enumerate(variants) if not (v.get("patient_summary") or "").strip()]
+    if not missing:
+        return variants
+
+    # Keep prompt small and deterministic
+    items = []
+    for i, v in enumerate(variants):
+        if i not in missing:
+            continue
+        items.append(
+            {
+                "index": i,
+                "variant_name": (v.get("variant_name") or "").strip(),
+                "cpt_code": (v.get("cpt_code") or "").strip(),
+                "cpt_explanation": (v.get("cpt_explanation") or "").strip(),
+            }
+        )
+
+    system = (
+        "You write short patient-friendly explanations of billed medical services. "
+        "One sentence each. Focus on purpose and what makes it different (views/with-contrast/etc). "
+        "No medical advice."
+    )
+    user = (
+        "Create a JSON array of objects with keys: index, summary. "
+        "Summary must be <= 22 words.\n\n" + json.dumps(items)
+    )
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            temperature=0.2,
+            timeout=20,
+        )
+        txt = (resp.choices[0].message.content or "").strip()
+        data = None
+        try:
+            data = json.loads(txt)
+        except Exception:
+            # If the model wrapped JSON in text, try to extract the first JSON array.
+            m = re.search(r"\[[\s\S]*\]", txt)
+            if m:
+                data = json.loads(m.group(0))
+        if isinstance(data, list):
+            by_idx = {}
+            for o in data:
+                if isinstance(o, dict) and "index" in o and "summary" in o:
+                    by_idx[int(o["index"])] = str(o["summary"]).strip()
+            for i in missing:
+                summ = by_idx.get(i)
+                if summ:
+                    variants[i]["patient_summary"] = summ
+    except Exception:
+        return variants
+    return variants
+
 def apply_variant_choice_from_candidates(merged: Dict[str, Any], message: str) -> bool:
     """Apply a numeric choice to merged state. Returns True if applied."""
     s = (message or "").strip()
@@ -1448,6 +1431,32 @@ def apply_variant_choice_from_candidates(merged: Dict[str, Any], message: str) -
     merged.pop("_variant_candidates", None)
     merged.pop("_awaiting", None)
     return True
+
+
+def _is_yes(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return t in {"y", "yes", "yeah", "yep", "correct", "right"}
+
+
+def _is_no(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return t in {"n", "no", "nope", "nah"}
+
+
+def build_single_variant_yesno_prompt(user_label: str, v: Dict[str, Any]) -> str:
+    name = (v.get("variant_name") or user_label or "this service").strip()
+    cpt = (v.get("cpt_code") or "").strip()
+    summ = (v.get("patient_summary") or "").strip()
+    if not summ:
+        expl = (v.get("cpt_explanation") or "").strip()
+        summ = expl[:160].strip() + ("..." if len(expl) > 160 else "")
+    parts = [
+        f"Just to confirm, do you mean **{name}**" + (f" (CPT {cpt})" if cpt else "") + "?",
+    ]
+    if summ:
+        parts.append(f"{summ}")
+    parts.append("Reply **Y** or **N**.")
+    return "\n".join(parts)
 
 
 # ----------------------------
@@ -1655,11 +1664,15 @@ async def chat_stream(req: ChatRequest, request: Request):
                     if inferred_service and any(kw in msg_l for kw in INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS):
                         reset_gating_fields_for_new_price_question(req.message, merged)
 
-                # 4) Load refiners + apply choice (if user replies 1/2/3)
+                # 4) Load refiners + apply choice (if user replies to a refiner prompt)
+                # IMPORTANT: do not let refiner numeric keys hijack the universal variant-choice flow.
                 refiners_doc = await get_refiners(conn)
                 refiner = match_refiner(merged.get("service_query") or "", refiners_doc)
-                merged = apply_refiner_choice(req.message, merged, refiner)
-                merged = maybe_apply_preview_code(merged, refiner)
+                if merged.get("_awaiting") not in {"variant_choice", "variant_confirm_yesno", "variant_clarify"}:
+                    merged = apply_refiner_choice(req.message, merged, refiner)
+                # Do not apply preview codes until a CPT-backed variant is confirmed.
+                if merged.get("variant_confirmed") is True or (merged.get("code_type") and merged.get("code")):
+                    merged = maybe_apply_preview_code(merged, refiner)
 
                 # ----------------------------
                 # GENERAL mode
@@ -1689,10 +1702,57 @@ async def chat_stream(req: ChatRequest, request: Request):
 
                     
                     # Gate 0b: Universal CPT-backed variant confirmation (BEFORE ZIP)
+                    # Spec:
+                    # - 0 matches: ask for more specificity (still before ZIP)
+                    # - 1 match: ask Y/N confirmation
+                    # - N matches: show numbered list, user replies with number only
                     if not (merged.get("code_type") and merged.get("code")):
+                        # If we previously asked for more specificity, treat the user's reply as an updated service query.
+                        if merged.get("_awaiting") == "variant_clarify":
+                            merged["service_query"] = infer_service_query_from_message(req.message) or req.message
+                            merged.pop("_awaiting", None)
+                            merged.pop("_variant_candidates", None)
+                            merged.pop("_variant_single", None)
+
+                        # If we are waiting on a Y/N confirmation for a single match.
+                        if merged.get("_awaiting") == "variant_confirm_yesno":
+                            if _is_yes(req.message):
+                                v = merged.get("_variant_single") or {}
+                                merged["code_type"] = "CPT"
+                                merged["code"] = v.get("cpt_code")
+                                merged["service_query"] = v.get("variant_name") or merged.get("service_query")
+                                merged["variant_id"] = v.get("id")
+                                merged["variant_name"] = v.get("variant_name")
+                                merged["variant_confirmed"] = True
+                                merged.pop("_variant_single", None)
+                                merged.pop("_awaiting", None)
+                                await update_session_state(conn, session_id, merged)
+                            elif _is_no(req.message):
+                                # Clear and ask for a clearer description before ZIP.
+                                merged.pop("_variant_single", None)
+                                merged.pop("code_type", None)
+                                merged.pop("code", None)
+                                merged["variant_confirmed"] = False
+                                merged["_awaiting"] = "variant_clarify"
+                                msg = "No problem, what *exactly* is being ordered? Add details like body part, number of views, with/without contrast, or purpose."
+                                yield sse({"type": "delta", "text": msg})
+                                await save_message(conn, session_id, "assistant", msg, {"mode": "price"})
+                                await update_session_state(conn, session_id, merged)
+                                yield sse({"type": "final", "used_web_search": False})
+                                return
+                            else:
+                                v = merged.get("_variant_single") or {}
+                                msg = build_single_variant_yesno_prompt(merged.get("service_query") or req.message, v)
+                                yield sse({"type": "delta", "text": msg})
+                                await save_message(conn, session_id, "assistant", msg, {"mode": "price"})
+                                await update_session_state(conn, session_id, merged)
+                                yield sse({"type": "final", "used_web_search": False})
+                                return
+
                         # If user just replied with a numeric choice, apply it.
                         if merged.get("_awaiting") == "variant_choice":
                             if apply_variant_choice_from_candidates(merged, req.message):
+                                merged["variant_confirmed"] = True
                                 await update_session_state(conn, session_id, merged)
                             else:
                                 # Re-ask with the same numbered options
@@ -1705,105 +1765,60 @@ async def chat_stream(req: ChatRequest, request: Request):
                                     yield sse({"type": "final", "used_web_search": False})
                                     return
 
-                        
-                        # Handle yes/no confirmation for a single matched variant
-                        if merged.get("_awaiting") == "variant_confirm":
-                            cand = merged.get("_variant_confirm_candidate") or {}
-                            ans = (req.message or "").strip().lower()
-                            if ans in {"yes","y","yeah","yep","correct","right","sure","ok","okay"}:
-                                cpt = (cand.get("cpt_code") or "").strip()
-                                if cpt:
-                                    merged["code_type"] = "CPT"
-                                    merged["code"] = cpt
-                                merged["service_query"] = (cand.get("variant_name") or merged.get("service_query") or "").strip()
-                                merged["_awaiting"] = None
-                                merged.pop("_variant_confirm_candidate", None)
-                                await update_session_state(conn, session_id, merged)
-                            elif ans in {"no","n","nope","nah","incorrect","wrong"}:
-                                merged["_awaiting"] = "variant_free_text"
-                                merged.pop("_variant_confirm_candidate", None)
-                                msg = (
-                                    "No problem, please describe the exact service a bit more so I can match the correct billing code.\n"
-                                    "Example: `CT chest with contrast` or `Colonoscopy screening`."
-                                )
-                                yield sse({"type": "delta", "text": msg})
-                                await save_message(conn, session_id, "assistant", msg, {"mode": "price"})
-                                await update_session_state(conn, session_id, merged)
-                                yield sse({"type": "final", "used_web_search": False})
-                                return
-                            else:
-                                msg = "Please reply `yes` or `no` so I can confirm the exact service."
-                                yield sse({"type": "delta", "text": msg})
-                                await save_message(conn, session_id, "assistant", msg, {"mode": "price"})
-                                await update_session_state(conn, session_id, merged)
-                                yield sse({"type": "final", "used_web_search": False})
-                                return
-
-                        # If user is providing more detail after a 0-match, treat message as the new query text
-                        if merged.get("_awaiting") == "variant_free_text":
-                            merged["service_query"] = (req.message or merged.get("service_query") or "").strip()
-                            merged["_awaiting"] = None
-                            await update_session_state(conn, session_id, merged)
-# If we still don't have a code and we're not already awaiting a choice, search variants.
-                        if not (merged.get("code_type") and merged.get("code")) and merged.get("_awaiting") not in {"zip", "payment", "payer", "variant_choice", "variant_confirm", "variant_free_text"}:
+                        # If we still don't have a code and we're not already awaiting a gate, search variants.
+                        if not (merged.get("code_type") and merged.get("code")) and merged.get("_awaiting") not in {"zip", "payment", "payer", "variant_choice", "variant_confirm_yesno", "variant_clarify"}:
                             qtext = merged.get("service_query") or req.message
-                            candidates = await search_service_variants_by_text(conn, qtext, limit=8)
-                            if candidates:
-                                # Normalize candidate shape
-                                norm_candidates = [
-                                    {
-                                        "id": c.get("id"),
-                                        "cpt_code": c.get("cpt_code"),
-                                        "variant_name": c.get("variant_name"),
-                                        "patient_summary": c.get("patient_summary"),
-                                        "cpt_explanation": c.get("cpt_explanation"),
-                                    }
-                                    for c in candidates
-                                ]
-                                # Optional: enrich patient summaries from web snippets (best-effort)
-                                norm_candidates = await maybe_enrich_variant_summaries(norm_candidates)
+                            raw_candidates = await search_service_variants_by_text(conn, qtext, limit=8)
 
-                                if len(norm_candidates) == 1:
-                                    # 1 match -> yes/no confirmation
-                                    only = norm_candidates[0]
-                                    merged["_awaiting"] = "variant_confirm"
-                                    merged["_variant_confirm_candidate"] = only
-                                    # Keep a small candidate list in case user says "no" and we want to show options later
-                                    merged["_variant_candidates"] = norm_candidates
-                                    vname = (only.get("variant_name") or "this service").strip()
-                                    msg = f"Just to confirm, do you mean **{vname}**? Reply `yes` or `no`."
-                                    yield sse({"type": "delta", "text": msg})
-                                    await save_message(conn, session_id, "assistant", msg, {"mode": "price"})
-                                    await update_session_state(conn, session_id, merged)
-                                    await log_query(conn, session_id, req.message, {"mode": "price"}, None, 0, False, msg)
-                                    yield sse({"type": "final", "used_web_search": ENABLE_WEB_VARIANT_SUMMARIES})
-                                    return
-
-                                # Multiple matches -> numbered list
-                                merged["_variant_candidates"] = norm_candidates
-                                merged["_awaiting"] = "variant_choice"
-                                msg = build_variant_numbered_prompt(qtext, merged["_variant_candidates"])
-                                yield sse({"type": "delta", "text": msg})
-                                await save_message(conn, session_id, "assistant", msg, {"mode": "price"})
-                                await update_session_state(conn, session_id, merged)
-                                await log_query(conn, session_id, req.message, {"mode": "price"}, None, 0, False, msg)
-                                yield sse({"type": "final", "used_web_search": ENABLE_WEB_VARIANT_SUMMARIES})
-                                return
-                            else:
-                                # 0 matches -> ask for more specificity BEFORE ZIP
-                                merged["_awaiting"] = "variant_free_text"
+                            if not raw_candidates:
+                                merged["_awaiting"] = "variant_clarify"
                                 msg = (
-                                    "I can price this, but I need a bit more detail to match the exact billed service.\n\n"
-                                    "Please reply with a more specific description (body part, purpose, with/without contrast, number of views, etc.).\n"
-                                    "Example: `X-ray chest 2 views` or `MRI knee without contrast`."
+                                    "I can price this, but I need a bit more detail on the exact billed service. "
+                                    "What exactly is being ordered?"
                                 )
                                 yield sse({"type": "delta", "text": msg})
                                 await save_message(conn, session_id, "assistant", msg, {"mode": "price"})
                                 await update_session_state(conn, session_id, merged)
-                                await log_query(conn, session_id, req.message, {"mode": "price"}, None, 0, False, msg)
                                 yield sse({"type": "final", "used_web_search": False})
                                 return
-# Gate 1: ZIP required
+
+                            # Normalize candidates we keep in state
+                            candidates = [
+                                {
+                                    "id": c.get("id"),
+                                    "cpt_code": c.get("cpt_code"),
+                                    "variant_name": c.get("variant_name"),
+                                    "patient_summary": c.get("patient_summary"),
+                                    "cpt_explanation": c.get("cpt_explanation"),
+                                }
+                                for c in raw_candidates
+                            ]
+
+                            if len(candidates) == 1:
+                                # Ask yes/no confirmation
+                                candidates = await maybe_fill_variant_summaries_with_llm(candidates)
+                                merged["_variant_single"] = candidates[0]
+                                merged["_awaiting"] = "variant_confirm_yesno"
+                                msg = build_single_variant_yesno_prompt(qtext, candidates[0])
+                                yield sse({"type": "delta", "text": msg})
+                                await save_message(conn, session_id, "assistant", msg, {"mode": "price"})
+                                await update_session_state(conn, session_id, merged)
+                                yield sse({"type": "final", "used_web_search": False})
+                                return
+
+                            # Multiple matches: show numbered list (fill summaries if needed)
+                            candidates = await maybe_fill_variant_summaries_with_llm(candidates)
+                            merged["_variant_candidates"] = candidates
+                            merged["_awaiting"] = "variant_choice"
+                            msg = build_variant_numbered_prompt(qtext, candidates)
+                            yield sse({"type": "delta", "text": msg})
+                            await save_message(conn, session_id, "assistant", msg, {"mode": "price"})
+                            await update_session_state(conn, session_id, merged)
+                            await log_query(conn, session_id, req.message, {"mode": "price"}, None, 0, False, msg)
+                            yield sse({"type": "final", "used_web_search": False})
+                            return
+
+                    # Gate 1: ZIP required
                     zipcode = merged.get("zipcode")
                     if not zipcode:
                         merged["_awaiting"] = "zip"
