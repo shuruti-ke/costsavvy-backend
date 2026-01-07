@@ -1131,6 +1131,8 @@ async def price_lookup_nearest_facilities(
                     h.state,
                     h.zipcode,
                     h.phone,
+                    h.latitude,
+                    h.longitude,
                     (3959 * acos(
                         cos(radians((SELECT zlat FROM user_zip))) * cos(radians(h.latitude)) *
                         cos(radians(h.longitude) - radians((SELECT zlon FROM user_zip))) +
@@ -1182,6 +1184,8 @@ async def price_lookup_nearest_facilities(
                     h.state,
                     h.zipcode,
                     h.phone,
+                    h.latitude,
+                    h.longitude,
                     (3959 * acos(
                         cos(radians((SELECT zlat FROM user_zip))) * cos(radians(h.latitude)) *
                         cos(radians(h.longitude) - radians((SELECT zlon FROM user_zip))) +
@@ -1437,6 +1441,139 @@ def _pick_address(row: Dict[str, Any]) -> str:
     return ", ".join(parts).strip()
 
 
+def _generate_google_maps_url(
+    user_lat: float, 
+    user_lon: float, 
+    facilities: List[Dict[str, Any]],
+    user_zipcode: str = ""
+) -> str:
+    """
+    Generate a Google Maps URL showing the user's location and nearby hospitals.
+    Uses the directions/search format to show multiple locations.
+    """
+    import urllib.parse
+    
+    # If we have facilities with coordinates, create a multi-destination map
+    valid_facilities = [
+        f for f in facilities 
+        if f.get("latitude") and f.get("longitude")
+    ]
+    
+    if not valid_facilities:
+        # Fallback: just show user's location
+        return f"https://www.google.com/maps?q={user_lat},{user_lon}&z=12"
+    
+    # Option 1: Create a map with markers for all hospitals
+    # Using the "dir" (directions) mode with waypoints
+    if len(valid_facilities) == 1:
+        # Single destination - simple directions
+        f = valid_facilities[0]
+        dest_lat, dest_lon = f["latitude"], f["longitude"]
+        return f"https://www.google.com/maps/dir/{user_lat},{user_lon}/{dest_lat},{dest_lon}"
+    
+    # Option 2: Create a search-based map centered on user location
+    # This shows hospitals in the area
+    # Build markers string for static map or use search
+    markers = []
+    for i, f in enumerate(valid_facilities[:5], start=1):  # Limit to 5 markers
+        name = _pick_hospital_name(f)
+        lat, lon = f["latitude"], f["longitude"]
+        markers.append(f"{lat},{lon}")
+    
+    # Use Google Maps with multiple destinations (waypoints)
+    # Format: origin -> waypoint1 -> waypoint2 -> ... -> final destination
+    origin = f"{user_lat},{user_lon}"
+    waypoints = "/".join(markers[:-1]) if len(markers) > 1 else ""
+    destination = markers[-1] if markers else origin
+    
+    if waypoints:
+        return f"https://www.google.com/maps/dir/{origin}/{waypoints}/{destination}"
+    else:
+        return f"https://www.google.com/maps/dir/{origin}/{destination}"
+
+
+def _generate_static_map_url(
+    user_lat: float,
+    user_lon: float,
+    facilities: List[Dict[str, Any]],
+    api_key: str = ""
+) -> Optional[str]:
+    """
+    Generate a Google Static Maps URL for embedding.
+    Requires a Google Maps API key.
+    Returns None if no API key is configured.
+    """
+    if not api_key:
+        return None
+    
+    import urllib.parse
+    
+    base_url = "https://maps.googleapis.com/maps/api/staticmap"
+    
+    # User location marker (blue)
+    markers = [f"color:blue|label:U|{user_lat},{user_lon}"]
+    
+    # Hospital markers (red, numbered)
+    for i, f in enumerate(facilities[:5], start=1):
+        if f.get("latitude") and f.get("longitude"):
+            markers.append(f"color:red|label:{i}|{f['latitude']},{f['longitude']}")
+    
+    params = {
+        "size": "600x400",
+        "maptype": "roadmap",
+        "key": api_key,
+    }
+    
+    # Build URL with multiple markers params
+    url = f"{base_url}?{'&'.join(f'{k}={v}' for k, v in params.items())}"
+    for m in markers:
+        url += f"&markers={urllib.parse.quote(m)}"
+    
+    return url
+
+
+def _generate_map_data(
+    user_lat: float,
+    user_lon: float,
+    user_zipcode: str,
+    facilities: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Generate map data including URLs and coordinates for the frontend.
+    """
+    # Generate interactive map URL
+    map_url = _generate_google_maps_url(user_lat, user_lon, facilities, user_zipcode)
+    
+    # Prepare facility coordinates for frontend map rendering
+    facility_markers = []
+    for i, f in enumerate(facilities[:5], start=1):
+        if f.get("latitude") and f.get("longitude"):
+            facility_markers.append({
+                "index": i,
+                "name": _pick_hospital_name(f),
+                "latitude": float(f["latitude"]),
+                "longitude": float(f["longitude"]),
+                "address": _pick_address(f),
+                "price": _pick_price_fields(f),
+                "distance_miles": f.get("distance_miles"),
+            })
+    
+    return {
+        "user_location": {
+            "latitude": user_lat,
+            "longitude": user_lon,
+            "zipcode": user_zipcode,
+        },
+        "facilities": facility_markers,
+        "google_maps_url": map_url,
+        "center": {
+            "latitude": user_lat,
+            "longitude": user_lon,
+        },
+        "zoom": 11,  # Good zoom level for ~25 mile radius
+    }
+
+
 def _format_money(v: Optional[float]) -> str:
     if v is None:
         return ""
@@ -1501,10 +1638,14 @@ def build_facility_block(
     payment_mode: str,
     priced_results: List[Dict[str, Any]],
     fallback_hospitals: List[Dict[str, Any]],
-) -> Tuple[str, List[Dict[str, Any]]]:
+    user_lat: Optional[float] = None,
+    user_lon: Optional[float] = None,
+    user_zipcode: str = "",
+) -> Tuple[str, List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
-    Returns (text_answer, facilities_payload_for_ui).
+    Returns (text_answer, facilities_payload_for_ui, map_data).
     Always produces at least MIN_FACILITIES_TO_DISPLAY facilities in text when possible.
+    map_data contains coordinates and Google Maps URL for displaying a map.
     """
     facilities: List[Dict[str, Any]] = []
 
@@ -1585,6 +1726,12 @@ def build_facility_block(
 
     lines.append("")
     lines.append("Confirm with the facility and your insurer.")
+    
+    # Add map link if we have user coordinates
+    if user_lat is not None and user_lon is not None and facilities:
+        map_url = _generate_google_maps_url(user_lat, user_lon, facilities, user_zipcode)
+        lines.append("")
+        lines.append(f"📍 [View all locations on map]({map_url})")
 
     # Build facility payload for UI
     ui_payload = []
@@ -1598,10 +1745,17 @@ def build_facility_block(
                 "price": _pick_price_fields(f),
                 "estimated_range": None if _pick_price_fields(f) is not None else est_range,
                 "price_is_estimate": _pick_price_fields(f) is None,
+                "latitude": f.get("latitude"),
+                "longitude": f.get("longitude"),
             }
         )
 
-    return "\n".join(lines), ui_payload
+    # Generate map data for frontend
+    map_data = None
+    if user_lat is not None and user_lon is not None:
+        map_data = _generate_map_data(user_lat, user_lon, user_zipcode, facilities)
+
+    return "\n".join(lines), ui_payload, map_data
 
 
 # ----------------------------
@@ -2528,11 +2682,27 @@ async def chat_stream(req: ChatRequest, request: Request):
                         logger.warning(f"Nearby hospitals lookup failed: {e}")
                         nearby_hospitals = []
 
-                    facility_text, facility_payload = build_facility_block(
+                    # Get user's coordinates for map
+                    user_lat, user_lon = None, None
+                    try:
+                        zip_row = await conn.fetchrow(
+                            "SELECT latitude, longitude FROM public.zip_locations WHERE zipcode = $1",
+                            merged["zipcode"]
+                        )
+                        if zip_row:
+                            user_lat = float(zip_row["latitude"]) if zip_row["latitude"] else None
+                            user_lon = float(zip_row["longitude"]) if zip_row["longitude"] else None
+                    except Exception as e:
+                        logger.warning(f"Failed to get user coordinates: {e}")
+
+                    facility_text, facility_payload, map_data = build_facility_block(
                         service_query=merged.get("service_query") or "this service",
                         payment_mode=merged.get("payment_mode") or "cash",
                         priced_results=results,
                         fallback_hospitals=nearby_hospitals,
+                        user_lat=user_lat,
+                        user_lon=user_lon,
+                        user_zipcode=merged.get("zipcode") or "",
                     )
 
                     yield sse(
@@ -2540,6 +2710,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                             "type": "results",
                             "results": results[:25],
                             "facilities": facility_payload,
+                            "map_data": map_data,
                             "state": {
                                 k: merged.get(k)
                                 for k in [
