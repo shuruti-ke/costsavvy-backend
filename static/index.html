@@ -366,7 +366,7 @@
         }
         
         async function fetchPrices(message) {
-            const response = await fetch(`${API_BASE_URL}/chat`, {
+            const response = await fetch(`${API_BASE_URL}/chat_stream`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ session_id: sessionId, message })
             });
