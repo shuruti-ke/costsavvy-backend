@@ -1,300 +1,186 @@
-# app/service_refiners.py
-from __future__ import annotations
+"""
+Service Refiners - Fallback definitions for service clarification flows.
 
-from typing import Dict, Any, List, Optional
+Refiners help narrow down generic service queries (like "MRI") to specific 
+billable CPT codes (like "MRI Brain without contrast - CPT 70551").
 
+This file provides a Python fallback when the database refiners table is empty or unavailable.
+"""
 
-def refiners_registry() -> Dict[str, Any]:
+def refiners_registry() -> dict:
     """
-    Python fallback registry for service refiners.
-    Shape mirrors what the DB loader returns:
-      { "version": 1, "refiners": [ ... ] }
+    Returns the fallback refiners configuration.
+    
+    Structure:
+    {
+        "refiners": [
+            {
+                "id": "unique-id",
+                "match": {"keywords": ["keyword1", "keyword2"]},
+                "prompt": "Question to ask user",
+                "choices": [
+                    {"key": "1", "label": "Option 1", "code_type": "CPT", "code": "12345"},
+                    ...
+                ],
+                "preview_code_type": "CPT",  # Optional: default if user skips
+                "preview_code": "12345"
+            },
+            ...
+        ]
+    }
     """
     return {
-        "version": 1,
         "refiners": [
-            # 1) Colonoscopy
+            # MRI Refiners
+            {
+                "id": "mri-general",
+                "match": {"keywords": ["mri", "magnetic resonance"]},
+                "prompt": "Which body area is the MRI for?",
+                "choices": [
+                    {"key": "1", "label": "Brain/Head", "code_type": "CPT", "code": "70551"},
+                    {"key": "2", "label": "Cervical Spine (Neck)", "code_type": "CPT", "code": "72141"},
+                    {"key": "3", "label": "Thoracic Spine (Mid-back)", "code_type": "CPT", "code": "72146"},
+                    {"key": "4", "label": "Lumbar Spine (Lower back)", "code_type": "CPT", "code": "72148"},
+                    {"key": "5", "label": "Knee", "code_type": "CPT", "code": "73721"},
+                    {"key": "6", "label": "Shoulder", "code_type": "CPT", "code": "73221"},
+                    {"key": "7", "label": "Hip", "code_type": "CPT", "code": "73721"},
+                    {"key": "8", "label": "Abdomen", "code_type": "CPT", "code": "74181"},
+                ],
+                "preview_code_type": "CPT",
+                "preview_code": "70551"
+            },
+            
+            # CT Scan Refiners
+            {
+                "id": "ct-general",
+                "match": {"keywords": ["ct scan", "cat scan", "computed tomography"]},
+                "prompt": "Which body area is the CT scan for?",
+                "choices": [
+                    {"key": "1", "label": "Head/Brain", "code_type": "CPT", "code": "70450"},
+                    {"key": "2", "label": "Chest", "code_type": "CPT", "code": "71250"},
+                    {"key": "3", "label": "Abdomen", "code_type": "CPT", "code": "74150"},
+                    {"key": "4", "label": "Abdomen & Pelvis", "code_type": "CPT", "code": "74176"},
+                    {"key": "5", "label": "Cervical Spine (Neck)", "code_type": "CPT", "code": "72125"},
+                    {"key": "6", "label": "Lumbar Spine (Lower back)", "code_type": "CPT", "code": "72131"},
+                ],
+                "preview_code_type": "CPT",
+                "preview_code": "70450"
+            },
+            
+            # X-Ray Refiners
+            {
+                "id": "xray-general",
+                "match": {"keywords": ["x-ray", "xray", "x ray", "radiograph"]},
+                "prompt": "Which body area is the X-ray for?",
+                "choices": [
+                    {"key": "1", "label": "Chest (1 view)", "code_type": "CPT", "code": "71045"},
+                    {"key": "2", "label": "Chest (2 views)", "code_type": "CPT", "code": "71046"},
+                    {"key": "3", "label": "Knee", "code_type": "CPT", "code": "73562"},
+                    {"key": "4", "label": "Shoulder", "code_type": "CPT", "code": "73030"},
+                    {"key": "5", "label": "Hip", "code_type": "CPT", "code": "73502"},
+                    {"key": "6", "label": "Ankle", "code_type": "CPT", "code": "73610"},
+                    {"key": "7", "label": "Foot", "code_type": "CPT", "code": "73630"},
+                    {"key": "8", "label": "Hand", "code_type": "CPT", "code": "73130"},
+                    {"key": "9", "label": "Wrist", "code_type": "CPT", "code": "73110"},
+                    {"key": "10", "label": "Spine (Lumbar)", "code_type": "CPT", "code": "72100"},
+                ],
+                "preview_code_type": "CPT",
+                "preview_code": "71046"
+            },
+            
+            # Ultrasound Refiners
+            {
+                "id": "ultrasound-general",
+                "match": {"keywords": ["ultrasound", "sonogram", "echo"]},
+                "prompt": "Which type of ultrasound?",
+                "choices": [
+                    {"key": "1", "label": "Abdominal (Complete)", "code_type": "CPT", "code": "76700"},
+                    {"key": "2", "label": "Pelvic", "code_type": "CPT", "code": "76856"},
+                    {"key": "3", "label": "Thyroid", "code_type": "CPT", "code": "76536"},
+                    {"key": "4", "label": "Breast", "code_type": "CPT", "code": "76641"},
+                    {"key": "5", "label": "Echocardiogram (Heart)", "code_type": "CPT", "code": "93306"},
+                    {"key": "6", "label": "Pregnancy/OB", "code_type": "CPT", "code": "76801"},
+                    {"key": "7", "label": "Carotid (Neck vessels)", "code_type": "CPT", "code": "93880"},
+                ],
+                "preview_code_type": "CPT",
+                "preview_code": "76700"
+            },
+            
+            # Colonoscopy Refiners
             {
                 "id": "colonoscopy",
-                "title": "Colonoscopy",
                 "match": {"keywords": ["colonoscopy"]},
-                "require_choice_before_pricing": False,
-                "preview_code": {"code_type": "CPT", "code": "45378"},
-                "question": "To make the price more exact, which best matches what you need?",
+                "prompt": "Is this a screening (preventive) or diagnostic colonoscopy?",
                 "choices": [
-                    {"key": "1", "label": "Standard colonoscopy (no biopsy or polyp removal)", "code_type": "CPT", "code": "45378"},
-                    {"key": "2", "label": "Colonoscopy with biopsy", "code_type": "CPT", "code": "45380"},
-                    {"key": "3", "label": "Colonoscopy with polyp removal", "code_type": "CPT", "code": "45385"},
+                    {"key": "1", "label": "Screening (no symptoms, routine)", "code_type": "CPT", "code": "45378"},
+                    {"key": "2", "label": "Diagnostic (symptoms or follow-up)", "code_type": "CPT", "code": "45380"},
+                    {"key": "3", "label": "With biopsy", "code_type": "CPT", "code": "45380"},
+                    {"key": "4", "label": "With polyp removal", "code_type": "CPT", "code": "45385"},
                 ],
+                "preview_code_type": "CPT",
+                "preview_code": "45378"
             },
-
-            # 2) Upper endoscopy (EGD)
-            {
-                "id": "upper_endoscopy_egd",
-                "title": "Upper endoscopy (EGD)",
-                "match": {"keywords": ["egd", "upper endoscopy", "upper gi endoscopy", "esophagogastroduodenoscopy"]},
-                "require_choice_before_pricing": False,
-                "preview_code": {"code_type": "CPT", "code": "43235"},
-                "question": "Which type of upper endoscopy is closest?",
-                "choices": [
-                    {"key": "1", "label": "EGD diagnostic (no biopsy)", "code_type": "CPT", "code": "43235"},
-                    {"key": "2", "label": "EGD with biopsy", "code_type": "CPT", "code": "43239"},
-                ],
-            },
-
-            # 3) MRI Brain
-            {
-                "id": "mri_brain",
-                "title": "MRI Brain",
-                "match": {"keywords": ["mri brain", "brain mri"]},
-                "require_choice_before_pricing": True,
-                "preview_code": None,
-                "question": "MRI brain prices differ by contrast. Which one do you need?",
-                "choices": [
-                    {"key": "1", "label": "Without contrast", "code_type": "CPT", "code": "70551"},
-                    {"key": "2", "label": "With contrast", "code_type": "CPT", "code": "70552"},
-                    {"key": "3", "label": "With and without contrast", "code_type": "CPT", "code": "70553"},
-                ],
-            },
-
-            # 4) MRI Lumbar Spine
-            {
-                "id": "mri_lumbar_spine",
-                "title": "MRI Lumbar Spine",
-                "match": {"keywords": ["mri lumbar", "lumbar mri", "mri low back", "mri spine lumbar"]},
-                "require_choice_before_pricing": True,
-                "preview_code": None,
-                "question": "MRI lumbar spine prices differ by contrast. Which one do you need?",
-                "choices": [
-                    {"key": "1", "label": "Without contrast", "code_type": "CPT", "code": "72148"},
-                    {"key": "2", "label": "With contrast", "code_type": "CPT", "code": "72149"},
-                    {"key": "3", "label": "With and without contrast", "code_type": "CPT", "code": "72158"},
-                ],
-            },
-
-            # 5) CT Head
-            {
-                "id": "ct_head",
-                "title": "CT Head/Brain",
-                "match": {"keywords": ["ct head", "head ct", "ct brain", "brain ct"]},
-                "require_choice_before_pricing": True,
-                "preview_code": None,
-                "question": "CT head prices differ by contrast. Which one do you need?",
-                "choices": [
-                    {"key": "1", "label": "Without contrast", "code_type": "CPT", "code": "70450"},
-                    {"key": "2", "label": "With contrast", "code_type": "CPT", "code": "70460"},
-                    {"key": "3", "label": "With and without contrast", "code_type": "CPT", "code": "70470"},
-                ],
-            },
-
-            # 6) CT Abdomen/Pelvis
-            {
-                "id": "ct_abdomen_pelvis",
-                "title": "CT Abdomen & Pelvis",
-                "match": {"keywords": ["ct abdomen pelvis", "ct abdomen and pelvis", "ct a/p", "ct abd pelvis"]},
-                "require_choice_before_pricing": True,
-                "preview_code": None,
-                "question": "CT abdomen/pelvis prices differ by contrast. Which one do you need?",
-                "choices": [
-                    {"key": "1", "label": "Without contrast", "code_type": "CPT", "code": "74176"},
-                    {"key": "2", "label": "With contrast", "code_type": "CPT", "code": "74177"},
-                    {"key": "3", "label": "With and without contrast", "code_type": "CPT", "code": "74178"},
-                ],
-            },
-
-            # 7) Chest X-ray
-            {
-                "id": "xray_chest",
-                "title": "Chest X-ray",
-                "match": {"keywords": ["chest x-ray", "chest xray"]},
-                "require_choice_before_pricing": False,
-                "preview_code": {"code_type": "CPT", "code": "71046"},
-                "question": "Chest X-ray prices vary by number of views. Which is closest?",
-                "choices": [
-                    {"key": "1", "label": "1 view", "code_type": "CPT", "code": "71045"},
-                    {"key": "2", "label": "2 views (most common)", "code_type": "CPT", "code": "71046"},
-                    {"key": "3", "label": "3–4 views", "code_type": "CPT", "code": "71047"},
-                ],
-            },
-
-            # 8) Knee X-ray
-            {
-                "id": "xray_knee",
-                "title": "Knee X-ray",
-                "match": {"keywords": ["knee x-ray", "knee xray"]},
-                "require_choice_before_pricing": False,
-                "preview_code": {"code_type": "CPT", "code": "73562"},
-                "question": "Knee X-ray prices vary by number of views. Which is closest?",
-                "choices": [
-                    {"key": "1", "label": "1–2 views", "code_type": "CPT", "code": "73560"},
-                    {"key": "2", "label": "3 views (most common)", "code_type": "CPT", "code": "73562"},
-                    {"key": "3", "label": "4+ views", "code_type": "CPT", "code": "73564"},
-                ],
-            },
-
-            # 9) Mammogram
+            
+            # Mammogram Refiners
             {
                 "id": "mammogram",
-                "title": "Mammogram",
-                "match": {"keywords": ["mammogram", "mammo"]},
-                "require_choice_before_pricing": True,
-                "preview_code": None,
-                "question": "Is this a screening or diagnostic mammogram (diagnostic often costs more)?",
+                "match": {"keywords": ["mammogram", "mammography", "breast imaging"]},
+                "prompt": "Is this a screening or diagnostic mammogram?",
                 "choices": [
-                    {"key": "1", "label": "Screening mammogram", "code_type": "CPT", "code": "77067"},
-                    {"key": "2", "label": "Diagnostic mammogram", "code_type": "CPT", "code": "77066"},
+                    {"key": "1", "label": "Screening (routine, no symptoms)", "code_type": "CPT", "code": "77067"},
+                    {"key": "2", "label": "Diagnostic (symptoms or follow-up)", "code_type": "CPT", "code": "77066"},
+                    {"key": "3", "label": "3D Mammogram (Tomosynthesis)", "code_type": "CPT", "code": "77063"},
                 ],
+                "preview_code_type": "CPT",
+                "preview_code": "77067"
             },
-
-            # 10) Ultrasound Abdomen
+            
+            # Lab Tests
             {
-                "id": "ultrasound_abdomen",
-                "title": "Abdominal ultrasound",
-                "match": {"keywords": ["abdominal ultrasound", "ultrasound abdomen", "ruq ultrasound", "right upper quadrant ultrasound"]},
-                "require_choice_before_pricing": True,
-                "preview_code": None,
-                "question": "Which abdominal ultrasound is it?",
+                "id": "lab-blood",
+                "match": {"keywords": ["blood test", "lab test", "blood work", "labs"]},
+                "prompt": "Which type of lab test?",
                 "choices": [
-                    {"key": "1", "label": "Limited (e.g., RUQ)", "code_type": "CPT", "code": "76705"},
-                    {"key": "2", "label": "Complete abdomen", "code_type": "CPT", "code": "76700"},
+                    {"key": "1", "label": "Complete Blood Count (CBC)", "code_type": "CPT", "code": "85025"},
+                    {"key": "2", "label": "Basic Metabolic Panel", "code_type": "CPT", "code": "80048"},
+                    {"key": "3", "label": "Comprehensive Metabolic Panel", "code_type": "CPT", "code": "80053"},
+                    {"key": "4", "label": "Lipid Panel (Cholesterol)", "code_type": "CPT", "code": "80061"},
+                    {"key": "5", "label": "Hemoglobin A1C (Diabetes)", "code_type": "CPT", "code": "83036"},
+                    {"key": "6", "label": "Thyroid Panel (TSH)", "code_type": "CPT", "code": "84443"},
+                    {"key": "7", "label": "Urinalysis", "code_type": "CPT", "code": "81003"},
                 ],
+                "preview_code_type": "CPT",
+                "preview_code": "80053"
             },
-
-            # 11) Ultrasound Pelvis
+            
+            # Office Visits
             {
-                "id": "ultrasound_pelvis",
-                "title": "Pelvic ultrasound",
-                "match": {"keywords": ["pelvic ultrasound", "ultrasound pelvis"]},
-                "require_choice_before_pricing": True,
-                "preview_code": None,
-                "question": "Which pelvic ultrasound is it?",
+                "id": "office-visit",
+                "match": {"keywords": ["office visit", "doctor visit", "checkup", "physical"]},
+                "prompt": "What type of visit?",
                 "choices": [
-                    {"key": "1", "label": "Pelvic ultrasound (non-obstetric), complete", "code_type": "CPT", "code": "76856"},
-                    {"key": "2", "label": "Transvaginal ultrasound", "code_type": "CPT", "code": "76830"},
+                    {"key": "1", "label": "New patient visit", "code_type": "CPT", "code": "99203"},
+                    {"key": "2", "label": "Established patient visit", "code_type": "CPT", "code": "99213"},
+                    {"key": "3", "label": "Annual physical/wellness", "code_type": "CPT", "code": "99395"},
+                    {"key": "4", "label": "Specialist consultation", "code_type": "CPT", "code": "99243"},
                 ],
+                "preview_code_type": "CPT",
+                "preview_code": "99213"
             },
-
-            # 12) Echocardiogram (TTE)
+            
+            # Emergency Room
             {
-                "id": "echo_tte",
-                "title": "Echocardiogram (TTE)",
-                "match": {"keywords": ["echocardiogram", "echo", "tte"]},
-                "require_choice_before_pricing": True,
-                "preview_code": None,
-                "question": "Which echocardiogram is it?",
+                "id": "emergency",
+                "match": {"keywords": ["emergency room", "er visit", "emergency visit", "ed visit"]},
+                "prompt": "What level of emergency care?",
                 "choices": [
-                    {"key": "1", "label": "TTE, complete (common)", "code_type": "CPT", "code": "93306"},
-                    {"key": "2", "label": "TTE, limited/follow-up", "code_type": "CPT", "code": "93308"},
+                    {"key": "1", "label": "Low complexity", "code_type": "CPT", "code": "99281"},
+                    {"key": "2", "label": "Moderate complexity", "code_type": "CPT", "code": "99283"},
+                    {"key": "3", "label": "High complexity", "code_type": "CPT", "code": "99284"},
+                    {"key": "4", "label": "Critical/Life-threatening", "code_type": "CPT", "code": "99285"},
                 ],
+                "preview_code_type": "CPT",
+                "preview_code": "99283"
             },
-
-            # 13) EKG/ECG
-            {
-                "id": "ekg_ecg",
-                "title": "EKG/ECG",
-                "match": {"keywords": ["ekg", "ecg", "electrocardiogram"]},
-                "require_choice_before_pricing": False,
-                "preview_code": {"code_type": "CPT", "code": "93000"},
-                "question": "Which best matches the EKG service?",
-                "choices": [
-                    {"key": "1", "label": "Tracing + interpretation (common office)", "code_type": "CPT", "code": "93000"},
-                    {"key": "2", "label": "Tracing only", "code_type": "CPT", "code": "93005"},
-                    {"key": "3", "label": "Interpretation only", "code_type": "CPT", "code": "93010"},
-                ],
-            },
-
-            # 14) CBC
-            {
-                "id": "lab_cbc",
-                "title": "CBC blood test",
-                "match": {"keywords": ["cbc", "complete blood count"]},
-                "require_choice_before_pricing": False,
-                "preview_code": {"code_type": "CPT", "code": "85025"},
-                "question": "Do you need a CBC with differential (most common) or without differential?",
-                "choices": [
-                    {"key": "1", "label": "CBC with automated differential (most common)", "code_type": "CPT", "code": "85025"},
-                    {"key": "2", "label": "CBC without differential", "code_type": "CPT", "code": "85027"},
-                ],
-            },
-
-            # 15) CMP vs BMP
-            {
-                "id": "lab_cmp_bmp",
-                "title": "Metabolic panel",
-                "match": {"keywords": ["cmp", "comprehensive metabolic panel", "bmp", "basic metabolic panel", "metabolic panel"]},
-                "require_choice_before_pricing": True,
-                "preview_code": None,
-                "question": "Which metabolic panel do you need?",
-                "choices": [
-                    {"key": "1", "label": "CMP (comprehensive metabolic panel)", "code_type": "CPT", "code": "80053"},
-                    {"key": "2", "label": "BMP (basic metabolic panel)", "code_type": "CPT", "code": "80048"},
-                ],
-            },
-
-            # 16) A1c
-            {
-                "id": "lab_a1c",
-                "title": "Hemoglobin A1c",
-                "match": {"keywords": ["a1c", "hemoglobin a1c"]},
-                "require_choice_before_pricing": False,
-                "preview_code": {"code_type": "CPT", "code": "83036"},
-                "question": "Confirming: you mean Hemoglobin A1c?",
-                "choices": [{"key": "1", "label": "Yes, A1c", "code_type": "CPT", "code": "83036"}],
-            },
-
-            # 17) Lipid panel
-            {
-                "id": "lab_lipid",
-                "title": "Lipid panel",
-                "match": {"keywords": ["lipid panel", "cholesterol test"]},
-                "require_choice_before_pricing": False,
-                "preview_code": {"code_type": "CPT", "code": "80061"},
-                "question": "Confirming: you mean a lipid panel (cholesterol test)?",
-                "choices": [{"key": "1", "label": "Yes, lipid panel", "code_type": "CPT", "code": "80061"}],
-            },
-
-            # 18) Office visit (new vs established)
-            {
-                "id": "office_visit",
-                "title": "Office visit (E/M)",
-                "match": {"keywords": ["office visit", "doctor visit", "primary care visit", "clinic visit"]},
-                "require_choice_before_pricing": True,
-                "preview_code": None,
-                "question": "For office visit pricing, are you a new patient or an established patient?",
-                "choices": [
-                    {"key": "1", "label": "New patient (typical level 3)", "code_type": "CPT", "code": "99203"},
-                    {"key": "2", "label": "Established patient (typical level 3)", "code_type": "CPT", "code": "99213"},
-                ],
-            },
-
-            # 19) CT Chest
-            {
-                "id": "ct_chest",
-                "title": "CT Chest",
-                "match": {"keywords": ["ct chest", "chest ct"]},
-                "require_choice_before_pricing": True,
-                "preview_code": None,
-                "question": "CT chest prices differ by contrast. Which one do you need?",
-                "choices": [
-                    {"key": "1", "label": "Without contrast", "code_type": "CPT", "code": "71250"},
-                    {"key": "2", "label": "With contrast", "code_type": "CPT", "code": "71260"},
-                    {"key": "3", "label": "With and without contrast", "code_type": "CPT", "code": "71270"},
-                ],
-            },
-
-            # 20) MRI Knee
-            {
-                "id": "mri_knee",
-                "title": "MRI Knee",
-                "match": {"keywords": ["mri knee", "knee mri"]},
-                "require_choice_before_pricing": True,
-                "preview_code": None,
-                "question": "MRI knee prices differ by contrast. Which one do you need?",
-                "choices": [
-                    {"key": "1", "label": "Without contrast", "code_type": "CPT", "code": "73721"},
-                    {"key": "2", "label": "With contrast", "code_type": "CPT", "code": "73722"},
-                    {"key": "3", "label": "With and without contrast", "code_type": "CPT", "code": "73723"},
-                ],
-            },
-        ],
+        ]
     }

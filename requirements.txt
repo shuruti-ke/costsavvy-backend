@@ -15,3 +15,9 @@ uvicorn[standard]
 # Async database access
 databases
 asyncpg
+
+# HTTP client for web search functionality
+httpx
+
+# Pydantic for request validation
+pydantic
