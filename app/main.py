@@ -1689,21 +1689,14 @@ async def search_service_variants_by_text(conn, user_text: str, limit: int = 8) 
     try:
         rows = await conn.fetch(sql, *params)
         if rows:
+            logger.info(f"service_variants search found {len(rows)} results for query: {user_text}")
             return [dict(r) for r in rows]
+        
+        logger.info(f"service_variants empty, trying services table fallback for: {user_text}")
         
         # Fallback: if service_variants is empty or has no matches, search services table directly
         # This creates "pseudo-variants" from the services table
-        fallback_sql = f"""
-            SELECT s.id, s.category as parent_service, s.code as cpt_code, 
-                   s.service_description as variant_name, s.patient_summary, 
-                   false as is_preventive, s.cpt_explanation, s.service_description,
-                   ({score_sql}) AS match_score
-            FROM public.services s
-            WHERE s.code_type = 'CPT' AND ({where_sql.replace('sv.', 's.').replace('COALESCE(s.cpt_explanation', 'COALESCE(s.cpt_explanation')})
-            ORDER BY match_score DESC, s.category NULLS LAST, s.service_description NULLS LAST
-            LIMIT {int(limit)}
-        """
-        # Need to rebuild where/score for services table columns
+        # Rebuild where/score for services table columns
         where_parts_s = []
         score_parts_s = []
         for i, tok in enumerate(toks, start=1):
@@ -1732,10 +1725,16 @@ async def search_service_variants_by_text(conn, user_text: str, limit: int = 8) 
             ORDER BY match_score DESC, s.category NULLS LAST, s.service_description NULLS LAST
             LIMIT {int(limit)}
         """
-        rows = await conn.fetch(fallback_sql, *params)
-        return [dict(r) for r in rows]
+        
+        try:
+            rows = await conn.fetch(fallback_sql, *params)
+            logger.info(f"services fallback found {len(rows)} results for query: {user_text}")
+            return [dict(r) for r in rows]
+        except Exception as fallback_err:
+            logger.error(f"services fallback SQL error: {fallback_err}")
+            return []
     except Exception as e:
-        logger.warning(f"service_variants search failed: {e}")
+        logger.error(f"service_variants search failed: {e}")
         return []
 
 def build_variant_numbered_prompt(user_label: str, variants: List[Dict[str, Any]]) -> str:
@@ -2313,7 +2312,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                         # If we still don't have a code and we're not already awaiting a gate, search variants.
                         if not (merged.get("code_type") and merged.get("code")) and merged.get("_awaiting") not in {"zip", "payment", "payer", "variant_choice", "variant_confirm_yesno", "variant_clarify"}:
                             qtext = merged.get("service_query") or req.message
+                            logger.info(f"Searching for service variants with query: {qtext}")
                             raw_candidates = await search_service_variants_by_text(conn, qtext, limit=8)
+                            logger.info(f"Variant search returned {len(raw_candidates)} candidates")
 
                             if not raw_candidates:
                                 merged["_awaiting"] = "variant_clarify"
