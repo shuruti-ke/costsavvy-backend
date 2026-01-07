@@ -608,18 +608,20 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
     have_zip = bool(st.get("zipcode"))
 
     # EARLY DETECTION: Symptom/care queries (e.g., "my knee hurts")
-    # Only trigger if NOT already in a pricing flow
-    if is_symptom_query(msg) and not have_service and awaiting not in {"zip", "payment", "payer", "variant_choice"}:
+    # ALWAYS trigger for symptoms - this overrides any pricing flow
+    # Symptoms indicate a NEW concern that needs care navigation, not pricing
+    if is_symptom_query(msg):
         return {
             "mode": "care",
-            "zipcode": st.get("zipcode"),
+            "zipcode": None,  # Always ask for ZIP fresh for care queries
             "symptom_description": msg,
             "clarifying_question": None,
+            "_reset_session": True,  # Signal to reset pricing state
         }
 
     # EARLY DETECTION: Health education queries (e.g., "what is a colonoscopy")
-    # Only trigger if NOT already in a pricing flow
-    if is_health_education_query(msg) and not have_service and awaiting not in {"zip", "payment", "payer", "variant_choice"}:
+    # Trigger if this looks like an education question (even mid-flow)
+    if is_health_education_query(msg) and awaiting not in {"variant_choice", "variant_confirm_yesno"}:
         health_topic = extract_health_topic(msg)
         return {
             "mode": "education",
@@ -1309,7 +1311,7 @@ async def get_nearby_hospitals(conn: asyncpg.Connection, zipcode: str, limit: in
     if zlat is not None and zlon is not None:
         q = """
         SELECT
-          h.name AS hospital_name,
+          h.hospital_name AS hospital_name,
           h.address AS address,
           h.state AS state,
           h.zipcode AS zipcode,
@@ -1326,18 +1328,41 @@ async def get_nearby_hospitals(conn: asyncpg.Connection, zipcode: str, limit: in
         LIMIT $1
         """
         rows = await conn.fetch(q, limit, zlat, zlon)
+        # If no results from hospital_details, try hospitals table
+        if not rows:
+            q_fallback = """
+            SELECT
+              h.name AS hospital_name,
+              h.address AS address,
+              h.state AS state,
+              h.zipcode AS zipcode,
+              h.phone AS phone,
+              h.latitude AS latitude,
+              h.longitude AS longitude,
+              (3959 * acos(
+                  cos(radians($2)) * cos(radians(h.latitude)) * cos(radians(h.longitude) - radians($3)) +
+                  sin(radians($2)) * sin(radians(h.latitude))
+              )) AS distance_miles
+            FROM public.hospitals h
+            WHERE h.latitude IS NOT NULL AND h.longitude IS NOT NULL
+            ORDER BY distance_miles ASC
+            LIMIT $1
+            """
+            rows = await conn.fetch(q_fallback, limit, zlat, zlon)
+        
         return [dict(r) for r in rows]
 
-    # If we can’t compute distance, still return facilities
+    # If we can't compute distance, still return facilities (join both tables)
     q2 = """
     SELECT
-      h.name AS hospital_name,
-      h.address AS address,
-      h.state AS state,
-      h.zipcode AS zipcode,
-      h.phone AS phone,
+      COALESCE(hd.hospital_name, h.name) AS hospital_name,
+      COALESCE(hd.address, h.address) AS address,
+      COALESCE(hd.state, h.state) AS state,
+      COALESCE(hd.zipcode, h.zipcode) AS zipcode,
+      COALESCE(hd.phone, h.phone) AS phone,
       NULL::float AS distance_miles
-    FROM public.hospital_details h
+    FROM public.hospitals h
+    LEFT JOIN public.hospital_details hd ON hd.hospital_id = h.id
     ORDER BY h.state, h.zipcode, h.name
     LIMIT $1
     """
@@ -2019,7 +2044,21 @@ async def chat_stream(req: ChatRequest, request: Request):
                 # ----------------------------
                 if mode == "care":
                     # User described symptoms - help them find care, NOT price services
-                    zipcode = merged.get("zipcode") or intent.get("zipcode")
+                    # IMPORTANT: Reset any pricing session state - this is a NEW concern
+                    if intent.get("_reset_session"):
+                        # Clear pricing-related state
+                        merged.pop("service_query", None)
+                        merged.pop("code_type", None)
+                        merged.pop("code", None)
+                        merged.pop("payment_mode", None)
+                        merged.pop("payer_like", None)
+                        merged.pop("plan_like", None)
+                        merged.pop("_variant_candidates", None)
+                        merged.pop("_variant_single", None)
+                        merged.pop("variant_confirmed", None)
+                        merged.pop("zipcode", None)  # Ask for ZIP fresh for care
+                    
+                    zipcode = intent.get("zipcode")  # Only use ZIP from current intent, not merged
                     
                     if not zipcode:
                         # Ask for ZIP to find nearby care options
@@ -2047,7 +2086,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     symptom_desc = merged.get("_symptom_description") or intent.get("symptom_description") or req.message
                     
                     lines = []
-                    lines.append("I'm sorry you're experiencing that. Here are some nearby care options:\n")
+                    lines.append(f"I'm sorry you're experiencing that. Here are some nearby care options:\n")
                     
                     if nearby:
                         for i, h in enumerate(nearby[:5], 1):
@@ -2315,11 +2354,46 @@ async def chat_stream(req: ChatRequest, request: Request):
                         yield sse({"type": "final", "used_web_search": False})
                         return
 
-                    # Resolve code if needed
+                    # Resolve code if needed - BUT only if variant was confirmed
+                    # Per instructions: ALWAYS require variant selection before pricing
                     if not (merged.get("code_type") and merged.get("code")):
-                        resolved = await resolve_service_code(conn, merged)
-                        if resolved:
-                            merged["code_type"], merged["code"] = resolved
+                        # If we don't have a confirmed variant, we should NOT proceed
+                        # This should have been handled by Gate 0b above
+                        # If we reach here without a code, force variant selection
+                        if not merged.get("variant_confirmed"):
+                            qtext = merged.get("service_query") or req.message
+                            raw_candidates = await search_service_variants_by_text(conn, qtext, limit=8)
+                            
+                            if raw_candidates:
+                                candidates = [
+                                    {
+                                        "id": c.get("id"),
+                                        "cpt_code": c.get("cpt_code"),
+                                        "variant_name": c.get("variant_name"),
+                                        "patient_summary": c.get("patient_summary"),
+                                        "cpt_explanation": c.get("cpt_explanation"),
+                                    }
+                                    for c in raw_candidates
+                                ]
+                                candidates = await maybe_fill_variant_summaries_with_llm(candidates)
+                                merged["_variant_candidates"] = candidates
+                                merged["_awaiting"] = "variant_choice"
+                                msg = build_variant_numbered_prompt(qtext, candidates)
+                                yield sse({"type": "delta", "text": msg})
+                                await save_message(conn, session_id, "assistant", msg, {"mode": "price"})
+                                await update_session_state(conn, session_id, merged)
+                                yield sse({"type": "final", "used_web_search": False})
+                                return
+                            
+                            # No variants found - try resolve_service_code as fallback
+                            resolved = await resolve_service_code(conn, merged)
+                            if resolved:
+                                merged["code_type"], merged["code"] = resolved
+                        else:
+                            # Variant was confirmed but code not set - try resolution
+                            resolved = await resolve_service_code(conn, merged)
+                            if resolved:
+                                merged["code_type"], merged["code"] = resolved
 
                     # If still no service, ask
                     if not (merged.get("service_query") or "").strip() and not (merged.get("code_type") and merged.get("code")):
