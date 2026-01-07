@@ -1608,13 +1608,30 @@ def build_facility_block(
 # ----------------------------
 
 def _normalize_service_text(s: str) -> str:
+    """Normalize text for search matching.
+    
+    Removes all non-alphanumeric characters and normalizes whitespace.
+    This ensures "X-ray", "x-ray", "xray", "X ray" all become "xray".
+    Works for ANY term, not just hardcoded ones.
+    """
     s = (s or "").lower().strip()
-    # Normalize common punctuation/spaces: "xray" == "x-ray" == "x ray"
-    s = re.sub(r"[^a-z0-9\s]+", " ", s)
+    # Remove ALL non-alphanumeric characters (hyphens, slashes, etc.)
+    s = re.sub(r"[^a-z0-9\s]+", "", s)
+    # Normalize whitespace
     s = re.sub(r"\s+", " ", s).strip()
-    # Join common patterns
-    s = s.replace("x ray", "xray")
+    # Remove spaces between single letters (e.g., "c t scan" -> "ct scan", "m r i" -> "mri")
+    # This handles cases like "X ray" -> "xray" generically
+    s = re.sub(r'\b([a-z])\s+(?=[a-z]\b)', r'\1', s)
     return s
+
+def _normalize_for_sql(column: str) -> str:
+    """Generate SQL expression to normalize a column value for matching.
+    
+    Removes hyphens, slashes, and other punctuation from DB values
+    so they can match normalized user input.
+    """
+    # Remove common punctuation that might appear in medical terms
+    return f"LOWER(REGEXP_REPLACE(COALESCE({column}, ''), '[^a-zA-Z0-9 ]', '', 'g'))"
 
 def _tokenize_service_text(s: str) -> List[str]:
     s = _normalize_service_text(s)
@@ -1624,142 +1641,125 @@ def _tokenize_service_text(s: str) -> List[str]:
     return toks
 
 async def search_service_variants_by_text(conn, user_text: str, limit: int = 8) -> List[Dict[str, Any]]:
+    """Search service_variants for any service type using variant_name and patient_summary.
+    Also joins with services table to get cpt_explanation for better matching.
+
+    Strategy:
+    - Normalize ALL text generically (remove punctuation, normalize spaces).
+    - Use same normalization on DB values via SQL REGEXP_REPLACE.
+    - No hardcoded special cases - works for any medical term.
     """
-    Search for service variants to present to the user for selection.
-    
-    service_variants table schema:
-    - id: integer
-    - parent_service: text (e.g., "Imaging - X-ray", "Dermatology")
-    - cpt_code: text
-    - variant_name: text (the actual procedure name)
-    - patient_summary: text
-    - is_preventive: boolean
-    
-    Fallback to services table:
-    - code, code_type, service_description, cpt_explanation, patient_summary, category
-    """
-    # Normalize the search text
-    search_text = (user_text or "").lower().strip()
-    
-    # Remove common filler words
-    for word in ["how", "much", "does", "cost", "price", "the", "a", "an", "for", "of", "is", "what"]:
-        search_text = search_text.replace(word, " ")
-    search_text = " ".join(search_text.split()).strip()
-    
-    if not search_text:
+    base = _normalize_service_text(user_text)
+    toks = _tokenize_service_text(base)
+    if not toks:
         return []
+
+    # Keep tokens that are not generic "price" language
+    stop = {
+        "how","much","does","do","an","a","the","cost","costs","price","prices","pricing","estimate","estimated",
+        "near","nearest","in","for","of","to","please","give","me","what","is","are",
+    }
+    toks = [t for t in toks if t and t not in stop]
+    if not toks:
+        # fall back to the normalized base as a single token (still better than nothing)
+        toks = [base.strip().lower()]
+
+    toks = toks[:6]
     
-    # Normalize x-ray variations for searching
-    search_normalized = search_text.replace("x-ray", "xray").replace("x ray", "xray")
+    logger.info(f"Searching service_variants with tokens: {toks} from query: {user_text}")
+
+    # Build OR match conditions and a score (count of matched tokens)
+    # Use REGEXP_REPLACE to normalize DB values the same way we normalize user input
+    # This handles ALL punctuation generically (hyphens, slashes, etc.)
+    where_parts = []
+    score_parts = []
+    params = []
     
-    # Split into tokens
-    tokens = [t for t in search_normalized.split() if len(t) >= 2]
-    if not tokens:
-        tokens = [search_normalized]
+    # SQL normalization: remove all non-alphanumeric except spaces, then lowercase
+    norm_sv_variant = "LOWER(REGEXP_REPLACE(COALESCE(sv.variant_name, ''), '[^a-zA-Z0-9 ]', '', 'g'))"
+    norm_sv_summary = "LOWER(REGEXP_REPLACE(COALESCE(sv.patient_summary, ''), '[^a-zA-Z0-9 ]', '', 'g'))"
+    norm_sv_parent = "LOWER(REGEXP_REPLACE(COALESCE(sv.parent_service, ''), '[^a-zA-Z0-9 ]', '', 'g'))"
+    norm_s_expl = "LOWER(REGEXP_REPLACE(COALESCE(s.cpt_explanation, ''), '[^a-zA-Z0-9 ]', '', 'g'))"
+    norm_s_desc = "LOWER(REGEXP_REPLACE(COALESCE(s.service_description, ''), '[^a-zA-Z0-9 ]', '', 'g'))"
     
-    tokens = tokens[:4]  # Limit tokens
-    
-    logger.info(f"Searching service_variants with tokens: {tokens} from: {user_text}")
-    
+    for i, tok in enumerate(toks, start=1):
+        like = f"%{tok}%"
+        params.append(like)
+        where_parts.append(f"""(
+            {norm_sv_variant} LIKE ${i} 
+            OR {norm_sv_summary} LIKE ${i}
+            OR {norm_sv_parent} LIKE ${i}
+            OR {norm_s_expl} LIKE ${i}
+            OR {norm_s_desc} LIKE ${i}
+        )""")
+        score_parts.append(f"""(
+            CASE WHEN {norm_sv_variant} LIKE ${i} THEN 2 ELSE 0 END +
+            CASE WHEN {norm_sv_summary} LIKE ${i} THEN 1 ELSE 0 END +
+            CASE WHEN {norm_sv_parent} LIKE ${i} THEN 2 ELSE 0 END +
+            CASE WHEN {norm_s_expl} LIKE ${i} THEN 1 ELSE 0 END
+        )""")
+
+    where_sql = " OR ".join(where_parts)
+    score_sql = " + ".join(score_parts)
+
+    sql = f"""
+        SELECT sv.id, sv.parent_service, sv.cpt_code, sv.variant_name, sv.patient_summary, sv.is_preventive,
+               s.cpt_explanation, s.service_description,
+               ({score_sql}) AS match_score
+        FROM public.service_variants sv
+        LEFT JOIN public.services s ON s.code = sv.cpt_code AND s.code_type = 'CPT'
+        WHERE ({where_sql})
+        ORDER BY match_score DESC, sv.parent_service NULLS LAST, sv.variant_name NULLS LAST, sv.id ASC
+        LIMIT {int(limit)}
+    """
     try:
-        results = []
+        rows = await conn.fetch(sql, *params)
+        if rows:
+            logger.info(f"service_variants found {len(rows)} results for: {user_text}")
+            return [dict(r) for r in rows]
         
-        for tok in tokens:
-            like_pattern = f"%{tok}%"
-            
-            # Search service_variants table
-            # Use REPLACE to handle hyphenated terms (X-ray vs xray)
-            rows = await conn.fetch("""
-                SELECT 
-                    id, 
-                    parent_service, 
-                    cpt_code, 
-                    variant_name, 
-                    patient_summary, 
-                    is_preventive
-                FROM public.service_variants
-                WHERE 
-                    LOWER(REPLACE(COALESCE(parent_service, ''), '-', '')) LIKE LOWER($1)
-                    OR LOWER(REPLACE(COALESCE(variant_name, ''), '-', '')) LIKE LOWER($1)
-                    OR LOWER(REPLACE(COALESCE(patient_summary, ''), '-', '')) LIKE LOWER($1)
-                    OR LOWER(cpt_code) LIKE LOWER($1)
-                ORDER BY 
-                    CASE 
-                        WHEN LOWER(REPLACE(COALESCE(parent_service, ''), '-', '')) LIKE LOWER($1) THEN 0 
-                        WHEN LOWER(REPLACE(COALESCE(variant_name, ''), '-', '')) LIKE LOWER($1) THEN 1
-                        ELSE 2 
-                    END,
-                    parent_service,
-                    variant_name
-                LIMIT $2
-            """, like_pattern, limit)
-            
-            if rows:
-                for r in rows:
-                    results.append({
-                        "id": r["id"],
-                        "parent_service": r["parent_service"],
-                        "cpt_code": r["cpt_code"],
-                        "variant_name": r["variant_name"],
-                        "patient_summary": r["patient_summary"],
-                        "is_preventive": r["is_preventive"],
-                    })
-                break  # Found results, stop searching
+        logger.info(f"service_variants empty, trying services table fallback for: {user_text}")
         
-        # Deduplicate by cpt_code
-        seen = set()
-        unique_results = []
-        for r in results:
-            cpt = r.get("cpt_code")
-            if cpt and cpt not in seen:
-                seen.add(cpt)
-                unique_results.append(r)
+        # Fallback: if service_variants is empty or has no matches, search services table directly
+        norm_s_desc_f = "LOWER(REGEXP_REPLACE(COALESCE(s.service_description, ''), '[^a-zA-Z0-9 ]', '', 'g'))"
+        norm_s_summary_f = "LOWER(REGEXP_REPLACE(COALESCE(s.patient_summary, ''), '[^a-zA-Z0-9 ]', '', 'g'))"
+        norm_s_expl_f = "LOWER(REGEXP_REPLACE(COALESCE(s.cpt_explanation, ''), '[^a-zA-Z0-9 ]', '', 'g'))"
+        norm_s_cat_f = "LOWER(REGEXP_REPLACE(COALESCE(s.category, ''), '[^a-zA-Z0-9 ]', '', 'g'))"
         
-        if unique_results:
-            logger.info(f"service_variants found {len(unique_results)} results for: {user_text}")
-            return unique_results[:limit]
+        where_parts_s = []
+        score_parts_s = []
+        for i, tok in enumerate(toks, start=1):
+            where_parts_s.append(f"""(
+                {norm_s_desc_f} LIKE ${i} 
+                OR {norm_s_summary_f} LIKE ${i}
+                OR {norm_s_expl_f} LIKE ${i}
+                OR {norm_s_cat_f} LIKE ${i}
+            )""")
+            score_parts_s.append(f"""(
+                CASE WHEN {norm_s_desc_f} LIKE ${i} THEN 2 ELSE 0 END +
+                CASE WHEN {norm_s_expl_f} LIKE ${i} THEN 1 ELSE 0 END +
+                CASE WHEN {norm_s_cat_f} LIKE ${i} THEN 2 ELSE 0 END
+            )""")
         
-        # Fallback: try services table
-        logger.info(f"service_variants empty, trying services table for: {user_text}")
+        where_sql_s = " OR ".join(where_parts_s)
+        score_sql_s = " + ".join(score_parts_s)
         
-        for tok in tokens:
-            like_pattern = f"%{tok}%"
-            rows = await conn.fetch("""
-                SELECT 
-                    id,
-                    category as parent_service,
-                    code as cpt_code, 
-                    service_description as variant_name,
-                    patient_summary,
-                    cpt_explanation,
-                    false as is_preventive
-                FROM public.services
-                WHERE code_type = 'CPT' AND (
-                    LOWER(REPLACE(COALESCE(category, ''), '-', '')) LIKE LOWER($1)
-                    OR LOWER(REPLACE(COALESCE(service_description, ''), '-', '')) LIKE LOWER($1)
-                    OR LOWER(REPLACE(COALESCE(cpt_explanation, ''), '-', '')) LIKE LOWER($1)
-                    OR LOWER(code) LIKE LOWER($1)
-                )
-                ORDER BY 
-                    CASE 
-                        WHEN LOWER(REPLACE(COALESCE(category, ''), '-', '')) LIKE LOWER($1) THEN 0 
-                        ELSE 1 
-                    END,
-                    category,
-                    service_description
-                LIMIT $2
-            """, like_pattern, limit)
-            
-            if rows:
-                results = [dict(r) for r in rows]
-                logger.info(f"services table found {len(results)} results for: {user_text}")
-                return results[:limit]
-        
-        logger.info(f"No results found in any table for: {user_text}")
-        return []
-        
+        fallback_sql = f"""
+            SELECT s.id, s.category as parent_service, s.code as cpt_code, 
+                   s.service_description as variant_name, s.patient_summary, 
+                   false as is_preventive, s.cpt_explanation, s.service_description,
+                   ({score_sql_s}) AS match_score
+            FROM public.services s
+            WHERE s.code_type = 'CPT' AND ({where_sql_s})
+            ORDER BY match_score DESC, s.category NULLS LAST, s.service_description NULLS LAST
+            LIMIT {int(limit)}
+        """
+        rows = await conn.fetch(fallback_sql, *params)
+        if rows:
+            logger.info(f"services fallback found {len(rows)} results for: {user_text}")
+        return [dict(r) for r in rows]
     except Exception as e:
-        logger.error(f"Variant search error: {e}")
+        logger.error(f"service_variants search failed: {e}")
         return []
 
 def build_variant_numbered_prompt(user_label: str, variants: List[Dict[str, Any]]) -> str:
@@ -1769,43 +1769,18 @@ def build_variant_numbered_prompt(user_label: str, variants: List[Dict[str, Any]
     lines.append(f"Before I look up prices, which exact billed **{header}** do you mean?")
     lines.append("")
     for i, v in enumerate(variants, start=1):
-        # Get the variant name (main display text)
-        name = (v.get("variant_name") or "").strip()
-        cpt_expl = (v.get("cpt_explanation") or "").strip()
-        
-        # Use variant_name if available, otherwise cpt_explanation
-        if name:
-            display_name = name[:80]
-            if len(name) > 80:
-                display_name = name[:77] + "..."
-        elif cpt_expl:
-            # Take first sentence or first 80 chars
-            if ". " in cpt_expl:
-                display_name = cpt_expl.split(". ")[0]
-            else:
-                display_name = cpt_expl[:80]
-            if len(display_name) > 80:
-                display_name = display_name[:77] + "..."
-        else:
-            display_name = "Option"
-        
+        name = (v.get("variant_name") or "Option").strip()
         cpt = (v.get("cpt_code") or "").strip()
-        # Support both parent_service (from service_variants) and category (from services)
+        # Support both parent_service (from service_variants) and category (from services fallback)
         category = (v.get("parent_service") or v.get("category") or "").strip()
-        summ = (v.get("patient_summary") or "").strip()
         
-        # Build the line
-        line = f"{i}) {display_name}"
+        # Build the line with name, CPT, and category
+        line = f"{i}) {name}"
         if cpt:
             line += f" (CPT {cpt})"
         if category:
             line += f" [{category}]"
         lines.append(line)
-        
-        # Add summary on next line if available and different from name
-        if summ and summ != name and len(summ) < 150:
-            lines.append(f"   _{summ}_")
-    
     lines.append("")
     lines.append("Reply with the **number only** (e.g., `1`).")
     return "\n".join(lines)
@@ -2112,6 +2087,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     merged.pop("variant_name", None)
                     merged.pop("_variant_candidates", None)
                     merged.pop("_variant_single", None)
+                    logger.info(f"Reset code fields for new price question: {intent.get('service_query')}")
                 _normalize_payment_mode(merged)
 
                 # 2) Force/override pricing intent when we are mid-flow
@@ -2364,13 +2340,10 @@ async def chat_stream(req: ChatRequest, request: Request):
                                     yield sse({"type": "final", "used_web_search": False})
                                     return
 
-                        # If we still don't have a code, search variants FIRST before any other gates.
-                        # This is the MANDATORY first step per the instructions.
-                        if not (merged.get("code_type") and merged.get("code")) and merged.get("_awaiting") not in {"variant_choice", "variant_confirm_yesno", "variant_clarify"}:
+                        # If we still don't have a code and we're not already awaiting a gate, search variants.
+                        if not (merged.get("code_type") and merged.get("code")) and merged.get("_awaiting") not in {"zip", "payment", "payer", "variant_choice", "variant_confirm_yesno", "variant_clarify"}:
                             qtext = merged.get("service_query") or req.message
-                            logger.info(f"Searching for service variants with query: {qtext}")
                             raw_candidates = await search_service_variants_by_text(conn, qtext, limit=8)
-                            logger.info(f"Variant search returned {len(raw_candidates)} candidates")
 
                             if not raw_candidates:
                                 merged["_awaiting"] = "variant_clarify"
@@ -2389,11 +2362,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                                 {
                                     "id": c.get("id"),
                                     "cpt_code": c.get("cpt_code"),
-                                    "variant_name": c.get("variant_name") or c.get("cpt_explanation", "")[:80],
+                                    "variant_name": c.get("variant_name"),
                                     "patient_summary": c.get("patient_summary"),
                                     "cpt_explanation": c.get("cpt_explanation"),
-                                    "parent_service": c.get("parent_service") or c.get("category"),
-                                    "is_preventive": c.get("is_preventive"),
                                 }
                                 for c in raw_candidates
                             ]
