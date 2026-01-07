@@ -3,30 +3,44 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CostSavvy - Healthcare Price Transparency</title>
+    <title>Cost Savvy - Healthcare Price Transparency</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --primary: #6b2458;
+            --primary-dark: #5a1e4a;
+            --primary-light: #8a3d73;
+            --primary-bg: #fdf2f8;
+            --primary-border: #f5d0e6;
+            --accent: #d4a574;
+            --accent-light: #e8c9a8;
+        }
+        
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; min-height: 100vh; }
+        body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8f6f7; min-height: 100vh; }
         
         /* Header */
-        .header { background: linear-gradient(135deg, #0d9488 0%, #0f766e 100%); color: white; padding: 16px 24px; position: sticky; top: 0; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
+        .header { background: var(--primary); color: white; padding: 16px 24px; position: sticky; top: 0; z-index: 100; box-shadow: 0 2px 8px rgba(107,36,88,0.3); }
         .header-content { max-width: 1400px; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; }
-        .logo { font-size: 22px; font-weight: 700; }
-        .header-subtitle { font-size: 13px; opacity: 0.9; }
+        .logo { font-family: 'Playfair Display', Georgia, serif; font-size: 26px; font-weight: 600; display: flex; align-items: center; gap: 10px; letter-spacing: 0.5px; }
+        .logo-icon { width: 36px; height: 36px; }
+        .logo-icon svg { width: 100%; height: 100%; }
+        .header-subtitle { font-size: 13px; opacity: 0.9; margin-top: 2px; font-weight: 400; }
         
         .main-container { max-width: 1400px; margin: 0 auto; padding: 20px; }
         
         /* Search Section */
         .search-section { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); margin-bottom: 20px; }
         .search-section h2 { font-size: 18px; color: #333; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+        .search-section h2 svg { color: var(--primary); }
         .search-form { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
         .form-group { flex: 1; min-width: 180px; }
         .form-group label { display: block; font-size: 13px; color: #555; margin-bottom: 6px; font-weight: 500; }
         .form-group input, .form-group select { width: 100%; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; }
-        .form-group input:focus, .form-group select:focus { outline: none; border-color: #0d9488; }
-        .search-btn { background: #0d9488; color: white; border: none; padding: 10px 24px; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; height: 42px; display: flex; align-items: center; gap: 8px; }
-        .search-btn:hover { background: #0f766e; }
+        .form-group input:focus, .form-group select:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(107,36,88,0.1); }
+        .search-btn { background: var(--primary); color: white; border: none; padding: 10px 24px; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; height: 42px; display: flex; align-items: center; gap: 8px; transition: background 0.2s; }
+        .search-btn:hover { background: var(--primary-dark); }
         .search-btn:disabled { background: #ccc; cursor: not-allowed; }
         .search-divider { display: flex; align-items: center; margin: 20px 0; color: #888; font-size: 13px; }
         .search-divider::before, .search-divider::after { content: ''; flex: 1; height: 1px; background: #e5e7eb; }
@@ -56,12 +70,12 @@
         .facility-list { max-height: 400px; overflow-y: auto; }
         .facility-card { padding: 14px 16px; border-bottom: 1px solid #f0f0f0; cursor: pointer; transition: all 0.2s; }
         .facility-card:hover { background: #f9fafb; }
-        .facility-card.selected { background: #f0fdfa; border-left: 3px solid #0d9488; }
+        .facility-card.selected { background: var(--primary-bg); border-left: 3px solid var(--primary); }
         .facility-row { display: flex; justify-content: space-between; align-items: flex-start; }
         .facility-info { display: flex; gap: 10px; flex: 1; }
-        .facility-index { background: #0d9488; color: white; width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: bold; flex-shrink: 0; }
+        .facility-index { background: var(--primary); color: white; width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: bold; flex-shrink: 0; }
         .facility-details { flex: 1; }
-        .facility-name { font-weight: 600; color: #0d9488; font-size: 14px; margin-bottom: 2px; }
+        .facility-name { font-weight: 600; color: var(--primary); font-size: 14px; margin-bottom: 2px; }
         .facility-type { font-size: 12px; color: #888; margin-bottom: 4px; }
         .facility-location { font-size: 12px; color: #666; }
         .facility-pricing { text-align: right; }
@@ -75,33 +89,33 @@
         .map-container { height: 400px; }
         #map { width: 100%; height: 100%; }
         .map-controls { position: absolute; top: 10px; right: 10px; z-index: 1000; background: white; padding: 8px 12px; border-radius: 6px; box-shadow: 0 2px 6px rgba(0,0,0,0.15); font-size: 13px; display: flex; align-items: center; gap: 6px; }
-        .map-controls input[type="checkbox"] { accent-color: #0d9488; }
+        .map-controls input[type="checkbox"] { accent-color: var(--primary); }
         .map-legend { position: absolute; bottom: 10px; left: 10px; z-index: 1000; background: white; padding: 8px 10px; border-radius: 6px; box-shadow: 0 2px 6px rgba(0,0,0,0.15); font-size: 11px; }
         .legend-item { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
         .legend-item:last-child { margin-bottom: 0; }
         .legend-dot { width: 12px; height: 12px; border-radius: 50%; }
         .legend-dot.user { background: #2563eb; border: 2px solid white; box-shadow: 0 1px 2px rgba(0,0,0,0.2); }
-        .legend-dot.facility { background: #0d9488; border: 2px solid white; box-shadow: 0 1px 2px rgba(0,0,0,0.2); }
-        .open-maps-btn { position: absolute; bottom: 10px; right: 10px; z-index: 1000; background: #0d9488; color: white; padding: 8px 12px; border-radius: 6px; box-shadow: 0 2px 6px rgba(0,0,0,0.2); font-size: 12px; text-decoration: none; display: flex; align-items: center; gap: 6px; }
-        .open-maps-btn:hover { background: #0f766e; color: white; }
+        .legend-dot.facility { background: var(--primary); border: 2px solid white; box-shadow: 0 1px 2px rgba(0,0,0,0.2); }
+        .open-maps-btn { position: absolute; bottom: 10px; right: 10px; z-index: 1000; background: var(--primary); color: white; padding: 8px 12px; border-radius: 6px; box-shadow: 0 2px 6px rgba(0,0,0,0.2); font-size: 12px; text-decoration: none; display: flex; align-items: center; gap: 6px; transition: background 0.2s; }
+        .open-maps-btn:hover { background: var(--primary-dark); color: white; }
         
         /* Map Markers */
         .user-marker { background: #2563eb; width: 20px; height: 20px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3); }
-        .facility-marker { background: #0d9488; color: white; width: 28px; height: 28px; border-radius: 50%; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3); display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 12px; }
-        .price-label { background: white; padding: 2px 6px; border-radius: 4px; box-shadow: 0 1px 4px rgba(0,0,0,0.2); font-weight: 600; font-size: 11px; color: #0d9488; white-space: nowrap; border: 1px solid #e5e7eb; }
+        .facility-marker { background: var(--primary); color: white; width: 28px; height: 28px; border-radius: 50%; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3); display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 12px; }
+        .price-label { background: white; padding: 2px 6px; border-radius: 4px; box-shadow: 0 1px 4px rgba(0,0,0,0.2); font-weight: 600; font-size: 11px; color: var(--primary); white-space: nowrap; border: 1px solid #e5e7eb; }
         
         /* Popup */
         .leaflet-popup-content-wrapper { border-radius: 8px; }
         .leaflet-popup-content { margin: 10px 12px; min-width: 180px; }
-        .popup-title { color: #0d9488; font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+        .popup-title { color: var(--primary); font-size: 14px; font-weight: 600; margin-bottom: 4px; }
         .popup-address { color: #666; font-size: 11px; margin-bottom: 6px; }
         .popup-details { display: flex; justify-content: space-between; align-items: center; padding-top: 6px; border-top: 1px solid #eee; }
         .popup-distance { font-size: 11px; color: #888; }
-        .popup-price { font-weight: bold; color: #0d9488; font-size: 16px; }
+        .popup-price { font-weight: bold; color: var(--primary); font-size: 16px; }
         
         /* Chat */
         .chat-section { background: white; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); overflow: hidden; }
-        .chat-header { background: linear-gradient(135deg, #0d9488 0%, #0f766e 100%); color: white; padding: 14px 20px; display: flex; justify-content: space-between; align-items: center; }
+        .chat-header { background: var(--primary); color: white; padding: 14px 20px; display: flex; justify-content: space-between; align-items: center; }
         .chat-header h2 { font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
         .chat-status { font-size: 12px; opacity: 0.9; display: flex; align-items: center; gap: 6px; }
         .status-dot { width: 8px; height: 8px; background: #4ade80; border-radius: 50%; }
@@ -109,37 +123,37 @@
         .message { margin-bottom: 16px; display: flex; gap: 10px; }
         .message.user { flex-direction: row-reverse; }
         .message-avatar { width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; flex-shrink: 0; }
-        .message.assistant .message-avatar { background: #0d9488; color: white; }
+        .message.assistant .message-avatar { background: var(--primary); color: white; }
         .message.user .message-avatar { background: #e5e7eb; color: #666; }
         .message-content { max-width: 75%; }
         .message-bubble { padding: 10px 14px; border-radius: 12px; font-size: 14px; line-height: 1.5; }
         .message.assistant .message-bubble { background: white; color: #333; border: 1px solid #eee; border-radius: 12px 12px 12px 4px; }
-        .message.user .message-bubble { background: #0d9488; color: white; border-radius: 12px 12px 4px 12px; }
+        .message.user .message-bubble { background: var(--primary); color: white; border-radius: 12px 12px 4px 12px; }
         .message-time { font-size: 11px; color: #999; margin-top: 4px; }
         .message.user .message-time { text-align: right; }
         .typing-indicator { display: none; padding: 10px 14px; background: white; border: 1px solid #eee; border-radius: 12px; width: fit-content; }
         .typing-indicator.active { display: block; }
         .typing-dots { display: flex; gap: 4px; }
-        .typing-dots span { width: 8px; height: 8px; background: #0d9488; border-radius: 50%; animation: typing 1.4s infinite; }
+        .typing-dots span { width: 8px; height: 8px; background: var(--primary); border-radius: 50%; animation: typing 1.4s infinite; }
         .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
         .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
         @keyframes typing { 0%, 60%, 100% { transform: translateY(0); opacity: 0.4; } 30% { transform: translateY(-4px); opacity: 1; } }
         .chat-input-container { padding: 16px; background: white; border-top: 1px solid #eee; }
         .chat-input-wrapper { display: flex; gap: 10px; }
-        .chat-input { flex: 1; padding: 12px 16px; border: 1px solid #ddd; border-radius: 24px; font-size: 14px; outline: none; }
-        .chat-input:focus { border-color: #0d9488; }
-        .send-btn { background: #0d9488; color: white; border: none; width: 44px; height: 44px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; }
-        .send-btn:hover { background: #0f766e; }
+        .chat-input { flex: 1; padding: 12px 16px; border: 1px solid #ddd; border-radius: 24px; font-size: 14px; outline: none; transition: border-color 0.2s, box-shadow 0.2s; }
+        .chat-input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(107,36,88,0.1); }
+        .send-btn { background: var(--primary); color: white; border: none; width: 44px; height: 44px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background 0.2s; }
+        .send-btn:hover { background: var(--primary-dark); }
         .send-btn:disabled { background: #ccc; cursor: not-allowed; }
         .send-btn svg { width: 20px; height: 20px; }
         .quick-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
-        .quick-action { padding: 8px 14px; background: #f0fdfa; color: #0d9488; border: 1px solid #99f6e4; border-radius: 20px; font-size: 13px; cursor: pointer; }
-        .quick-action:hover { background: #0d9488; color: white; border-color: #0d9488; }
+        .quick-action { padding: 8px 14px; background: var(--primary-bg); color: var(--primary); border: 1px solid var(--primary-border); border-radius: 20px; font-size: 13px; cursor: pointer; transition: all 0.2s; }
+        .quick-action:hover { background: var(--primary); color: white; border-color: var(--primary); }
         .message-bubble strong { font-weight: 600; }
         .message-bubble ul, .message-bubble ol { margin: 8px 0; padding-left: 20px; }
         .message-bubble li { margin-bottom: 4px; }
-        .message-bubble a { color: #0d9488; text-decoration: underline; }
-        .message.user .message-bubble a { color: #a7f3d0; }
+        .message-bubble a { color: var(--primary); text-decoration: underline; }
+        .message.user .message-bubble a { color: #f5d0e6; }
         .search-btn .spinner { width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-top-color: white; border-radius: 50%; animation: spin 0.8s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
     </style>
@@ -148,7 +162,33 @@
     <header class="header">
         <div class="header-content">
             <div>
-                <div class="logo">🏥 CostSavvy</div>
+                <div class="logo">
+                    <div class="logo-icon">
+                        <svg viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <!-- Sunburst/starburst pattern like the CostSavvy logo -->
+                            <circle cx="50" cy="50" r="8" fill="white"/>
+                            <g stroke="white" stroke-width="2.5" stroke-linecap="round">
+                                <line x1="50" y1="15" x2="50" y2="30"/>
+                                <line x1="50" y1="70" x2="50" y2="85"/>
+                                <line x1="15" y1="50" x2="30" y2="50"/>
+                                <line x1="70" y1="50" x2="85" y2="50"/>
+                                <line x1="25.3" y1="25.3" x2="35.6" y2="35.6"/>
+                                <line x1="64.4" y1="64.4" x2="74.7" y2="74.7"/>
+                                <line x1="74.7" y1="25.3" x2="64.4" y2="35.6"/>
+                                <line x1="35.6" y1="64.4" x2="25.3" y2="74.7"/>
+                                <line x1="50" y1="20" x2="50" y2="28" transform="rotate(22.5 50 50)"/>
+                                <line x1="50" y1="20" x2="50" y2="28" transform="rotate(67.5 50 50)"/>
+                                <line x1="50" y1="20" x2="50" y2="28" transform="rotate(112.5 50 50)"/>
+                                <line x1="50" y1="20" x2="50" y2="28" transform="rotate(157.5 50 50)"/>
+                                <line x1="50" y1="20" x2="50" y2="28" transform="rotate(202.5 50 50)"/>
+                                <line x1="50" y1="20" x2="50" y2="28" transform="rotate(247.5 50 50)"/>
+                                <line x1="50" y1="20" x2="50" y2="28" transform="rotate(292.5 50 50)"/>
+                                <line x1="50" y1="20" x2="50" y2="28" transform="rotate(337.5 50 50)"/>
+                            </g>
+                        </svg>
+                    </div>
+                    Cost Savvy
+                </div>
                 <div class="header-subtitle">Healthcare Price Transparency</div>
             </div>
         </div>
@@ -157,7 +197,10 @@
     <div class="main-container">
         <!-- Quick Search -->
         <section class="search-section">
-            <h2>🔍 Quick Price Search</h2>
+            <h2>
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.35-4.35"></path></svg>
+                Quick Price Search
+            </h2>
             <form class="search-form" id="quickSearchForm">
                 <div class="form-group">
                     <label for="service">Service</label>
@@ -253,12 +296,15 @@
         <!-- Chat -->
         <section class="chat-section">
             <div class="chat-header">
-                <h2>💬 AI Healthcare Price Assistant</h2>
+                <h2>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+                    AI Healthcare Price Assistant
+                </h2>
                 <div class="chat-status"><div class="status-dot"></div>Online</div>
             </div>
             <div class="chat-messages" id="chatMessages">
                 <div class="message assistant">
-                    <div class="message-avatar">🤖</div>
+                    <div class="message-avatar">💬</div>
                     <div class="message-content">
                         <div class="message-bubble">
                             Hi! I'm your healthcare price assistant. <strong>Use the Quick Search above</strong> for common services, or ask me anything like:
@@ -332,7 +378,11 @@
                 if (data.mapData && data.facilities.length > 0) {
                     currentMapData = data.mapData; currentFacilities = data.facilities;
                     displayResults(data.mapData, data.facilities, service);
-                } else { showError('No results found. Try a different service or location.'); }
+                }
+                // Only show error if no text response AND no results (true error case)
+                if (!data.text && (!data.mapData || data.facilities.length === 0)) {
+                    showError('No results found. Try a different service or location.');
+                }
             } catch (error) {
                 typingIndicator.classList.remove('active');
                 showError('Failed to fetch prices. Please try again.');
@@ -391,7 +441,7 @@
         function addMessage(text, role) {
             const div = document.createElement('div');
             div.className = `message ${role}`;
-            const avatar = role === 'assistant' ? '🤖' : '👤';
+            const avatar = role === 'assistant' ? '💬' : '👤';
             const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
             let formatted = text.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>').replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
             div.innerHTML = `<div class="message-avatar">${avatar}</div><div class="message-content"><div class="message-bubble">${formatted}</div><div class="message-time">${time}</div></div>`;
