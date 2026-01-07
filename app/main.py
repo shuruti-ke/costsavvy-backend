@@ -1624,102 +1624,142 @@ def _tokenize_service_text(s: str) -> List[str]:
     return toks
 
 async def search_service_variants_by_text(conn, user_text: str, limit: int = 8) -> List[Dict[str, Any]]:
-    """Search for service variants using the stg_services_cpt table.
+    """
+    Search for service variants to present to the user for selection.
     
-    The stg_services_cpt table has columns: cpt_code, cpt_explanation, patient_summary, category
-    This matches the service_variants.csv data structure.
-
-    Strategy:
-    - Normalize text (e.g., xray/x-ray/x ray).
-    - Remove pricing/stop words.
-    - Use token OR-matching with a simple relevance score.
+    service_variants table schema:
+    - id: integer
+    - parent_service: text (e.g., "Imaging - X-ray", "Dermatology")
+    - cpt_code: text
+    - variant_name: text (the actual procedure name)
+    - patient_summary: text
+    - is_preventive: boolean
+    
+    Fallback to services table:
+    - code, code_type, service_description, cpt_explanation, patient_summary, category
     """
-    base = _normalize_service_text(user_text)
-    toks = _tokenize_service_text(base)
-    if not toks:
+    # Normalize the search text
+    search_text = (user_text or "").lower().strip()
+    
+    # Remove common filler words
+    for word in ["how", "much", "does", "cost", "price", "the", "a", "an", "for", "of", "is", "what"]:
+        search_text = search_text.replace(word, " ")
+    search_text = " ".join(search_text.split()).strip()
+    
+    if not search_text:
         return []
-
-    # Keep tokens that are not generic "price" language
-    stop = {
-        "how","much","does","do","an","a","the","cost","costs","price","prices","pricing","estimate","estimated",
-        "near","nearest","in","for","of","to","please","give","me","what","is","are",
-    }
-    toks = [t for t in toks if t and t not in stop]
-    if not toks:
-        # fall back to the normalized base as a single token (still better than nothing)
-        toks = [base.strip().lower()]
-
-    toks = toks[:6]
-
-    # Build OR match conditions and a score
-    # stg_services_cpt has: cpt_code, cpt_explanation, patient_summary, category
-    where_parts = []
-    score_parts = []
-    params = []
-    for i, tok in enumerate(toks, start=1):
-        like = f"%{tok}%"
-        params.append(like)
-        # Use REPLACE to normalize hyphens in database text for matching
-        # This ensures "x-ray" in DB matches "xray" search term
-        where_parts.append(f"""(
-            LOWER(REPLACE(COALESCE(cpt_explanation,''), '-', '')) LIKE ${i} 
-            OR LOWER(REPLACE(COALESCE(patient_summary,''), '-', '')) LIKE ${i}
-            OR LOWER(REPLACE(COALESCE(category,''), '-', '')) LIKE ${i}
-            OR LOWER(COALESCE(cpt_code,'')) LIKE ${i}
-        )""")
-        score_parts.append(f"""(
-            CASE WHEN LOWER(REPLACE(COALESCE(cpt_explanation,''), '-', '')) LIKE ${i} THEN 2 ELSE 0 END +
-            CASE WHEN LOWER(REPLACE(COALESCE(category,''), '-', '')) LIKE ${i} THEN 2 ELSE 0 END +
-            CASE WHEN LOWER(REPLACE(COALESCE(patient_summary,''), '-', '')) LIKE ${i} THEN 1 ELSE 0 END
-        )""")
-
-    where_sql = " OR ".join(where_parts)
-    score_sql = " + ".join(score_parts)
-
-    # Query stg_services_cpt table - this is where the service_variants.csv data lives
-    sql = f"""
-        SELECT 
-            cpt_code,
-            cpt_explanation,
-            patient_summary,
-            category,
-            cpt_explanation as variant_name,
-            ({score_sql}) AS match_score
-        FROM public.stg_services_cpt
-        WHERE ({where_sql})
-        ORDER BY match_score DESC, category NULLS LAST, cpt_code ASC
-        LIMIT {int(limit)}
-    """
+    
+    # Normalize x-ray variations for searching
+    search_normalized = search_text.replace("x-ray", "xray").replace("x ray", "xray")
+    
+    # Split into tokens
+    tokens = [t for t in search_normalized.split() if len(t) >= 2]
+    if not tokens:
+        tokens = [search_normalized]
+    
+    tokens = tokens[:4]  # Limit tokens
+    
+    logger.info(f"Searching service_variants with tokens: {tokens} from: {user_text}")
     
     try:
-        rows = await conn.fetch(sql, *params)
-        if rows:
-            logger.info(f"stg_services_cpt search found {len(rows)} results for query: {user_text}")
-            return [dict(r) for r in rows]
+        results = []
         
-        logger.info(f"stg_services_cpt empty for query: {user_text}, trying services table")
+        for tok in tokens:
+            like_pattern = f"%{tok}%"
+            
+            # Search service_variants table
+            # Use REPLACE to handle hyphenated terms (X-ray vs xray)
+            rows = await conn.fetch("""
+                SELECT 
+                    id, 
+                    parent_service, 
+                    cpt_code, 
+                    variant_name, 
+                    patient_summary, 
+                    is_preventive
+                FROM public.service_variants
+                WHERE 
+                    LOWER(REPLACE(COALESCE(parent_service, ''), '-', '')) LIKE LOWER($1)
+                    OR LOWER(REPLACE(COALESCE(variant_name, ''), '-', '')) LIKE LOWER($1)
+                    OR LOWER(REPLACE(COALESCE(patient_summary, ''), '-', '')) LIKE LOWER($1)
+                    OR LOWER(cpt_code) LIKE LOWER($1)
+                ORDER BY 
+                    CASE 
+                        WHEN LOWER(REPLACE(COALESCE(parent_service, ''), '-', '')) LIKE LOWER($1) THEN 0 
+                        WHEN LOWER(REPLACE(COALESCE(variant_name, ''), '-', '')) LIKE LOWER($1) THEN 1
+                        ELSE 2 
+                    END,
+                    parent_service,
+                    variant_name
+                LIMIT $2
+            """, like_pattern, limit)
+            
+            if rows:
+                for r in rows:
+                    results.append({
+                        "id": r["id"],
+                        "parent_service": r["parent_service"],
+                        "cpt_code": r["cpt_code"],
+                        "variant_name": r["variant_name"],
+                        "patient_summary": r["patient_summary"],
+                        "is_preventive": r["is_preventive"],
+                    })
+                break  # Found results, stop searching
         
-        # Fallback to services table
-        fallback_sql = f"""
-            SELECT 
-                code as cpt_code,
-                cpt_explanation,
-                patient_summary,
-                category,
-                service_description as variant_name,
-                ({score_sql}) AS match_score
-            FROM public.services
-            WHERE code_type = 'CPT' AND ({where_sql})
-            ORDER BY match_score DESC, category NULLS LAST, code ASC
-            LIMIT {int(limit)}
-        """
-        rows = await conn.fetch(fallback_sql, *params)
-        if rows:
-            logger.info(f"services fallback found {len(rows)} results for query: {user_text}")
-        return [dict(r) for r in rows]
+        # Deduplicate by cpt_code
+        seen = set()
+        unique_results = []
+        for r in results:
+            cpt = r.get("cpt_code")
+            if cpt and cpt not in seen:
+                seen.add(cpt)
+                unique_results.append(r)
+        
+        if unique_results:
+            logger.info(f"service_variants found {len(unique_results)} results for: {user_text}")
+            return unique_results[:limit]
+        
+        # Fallback: try services table
+        logger.info(f"service_variants empty, trying services table for: {user_text}")
+        
+        for tok in tokens:
+            like_pattern = f"%{tok}%"
+            rows = await conn.fetch("""
+                SELECT 
+                    id,
+                    category as parent_service,
+                    code as cpt_code, 
+                    service_description as variant_name,
+                    patient_summary,
+                    cpt_explanation,
+                    false as is_preventive
+                FROM public.services
+                WHERE code_type = 'CPT' AND (
+                    LOWER(REPLACE(COALESCE(category, ''), '-', '')) LIKE LOWER($1)
+                    OR LOWER(REPLACE(COALESCE(service_description, ''), '-', '')) LIKE LOWER($1)
+                    OR LOWER(REPLACE(COALESCE(cpt_explanation, ''), '-', '')) LIKE LOWER($1)
+                    OR LOWER(code) LIKE LOWER($1)
+                )
+                ORDER BY 
+                    CASE 
+                        WHEN LOWER(REPLACE(COALESCE(category, ''), '-', '')) LIKE LOWER($1) THEN 0 
+                        ELSE 1 
+                    END,
+                    category,
+                    service_description
+                LIMIT $2
+            """, like_pattern, limit)
+            
+            if rows:
+                results = [dict(r) for r in rows]
+                logger.info(f"services table found {len(results)} results for: {user_text}")
+                return results[:limit]
+        
+        logger.info(f"No results found in any table for: {user_text}")
+        return []
         
     except Exception as e:
-        logger.error(f"service variant search failed: {e}")
+        logger.error(f"Variant search error: {e}")
         return []
 
 def build_variant_numbered_prompt(user_label: str, variants: List[Dict[str, Any]]) -> str:
@@ -1729,26 +1769,29 @@ def build_variant_numbered_prompt(user_label: str, variants: List[Dict[str, Any]
     lines.append(f"Before I look up prices, which exact billed **{header}** do you mean?")
     lines.append("")
     for i, v in enumerate(variants, start=1):
-        # Build a readable name from cpt_explanation or variant_name
-        expl = (v.get("cpt_explanation") or "").strip()
+        # Get the variant name (main display text)
         name = (v.get("variant_name") or "").strip()
+        cpt_expl = (v.get("cpt_explanation") or "").strip()
         
-        # Extract a short, meaningful name from the explanation
-        if expl:
+        # Use variant_name if available, otherwise cpt_explanation
+        if name:
+            display_name = name[:80]
+            if len(name) > 80:
+                display_name = name[:77] + "..."
+        elif cpt_expl:
             # Take first sentence or first 80 chars
-            if ". " in expl:
-                display_name = expl.split(". ")[0]
+            if ". " in cpt_expl:
+                display_name = cpt_expl.split(". ")[0]
             else:
-                display_name = expl[:80]
+                display_name = cpt_expl[:80]
             if len(display_name) > 80:
                 display_name = display_name[:77] + "..."
-        elif name:
-            display_name = name[:80]
         else:
             display_name = "Option"
         
         cpt = (v.get("cpt_code") or "").strip()
-        category = (v.get("category") or "").strip()
+        # Support both parent_service (from service_variants) and category (from services)
+        category = (v.get("parent_service") or v.get("category") or "").strip()
         summ = (v.get("patient_summary") or "").strip()
         
         # Build the line
@@ -1759,8 +1802,8 @@ def build_variant_numbered_prompt(user_label: str, variants: List[Dict[str, Any]
             line += f" [{category}]"
         lines.append(line)
         
-        # Add summary on next line if available and different from explanation
-        if summ and summ != expl and len(summ) < 150:
+        # Add summary on next line if available and different from name
+        if summ and summ != name and len(summ) < 150:
             lines.append(f"   _{summ}_")
     
     lines.append("")
@@ -2061,6 +2104,14 @@ async def chat_stream(req: ChatRequest, request: Request):
                         merged.pop("plan_like", None)
                         merged.pop("cash_only", None)
                     merged.pop("_awaiting", None)
+                    # CRITICAL: Reset code fields to force variant selection for new service
+                    merged.pop("code_type", None)
+                    merged.pop("code", None)
+                    merged.pop("variant_confirmed", None)
+                    merged.pop("variant_id", None)
+                    merged.pop("variant_name", None)
+                    merged.pop("_variant_candidates", None)
+                    merged.pop("_variant_single", None)
                 _normalize_payment_mode(merged)
 
                 # 2) Force/override pricing intent when we are mid-flow
@@ -2341,7 +2392,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                                     "variant_name": c.get("variant_name") or c.get("cpt_explanation", "")[:80],
                                     "patient_summary": c.get("patient_summary"),
                                     "cpt_explanation": c.get("cpt_explanation"),
-                                    "category": c.get("category"),
+                                    "parent_service": c.get("parent_service") or c.get("category"),
+                                    "is_preventive": c.get("is_preventive"),
                                 }
                                 for c in raw_candidates
                             ]
