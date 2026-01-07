@@ -1624,7 +1624,8 @@ def _tokenize_service_text(s: str) -> List[str]:
     return toks
 
 async def search_service_variants_by_text(conn, user_text: str, limit: int = 8) -> List[Dict[str, Any]]:
-    """Search service_variants for any service type using variant_name and cpt_explanation.
+    """Search service_variants for any service type using variant_name and patient_summary.
+    Also joins with services table to get cpt_explanation for better matching.
 
     Strategy:
     - Normalize text (e.g., xray/x-ray/x ray).
@@ -1649,30 +1650,92 @@ async def search_service_variants_by_text(conn, user_text: str, limit: int = 8) 
     toks = toks[:6]
 
     # Build OR match conditions and a score (count of matched tokens)
+    # service_variants has: variant_name, patient_summary, parent_service
+    # services has: cpt_explanation, service_description, patient_summary
     where_parts = []
     score_parts = []
     params = []
     for i, tok in enumerate(toks, start=1):
         like = f"%{tok}%"
         params.append(like)
-        where_parts.append(f"(LOWER(COALESCE(variant_name,'')) LIKE ${i} OR LOWER(COALESCE(cpt_explanation,'')) LIKE ${i})")
-        score_parts.append(f"(CASE WHEN LOWER(COALESCE(variant_name,'')) LIKE ${i} OR LOWER(COALESCE(cpt_explanation,'')) LIKE ${i} THEN 1 ELSE 0 END)")
+        # Match against service_variants columns AND joined services columns
+        where_parts.append(f"""(
+            LOWER(COALESCE(sv.variant_name,'')) LIKE ${i} 
+            OR LOWER(COALESCE(sv.patient_summary,'')) LIKE ${i}
+            OR LOWER(COALESCE(sv.parent_service,'')) LIKE ${i}
+            OR LOWER(COALESCE(s.cpt_explanation,'')) LIKE ${i}
+            OR LOWER(COALESCE(s.service_description,'')) LIKE ${i}
+        )""")
+        score_parts.append(f"""(
+            CASE WHEN LOWER(COALESCE(sv.variant_name,'')) LIKE ${i} THEN 2 ELSE 0 END +
+            CASE WHEN LOWER(COALESCE(sv.patient_summary,'')) LIKE ${i} THEN 1 ELSE 0 END +
+            CASE WHEN LOWER(COALESCE(sv.parent_service,'')) LIKE ${i} THEN 1 ELSE 0 END +
+            CASE WHEN LOWER(COALESCE(s.cpt_explanation,'')) LIKE ${i} THEN 1 ELSE 0 END
+        )""")
 
     where_sql = " OR ".join(where_parts)
     score_sql = " + ".join(score_parts)
 
     sql = f"""
-        SELECT id, parent_service, cpt_code, variant_name, cpt_explanation, patient_summary, is_preventive,
+        SELECT sv.id, sv.parent_service, sv.cpt_code, sv.variant_name, sv.patient_summary, sv.is_preventive,
+               s.cpt_explanation, s.service_description,
                ({score_sql}) AS match_score
-        FROM public.service_variants
+        FROM public.service_variants sv
+        LEFT JOIN public.services s ON s.code = sv.cpt_code AND s.code_type = 'CPT'
         WHERE ({where_sql})
-        ORDER BY match_score DESC, parent_service NULLS LAST, variant_name NULLS LAST, id ASC
+        ORDER BY match_score DESC, sv.parent_service NULLS LAST, sv.variant_name NULLS LAST, sv.id ASC
         LIMIT {int(limit)}
     """
     try:
         rows = await conn.fetch(sql, *params)
+        if rows:
+            return [dict(r) for r in rows]
+        
+        # Fallback: if service_variants is empty or has no matches, search services table directly
+        # This creates "pseudo-variants" from the services table
+        fallback_sql = f"""
+            SELECT s.id, s.category as parent_service, s.code as cpt_code, 
+                   s.service_description as variant_name, s.patient_summary, 
+                   false as is_preventive, s.cpt_explanation, s.service_description,
+                   ({score_sql}) AS match_score
+            FROM public.services s
+            WHERE s.code_type = 'CPT' AND ({where_sql.replace('sv.', 's.').replace('COALESCE(s.cpt_explanation', 'COALESCE(s.cpt_explanation')})
+            ORDER BY match_score DESC, s.category NULLS LAST, s.service_description NULLS LAST
+            LIMIT {int(limit)}
+        """
+        # Need to rebuild where/score for services table columns
+        where_parts_s = []
+        score_parts_s = []
+        for i, tok in enumerate(toks, start=1):
+            where_parts_s.append(f"""(
+                LOWER(COALESCE(s.service_description,'')) LIKE ${i} 
+                OR LOWER(COALESCE(s.patient_summary,'')) LIKE ${i}
+                OR LOWER(COALESCE(s.cpt_explanation,'')) LIKE ${i}
+                OR LOWER(COALESCE(s.category,'')) LIKE ${i}
+            )""")
+            score_parts_s.append(f"""(
+                CASE WHEN LOWER(COALESCE(s.service_description,'')) LIKE ${i} THEN 2 ELSE 0 END +
+                CASE WHEN LOWER(COALESCE(s.cpt_explanation,'')) LIKE ${i} THEN 1 ELSE 0 END +
+                CASE WHEN LOWER(COALESCE(s.category,'')) LIKE ${i} THEN 1 ELSE 0 END
+            )""")
+        
+        where_sql_s = " OR ".join(where_parts_s)
+        score_sql_s = " + ".join(score_parts_s)
+        
+        fallback_sql = f"""
+            SELECT s.id, s.category as parent_service, s.code as cpt_code, 
+                   s.service_description as variant_name, s.patient_summary, 
+                   false as is_preventive, s.cpt_explanation, s.service_description,
+                   ({score_sql_s}) AS match_score
+            FROM public.services s
+            WHERE s.code_type = 'CPT' AND ({where_sql_s})
+            ORDER BY match_score DESC, s.category NULLS LAST, s.service_description NULLS LAST
+            LIMIT {int(limit)}
+        """
+        rows = await conn.fetch(fallback_sql, *params)
         return [dict(r) for r in rows]
-    except Exception:
+    except Exception as e:
+        logger.warning(f"service_variants search failed: {e}")
         return []
 
 def build_variant_numbered_prompt(user_label: str, variants: List[Dict[str, Any]]) -> str:
