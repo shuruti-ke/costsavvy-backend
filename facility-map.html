@@ -1,0 +1,874 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CostSavvy - Facility Map</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #f5f5f5;
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #0d9488 0%, #0f766e 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+        }
+        
+        .header h1 {
+            font-size: 24px;
+            margin-bottom: 8px;
+        }
+        
+        .header p {
+            opacity: 0.9;
+            font-size: 14px;
+        }
+        
+        .search-section {
+            background: white;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            margin-bottom: 20px;
+        }
+        
+        .search-form {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        
+        .form-group {
+            flex: 1;
+            min-width: 200px;
+        }
+        
+        .form-group label {
+            display: block;
+            font-size: 13px;
+            color: #555;
+            margin-bottom: 6px;
+            font-weight: 500;
+        }
+        
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 10px 14px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border-color 0.2s;
+        }
+        
+        .form-group input:focus, .form-group select:focus {
+            outline: none;
+            border-color: #0d9488;
+        }
+        
+        .search-btn {
+            background: #0d9488;
+            color: white;
+            border: none;
+            padding: 10px 24px;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s;
+            align-self: flex-end;
+        }
+        
+        .search-btn:hover {
+            background: #0f766e;
+        }
+        
+        .search-btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        
+        .results-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        
+        @media (max-width: 900px) {
+            .results-container {
+                grid-template-columns: 1fr;
+            }
+        }
+        
+        .results-list {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            overflow: hidden;
+        }
+        
+        .results-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .results-header h2 {
+            font-size: 16px;
+            color: #333;
+        }
+        
+        .results-count {
+            font-size: 13px;
+            color: #888;
+        }
+        
+        .facility-list {
+            max-height: 500px;
+            overflow-y: auto;
+        }
+        
+        .facility-card {
+            padding: 16px 20px;
+            border-bottom: 1px solid #f0f0f0;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        
+        .facility-card:hover {
+            background: #f9fafb;
+        }
+        
+        .facility-card.selected {
+            background: #f0fdfa;
+            border-left: 3px solid #0d9488;
+        }
+        
+        .facility-card:last-child {
+            border-bottom: none;
+        }
+        
+        .facility-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 8px;
+        }
+        
+        .facility-index {
+            background: #0d9488;
+            color: white;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            font-weight: bold;
+            margin-right: 10px;
+            flex-shrink: 0;
+        }
+        
+        .facility-name {
+            font-weight: 600;
+            color: #0d9488;
+            font-size: 15px;
+            flex: 1;
+        }
+        
+        .facility-price {
+            font-weight: bold;
+            font-size: 18px;
+            color: #333;
+        }
+        
+        .facility-price.estimate {
+            color: #888;
+            font-size: 14px;
+        }
+        
+        .facility-details {
+            display: flex;
+            gap: 16px;
+            font-size: 13px;
+            color: #666;
+            margin-top: 6px;
+        }
+        
+        .facility-distance {
+            color: #888;
+        }
+        
+        .facility-address {
+            color: #666;
+        }
+        
+        .in-network {
+            color: #059669;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 12px;
+            margin-top: 6px;
+        }
+        
+        .map-section {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            overflow: hidden;
+        }
+        
+        .map-container {
+            position: relative;
+            height: 500px;
+        }
+        
+        #map {
+            width: 100%;
+            height: 100%;
+        }
+        
+        .map-controls {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            z-index: 1000;
+            background: white;
+            padding: 8px 12px;
+            border-radius: 6px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .map-controls input[type="checkbox"] {
+            accent-color: #0d9488;
+            width: 16px;
+            height: 16px;
+        }
+        
+        .map-legend {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            z-index: 1000;
+            background: white;
+            padding: 10px 12px;
+            border-radius: 6px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+            font-size: 12px;
+            color: #555;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 4px;
+        }
+        
+        .legend-item:last-child {
+            margin-bottom: 0;
+        }
+        
+        .legend-dot {
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+        }
+        
+        .legend-dot.user {
+            background: #2563eb;
+            border: 2px solid white;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+        }
+        
+        .legend-dot.facility {
+            background: #0d9488;
+            border: 2px solid white;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+        }
+        
+        .open-maps-btn {
+            position: absolute;
+            bottom: 10px;
+            right: 10px;
+            z-index: 1000;
+            background: #0d9488;
+            color: white;
+            padding: 8px 14px;
+            border-radius: 6px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+            font-size: 13px;
+            text-decoration: none;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: background 0.2s;
+        }
+        
+        .open-maps-btn:hover {
+            background: #0f766e;
+            color: white;
+        }
+        
+        /* Custom marker styles */
+        .user-marker {
+            background: #2563eb;
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            border: 3px solid white;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+        }
+        
+        .facility-marker {
+            background: #0d9488;
+            color: white;
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            border: 2px solid white;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 13px;
+        }
+        
+        .price-label {
+            background: white;
+            padding: 3px 8px;
+            border-radius: 4px;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+            font-weight: 600;
+            font-size: 12px;
+            color: #0d9488;
+            white-space: nowrap;
+            border: 1px solid #e5e7eb;
+        }
+        
+        /* Popup styles */
+        .leaflet-popup-content-wrapper {
+            border-radius: 8px;
+            box-shadow: 0 3px 14px rgba(0,0,0,0.15);
+        }
+        
+        .leaflet-popup-content {
+            margin: 12px 14px;
+            min-width: 200px;
+        }
+        
+        .popup-title {
+            color: #0d9488;
+            font-size: 15px;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+        
+        .popup-address {
+            color: #666;
+            font-size: 12px;
+            margin-bottom: 8px;
+        }
+        
+        .popup-details {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding-top: 8px;
+            border-top: 1px solid #eee;
+        }
+        
+        .popup-distance {
+            font-size: 12px;
+            color: #888;
+        }
+        
+        .popup-price {
+            font-weight: bold;
+            color: #0d9488;
+            font-size: 18px;
+        }
+        
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 200px;
+            color: #888;
+        }
+        
+        .loading-spinner {
+            width: 30px;
+            height: 30px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #0d9488;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 10px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .no-results {
+            padding: 40px 20px;
+            text-align: center;
+            color: #888;
+        }
+        
+        .error-message {
+            background: #fef2f2;
+            color: #dc2626;
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🏥 CostSavvy Healthcare Price Finder</h1>
+            <p>Compare prices for medical services at facilities near you</p>
+        </div>
+        
+        <div class="search-section">
+            <form class="search-form" id="searchForm">
+                <div class="form-group">
+                    <label for="service">Service</label>
+                    <select id="service" required>
+                        <option value="">Select a service...</option>
+                        <optgroup label="Imaging">
+                            <option value="xray">X-Ray</option>
+                            <option value="mri">MRI</option>
+                            <option value="ct scan">CT Scan</option>
+                            <option value="ultrasound">Ultrasound</option>
+                            <option value="mammogram">Mammogram</option>
+                        </optgroup>
+                        <optgroup label="Procedures">
+                            <option value="colonoscopy">Colonoscopy</option>
+                            <option value="endoscopy">Endoscopy</option>
+                        </optgroup>
+                        <optgroup label="Lab Tests">
+                            <option value="blood test">Blood Test</option>
+                            <option value="urinalysis">Urinalysis</option>
+                        </optgroup>
+                        <optgroup label="Visits">
+                            <option value="office visit">Office Visit</option>
+                            <option value="emergency room">Emergency Room</option>
+                        </optgroup>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label for="zipcode">ZIP Code</label>
+                    <input type="text" id="zipcode" placeholder="e.g., 06119" maxlength="5" pattern="[0-9]{5}" required>
+                </div>
+                
+                <div class="form-group">
+                    <label for="payment">Payment Type</label>
+                    <select id="payment">
+                        <option value="cash">Cash / Self-Pay</option>
+                        <option value="insurance">Insurance</option>
+                    </select>
+                </div>
+                
+                <button type="submit" class="search-btn" id="searchBtn">Search Prices</button>
+            </form>
+        </div>
+        
+        <div id="errorContainer"></div>
+        
+        <div class="results-container" id="resultsContainer" style="display: none;">
+            <div class="results-list">
+                <div class="results-header">
+                    <h2 id="resultsTitle">Results</h2>
+                    <span class="results-count" id="resultsCount"></span>
+                </div>
+                <div class="facility-list" id="facilityList">
+                    <!-- Facility cards will be inserted here -->
+                </div>
+            </div>
+            
+            <div class="map-section">
+                <div class="map-container">
+                    <div id="map"></div>
+                    
+                    <div class="map-controls">
+                        <input type="checkbox" id="searchWhenMoving" checked>
+                        <label for="searchWhenMoving">Search when moving</label>
+                    </div>
+                    
+                    <div class="map-legend">
+                        <div class="legend-item">
+                            <div class="legend-dot user"></div>
+                            <span>Your location</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-dot facility"></div>
+                            <span>Healthcare facilities</span>
+                        </div>
+                    </div>
+                    
+                    <a href="#" id="openMapsBtn" class="open-maps-btn" target="_blank" style="display: none;">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path>
+                            <circle cx="12" cy="10" r="3"></circle>
+                        </svg>
+                        Open in Google Maps
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // ============================================
+        // CostSavvy Facility Map - Dynamic Data Version
+        // ============================================
+        
+        // Configuration - Update this to match your API endpoint
+        const API_BASE_URL = window.location.origin;
+        
+        // State
+        let map = null;
+        let markers = [];
+        let priceLabels = [];
+        let currentMapData = null;
+        let selectedFacilityIndex = null;
+        
+        // DOM Elements
+        const searchForm = document.getElementById('searchForm');
+        const searchBtn = document.getElementById('searchBtn');
+        const resultsContainer = document.getElementById('resultsContainer');
+        const facilityList = document.getElementById('facilityList');
+        const resultsTitle = document.getElementById('resultsTitle');
+        const resultsCount = document.getElementById('resultsCount');
+        const errorContainer = document.getElementById('errorContainer');
+        const openMapsBtn = document.getElementById('openMapsBtn');
+        
+        // Initialize
+        document.addEventListener('DOMContentLoaded', function() {
+            searchForm.addEventListener('submit', handleSearch);
+        });
+        
+        // Handle search form submission
+        async function handleSearch(e) {
+            e.preventDefault();
+            
+            const service = document.getElementById('service').value;
+            const zipcode = document.getElementById('zipcode').value;
+            const payment = document.getElementById('payment').value;
+            
+            if (!service || !zipcode) {
+                showError('Please select a service and enter your ZIP code');
+                return;
+            }
+            
+            // Show loading state
+            searchBtn.disabled = true;
+            searchBtn.textContent = 'Searching...';
+            errorContainer.innerHTML = '';
+            
+            try {
+                const data = await fetchPrices(service, zipcode, payment);
+                displayResults(data, service, payment);
+            } catch (error) {
+                showError('Failed to fetch prices. Please try again. ' + error.message);
+                console.error('Search error:', error);
+            } finally {
+                searchBtn.disabled = false;
+                searchBtn.textContent = 'Search Prices';
+            }
+        }
+        
+        // Fetch prices from API using SSE
+        async function fetchPrices(service, zipcode, payment) {
+            const sessionId = 'map-' + Date.now();
+            
+            const response = await fetch(`${API_BASE_URL}/chat_stream`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    session_id: sessionId,
+                    message: `How much does a ${service} cost? My ZIP is ${zipcode} and I'm paying ${payment}.`
+                })
+            });
+            
+            if (!response.ok) {
+                throw new Error(`API returned ${response.status}`);
+            }
+            
+            // Parse SSE response
+            const text = await response.text();
+            const lines = text.split('\n');
+            
+            let mapData = null;
+            let facilities = [];
+            
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    try {
+                        const data = JSON.parse(line.slice(6));
+                        if (data.type === 'results') {
+                            mapData = data.map_data;
+                            facilities = data.facilities || [];
+                        }
+                    } catch (e) {
+                        // Skip non-JSON lines
+                    }
+                }
+            }
+            
+            return { mapData, facilities };
+        }
+        
+        // Display results
+        function displayResults(data, service, payment) {
+            const { mapData, facilities } = data;
+            
+            if (!facilities || facilities.length === 0) {
+                showError('No results found. Try a different service or location.');
+                resultsContainer.style.display = 'none';
+                return;
+            }
+            
+            resultsContainer.style.display = 'grid';
+            resultsTitle.textContent = `Results for ${service.charAt(0).toUpperCase() + service.slice(1)}`;
+            resultsCount.textContent = `${facilities.length} facilities found`;
+            
+            renderFacilityList(facilities);
+            
+            if (mapData) {
+                currentMapData = mapData;
+                
+                if (!map) {
+                    initMap(mapData);
+                } else {
+                    updateMap(mapData);
+                }
+                
+                if (mapData.google_maps_url) {
+                    openMapsBtn.href = mapData.google_maps_url;
+                    openMapsBtn.style.display = 'flex';
+                }
+            }
+        }
+        
+        // Render facility list
+        function renderFacilityList(facilities) {
+            facilityList.innerHTML = '';
+            
+            facilities.forEach((facility, index) => {
+                const card = document.createElement('div');
+                card.className = 'facility-card';
+                card.dataset.index = index;
+                
+                const priceText = facility.price 
+                    ? `$${facility.price.toLocaleString()}`
+                    : (facility.estimated_range || 'Contact for price');
+                
+                const priceClass = facility.price ? '' : 'estimate';
+                
+                card.innerHTML = `
+                    <div class="facility-header">
+                        <div style="display: flex; align-items: center;">
+                            <div class="facility-index">${index + 1}</div>
+                            <div class="facility-name">${facility.hospital_name || 'Healthcare Facility'}</div>
+                        </div>
+                        <div class="facility-price ${priceClass}">${priceText}</div>
+                    </div>
+                    <div class="facility-details">
+                        ${facility.distance_miles ? `<span class="facility-distance">${facility.distance_miles.toFixed(1)} mi</span>` : ''}
+                        <span class="facility-address">${facility.address || ''}</span>
+                    </div>
+                `;
+                
+                card.addEventListener('click', () => selectFacility(index));
+                facilityList.appendChild(card);
+            });
+        }
+        
+        // Select facility
+        function selectFacility(index) {
+            document.querySelectorAll('.facility-card').forEach((card, i) => {
+                card.classList.toggle('selected', i === index);
+            });
+            
+            selectedFacilityIndex = index;
+            
+            if (currentMapData?.facilities?.[index] && markers[index + 1]) {
+                const facility = currentMapData.facilities[index];
+                map.setView([facility.latitude, facility.longitude], 13);
+                markers[index + 1].openPopup();
+            }
+        }
+        
+        // Initialize map
+        function initMap(mapData) {
+            if (!mapData?.center) return;
+            
+            map = L.map('map').setView(
+                [mapData.center.latitude, mapData.center.longitude],
+                mapData.zoom || 11
+            );
+            
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '© OpenStreetMap'
+            }).addTo(map);
+            
+            addMarkers(mapData);
+        }
+        
+        // Update map
+        function updateMap(mapData) {
+            if (!map || !mapData?.center) return;
+            
+            markers.forEach(m => map.removeLayer(m));
+            priceLabels.forEach(l => map.removeLayer(l));
+            markers = [];
+            priceLabels = [];
+            
+            addMarkers(mapData);
+            fitBounds(mapData);
+        }
+        
+        // Add markers
+        function addMarkers(mapData) {
+            // User marker
+            if (mapData.user_location?.latitude && mapData.user_location?.longitude) {
+                const userIcon = L.divIcon({
+                    className: '',
+                    html: '<div class="user-marker"></div>',
+                    iconSize: [22, 22],
+                    iconAnchor: [11, 11],
+                });
+                
+                const userMarker = L.marker(
+                    [mapData.user_location.latitude, mapData.user_location.longitude],
+                    { icon: userIcon, zIndexOffset: 1000 }
+                ).addTo(map);
+                
+                userMarker.bindPopup(`
+                    <div class="popup-title">Your Location</div>
+                    <div class="popup-address">${mapData.user_location.zipcode || ''}</div>
+                `);
+                
+                markers.push(userMarker);
+            }
+            
+            // Facility markers
+            if (mapData.facilities?.length > 0) {
+                mapData.facilities.forEach((facility, idx) => {
+                    if (!facility.latitude || !facility.longitude) return;
+                    
+                    const index = facility.index || idx + 1;
+                    
+                    const facilityIcon = L.divIcon({
+                        className: '',
+                        html: `<div class="facility-marker">${index}</div>`,
+                        iconSize: [32, 32],
+                        iconAnchor: [16, 16],
+                    });
+                    
+                    const marker = L.marker(
+                        [facility.latitude, facility.longitude],
+                        { icon: facilityIcon }
+                    ).addTo(map);
+                    
+                    const priceText = facility.price 
+                        ? `$${facility.price.toLocaleString()}`
+                        : (facility.estimated_range || 'Contact for price');
+                    
+                    marker.bindPopup(`
+                        <div class="popup-title">${facility.name || 'Healthcare Facility'}</div>
+                        <div class="popup-address">${facility.address || ''}</div>
+                        <div class="popup-details">
+                            <span class="popup-distance">${facility.distance_miles ? facility.distance_miles.toFixed(1) + ' mi' : ''}</span>
+                            <span class="popup-price">${priceText}</span>
+                        </div>
+                    `);
+                    
+                    marker.on('click', () => selectFacility(idx));
+                    markers.push(marker);
+                    
+                    // Price label
+                    if (facility.price) {
+                        const priceIcon = L.divIcon({
+                            className: '',
+                            html: `<div class="price-label">$${facility.price.toLocaleString()}</div>`,
+                            iconSize: [70, 24],
+                            iconAnchor: [35, -8],
+                        });
+                        
+                        const priceLabel = L.marker(
+                            [facility.latitude, facility.longitude],
+                            { icon: priceIcon, interactive: false, zIndexOffset: -100 }
+                        ).addTo(map);
+                        
+                        priceLabels.push(priceLabel);
+                    }
+                });
+            }
+            
+            fitBounds(mapData);
+        }
+        
+        // Fit bounds
+        function fitBounds(mapData) {
+            const coords = [];
+            
+            if (mapData.user_location?.latitude && mapData.user_location?.longitude) {
+                coords.push([mapData.user_location.latitude, mapData.user_location.longitude]);
+            }
+            
+            mapData.facilities?.forEach(f => {
+                if (f.latitude && f.longitude) {
+                    coords.push([f.latitude, f.longitude]);
+                }
+            });
+            
+            if (coords.length > 1) {
+                map.fitBounds(L.latLngBounds(coords), { padding: [50, 50] });
+            }
+        }
+        
+        // Show error
+        function showError(message) {
+            errorContainer.innerHTML = `<div class="error-message">${message}</div>`;
+        }
+    </script>
+</body>
+</html>
