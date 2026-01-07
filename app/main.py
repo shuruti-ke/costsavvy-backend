@@ -12,11 +12,15 @@ import asyncpg
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI, OpenAIError
 
-# Python fallback refiners (file: app/service_refiners.py)
-from app.service_refiners import refiners_registry
+# Python fallback refiners (file: service_refiners.py)
+try:
+    from app.service_refiners import refiners_registry
+except ImportError:
+    from service_refiners import refiners_registry
 
 # ----------------------------
 # Config
@@ -89,10 +93,26 @@ PRICE_RADIUS_ATTEMPTS = [
 # App
 # ----------------------------
 app = FastAPI()
+
+# CORS middleware - allow requests from any origin
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+)
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 pool: asyncpg.Pool | None = None
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Mount static files if directory exists
+import pathlib
+static_dir = pathlib.Path("static")
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+else:
+    logger.warning("Static directory not found - static files will not be served")
 
 
 # ----------------------------
