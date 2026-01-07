@@ -1659,16 +1659,18 @@ async def search_service_variants_by_text(conn, user_text: str, limit: int = 8) 
     for i, tok in enumerate(toks, start=1):
         like = f"%{tok}%"
         params.append(like)
+        # Use REPLACE to normalize hyphens in database text for matching
+        # This ensures "x-ray" in DB matches "xray" search term
         where_parts.append(f"""(
-            LOWER(COALESCE(cpt_explanation,'')) LIKE ${i} 
-            OR LOWER(COALESCE(patient_summary,'')) LIKE ${i}
-            OR LOWER(COALESCE(category,'')) LIKE ${i}
+            LOWER(REPLACE(COALESCE(cpt_explanation,''), '-', '')) LIKE ${i} 
+            OR LOWER(REPLACE(COALESCE(patient_summary,''), '-', '')) LIKE ${i}
+            OR LOWER(REPLACE(COALESCE(category,''), '-', '')) LIKE ${i}
             OR LOWER(COALESCE(cpt_code,'')) LIKE ${i}
         )""")
         score_parts.append(f"""(
-            CASE WHEN LOWER(COALESCE(cpt_explanation,'')) LIKE ${i} THEN 2 ELSE 0 END +
-            CASE WHEN LOWER(COALESCE(category,'')) LIKE ${i} THEN 2 ELSE 0 END +
-            CASE WHEN LOWER(COALESCE(patient_summary,'')) LIKE ${i} THEN 1 ELSE 0 END
+            CASE WHEN LOWER(REPLACE(COALESCE(cpt_explanation,''), '-', '')) LIKE ${i} THEN 2 ELSE 0 END +
+            CASE WHEN LOWER(REPLACE(COALESCE(category,''), '-', '')) LIKE ${i} THEN 2 ELSE 0 END +
+            CASE WHEN LOWER(REPLACE(COALESCE(patient_summary,''), '-', '')) LIKE ${i} THEN 1 ELSE 0 END
         )""")
 
     where_sql = " OR ".join(where_parts)
@@ -2311,8 +2313,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                                     yield sse({"type": "final", "used_web_search": False})
                                     return
 
-                        # If we still don't have a code and we're not already awaiting a gate, search variants.
-                        if not (merged.get("code_type") and merged.get("code")) and merged.get("_awaiting") not in {"zip", "payment", "payer", "variant_choice", "variant_confirm_yesno", "variant_clarify"}:
+                        # If we still don't have a code, search variants FIRST before any other gates.
+                        # This is the MANDATORY first step per the instructions.
+                        if not (merged.get("code_type") and merged.get("code")) and merged.get("_awaiting") not in {"variant_choice", "variant_confirm_yesno", "variant_clarify"}:
                             qtext = merged.get("service_query") or req.message
                             logger.info(f"Searching for service variants with query: {qtext}")
                             raw_candidates = await search_service_variants_by_text(conn, qtext, limit=8)
