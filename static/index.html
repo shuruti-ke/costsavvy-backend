@@ -461,7 +461,11 @@
             sortAndRenderFacilities();
             if (!map) initMap(mapData); else updateMap(mapData);
             if (mapData.google_maps_url) { openMapsBtn.href = mapData.google_maps_url; openMapsBtn.style.display = 'flex'; }
-            resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            
+            // Scroll to results section after a brief delay to ensure rendering is complete
+            setTimeout(() => {
+                resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }, 100);
         }
         
         function sortAndRenderFacilities() {
@@ -471,7 +475,11 @@
             renderFacilityList(sorted);
         }
         
+        // Keep track of currently displayed (sorted) facilities
+        let displayedFacilities = [];
+        
         function renderFacilityList(facilities) {
+            displayedFacilities = facilities; // Store for selection
             facilityList.innerHTML = '';
             facilities.forEach((f, i) => {
                 const card = document.createElement('div');
@@ -486,10 +494,31 @@
         
         function selectFacility(index) {
             document.querySelectorAll('.facility-card').forEach((card, i) => card.classList.toggle('selected', i === index));
-            if (currentMapData?.facilities?.[index] && markers[index + 1]) {
-                const f = currentMapData.facilities[index];
-                map.setView([f.latitude, f.longitude], 14);
-                markers[index + 1].openPopup();
+            
+            // Get the facility from the displayed (sorted) list
+            const selectedFacility = displayedFacilities[index];
+            if (!selectedFacility) return;
+            
+            // Find the matching marker by coordinates
+            if (selectedFacility.latitude && selectedFacility.longitude) {
+                map.setView([selectedFacility.latitude, selectedFacility.longitude], 14);
+                
+                // Find and open the correct marker popup
+                // markers[0] is user location, facility markers start at index 1
+                for (let i = 1; i < markers.length; i++) {
+                    const markerLatLng = markers[i].getLatLng();
+                    if (Math.abs(markerLatLng.lat - selectedFacility.latitude) < 0.0001 && 
+                        Math.abs(markerLatLng.lng - selectedFacility.longitude) < 0.0001) {
+                        markers[i].openPopup();
+                        break;
+                    }
+                }
+                
+                // Scroll to show the map
+                const mapElement = document.getElementById('map');
+                if (mapElement) {
+                    mapElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
             }
         }
         
