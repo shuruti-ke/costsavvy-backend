@@ -806,10 +806,34 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
 
     # 4) If the user is asking a new price question, mark it as such so we reset session state.
     # This ensures variant selection happens even if we already have a ZIP from a previous query.
+    # Also extract ZIP and payment info from the same message if present.
     inferred_service = infer_service_query_from_message(msg)
     if inferred_service:
+        # Extract ZIP from this message if present
+        extracted_zip = None
+        zip_match_new = re.search(r"\b(\d{5})\b", msg)
+        if zip_match_new:
+            extracted_zip = zip_match_new.group(1)
+        
+        # Extract payment mode from this message if present
+        extracted_payment = None
+        extracted_payer = None
+        if any(t in msg_l for t in cash_terms):
+            extracted_payment = "cash"
+        elif any(t in msg_l for t in insurance_terms):
+            extracted_payment = "insurance"
+            extracted_payer = extract_carrier(msg)
+        
         # Always mark as new price question to trigger session reset and variant selection
-        return {"mode": "price", "service_query": inferred_service, "clarifying_question": None, "_new_price_question": True}
+        return {
+            "mode": "price", 
+            "service_query": inferred_service, 
+            "zipcode": extracted_zip,
+            "payment_mode": extracted_payment,
+            "payer_like": extracted_payer,
+            "clarifying_question": None, 
+            "_new_price_question": True
+        }
 
     # 5) Otherwise fall back to LLM-based intent extraction (general Q&A, non-price).
     try:
