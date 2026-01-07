@@ -784,10 +784,11 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
                 "cash_only": False,
             }
 
-    # 4) If the user is asking a new price question but we lack ZIP, we will ask for ZIP (geo-first).
+    # 4) If the user is asking a new price question, mark it as such so we reset session state.
+    # This ensures variant selection happens even if we already have a ZIP from a previous query.
     inferred_service = infer_service_query_from_message(msg)
-    if inferred_service and not have_zip:
-        # Force clarifying ZIP instead of letting the LLM ask for payment first.
+    if inferred_service:
+        # Always mark as new price question to trigger session reset and variant selection
         return {"mode": "price", "service_query": inferred_service, "clarifying_question": None, "_new_price_question": True}
 
     # 5) Otherwise fall back to LLM-based intent extraction (general Q&A, non-price).
