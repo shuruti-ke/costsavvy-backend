@@ -8,10 +8,6 @@ import logging
 from typing import Optional, Any, Dict, List, Tuple
 
 import asyncpg
-try:
-    import httpx  # type: ignore
-except Exception:  # pragma: no cover
-    httpx = None
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -40,18 +36,6 @@ MIN_FACILITIES_TO_DISPLAY = int(os.getenv("MIN_FACILITIES_TO_DISPLAY", "5"))
 
 # Refiners cache TTL (DB-first, Python fallback)
 REFINERS_CACHE_TTL_SECONDS = int(os.getenv("REFINERS_CACHE_TTL_SECONDS", "300"))
-
-# ---- Care navigation (nearest hospital) ----
-ENABLE_WEB_NEAREST_FACILITY = os.getenv("ENABLE_WEB_NEAREST_FACILITY", "true").lower() in (
-    "1", "true", "yes", "y", "on"
-)
-WEB_NEAREST_FACILITY_LIMIT = int(os.getenv("WEB_NEAREST_FACILITY_LIMIT", "3"))
-
-# Nominatim/Overpass require a descriptive User-Agent
-NOMINATIM_USER_AGENT = os.getenv(
-    "NOMINATIM_USER_AGENT",
-    "CostSavvy.health/1.0 (nearest-facility lookup; contact: support@costsavvy.health)",
-)
 
 # ---- Intent override controls (env-driven) ----
 INTENT_OVERRIDE_FORCE_PRICE_ENABLED = os.getenv("INTENT_OVERRIDE_FORCE_PRICE_ENABLED", "true").lower() in (
@@ -327,9 +311,6 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
     have_service = bool(st.get("service_query") or st.get("code"))
     have_zip = bool(st.get("zipcode"))
 
-    if is_symptom_message(msg) and not any(kw in msg_l for kw in INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS) and not is_care_navigation_message(msg):
-        return {"mode": "general", "clarifying_question": None}
-
     # 0) ZIP detection anywhere in the message
     zip_match = re.search(r"\b(\d{5})\b", msg)
     if zip_match:
@@ -469,22 +450,6 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
                 "cash_only": False,
             }
 
-    # 3.5) If we are awaiting an imaging/service variant selection, do NOT treat this message as a new pricing question.
-    # Let the pricing flow handle applying the variant choice/free-text downstream.
-    if awaiting in {"service_variant", "service_variant_text"}:
-        return {
-            "mode": "price",
-            "zipcode": st.get("zipcode"),
-            "radius_miles": st.get("radius_miles"),
-            "payer_like": st.get("payer_like"),
-            "plan_like": st.get("plan_like"),
-            "payment_mode": st.get("payment_mode"),
-            "service_query": st.get("service_query"),
-            "code_type": st.get("code_type"),
-            "code": st.get("code"),
-            "clarifying_question": None,
-        }
-
     # 4) If the user is asking a new price question but we lack ZIP, we will ask for ZIP (geo-first).
     inferred_service = infer_service_query_from_message(msg)
     if inferred_service and not have_zip:
@@ -530,21 +495,19 @@ def infer_service_query_from_message(message: str) -> Optional[str]:
     return None
 
 
-
 def should_force_price_mode(message: str, merged: Dict[str, Any]) -> bool:
     if not INTENT_OVERRIDE_FORCE_PRICE_ENABLED:
         return False
 
-    msg = (message or "").lower()
-
-    if is_symptom_message(msg) and not any(kw in msg for kw in INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS):
-        return False
-
+    # If we already have a pricing context (service + ZIP) and are still collecting
+    # payment details, keep the conversation in price mode even if the user's reply
+    # doesn't include explicit cost keywords (e.g., "I have Aetna insurance").
     if (merged or {}).get("service_query") and (merged or {}).get("zipcode") and not (merged or {}).get("payment_mode"):
         return True
     if (merged or {}).get("_awaiting") in {"zip", "payment"}:
         return True
 
+    msg = (message or "").lower()
     return any(kw in msg for kw in INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS)
 
 
@@ -594,197 +557,143 @@ def reset_gating_fields_for_new_price_question(message: str, merged: Dict[str, A
         merged.pop("plan_like", None)
         merged.pop("cash_only", None)
 
-    # For a new pricing question, avoid reusing the previous service/code/variant context
-    # unless the user explicitly included a code in the message.
-    if not re.search(r"\b\d{4,5}[A-Z]?\b", (message or ""), flags=re.IGNORECASE):
-        merged.pop("code_type", None)
-        merged.pop("code", None)
-        merged.pop("service_id", None)
-        merged.pop("refiner_id", None)
-        merged.pop("refiner_choice", None)
-        merged.pop("variant_id", None)
-        merged.pop("variant_name", None)
-        merged.pop("variant_free_text", None)
-        merged.pop("variant_patient_summary", None)
-        merged.pop("_variant_choices", None)
-        merged.pop("variant_parent_service", None)
-        # Clear any in-progress gating prompts related to the prior service.
-        merged.pop("_awaiting", None)
-
-
-# ----------------------------
-# Care navigation (nearest hospital/urgent care)
-# ----------------------------
-
-def is_symptom_message(message: str) -> bool:
-    msg = (message or "").lower()
-    symptomish = [
-        "hurts", "hurt", "pain", "swollen", "swelling", "injury", "bleeding",
-        "nausea", "vomit", "vomiting", "dizzy", "dizziness",
-        "shortness of breath", "can't breathe", "cant breathe",
-        "stomach hurts", "abdominal pain", "fever",
-        "chest hurts", "chest pain",
-    ]
-    return any(s in msg for s in symptomish)
-
-
-def is_care_navigation_message(message: str) -> bool:
-    msg = (message or "").lower()
-
-    triggers = [
-        "go to hospital",
-        "need to go to hospital",
-        "i need to go to hospital",
-        "i need to go to the hospital",
-        "nearest hospital",
-        "closest hospital",
-        "which is the closest hospital",
-        "need a hospital",
-        "urgent care",
-        "emergency room",
-        "er ",
-        " er",
-    ]
-
-    # If the user is describing symptoms, proactively offer navigation help.
-    # (Pricing-mode overrides are handled elsewhere so price questions aren't hijacked.)
-    if is_symptom_message(msg):
-        return True
-
-    symptomish = [
-        "hurts",
-        "pain",
-        "swollen",
-        "swelling",
-        "injury",
-        "bleeding",
-        "can't walk",
-        "cant walk",
-        "broken",
-        "shortness of breath",
-        "can't breathe",
-        "cant breathe",
-        "stomach hurts",
-        "abdominal pain",
-        "chest hurts",
-        "chest pain",
-    ]
-    return any(t in msg for t in triggers) or ("hospital" in msg and any(s in msg for s in symptomish))
-
-
-def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    import math
-
-    R = 3959.0
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dl / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(a))
-
-
-async def get_zip_latlon(conn: asyncpg.Connection, zipcode: str) -> Optional[Tuple[float, float]]:
-    row = await conn.fetchrow(
-        "SELECT latitude, longitude FROM public.zip_locations WHERE zipcode = $1 LIMIT 1",
-        zipcode,
-    )
-    if row and row.get("latitude") is not None and row.get("longitude") is not None:
-        return float(row["latitude"]), float(row["longitude"])
-    return None
-
-
-async def geocode_zip_nominatim(zipcode: str) -> Optional[Tuple[float, float]]:
-    """Web fallback for ZIP -> lat/lon. Requires httpx and ENABLE_WEB_NEAREST_FACILITY."""
-    if not ENABLE_WEB_NEAREST_FACILITY or httpx is None:
-        return None
-    url = "https://nominatim.openstreetmap.org/search"
-    params = {"postalcode": zipcode, "country": "USA", "format": "json", "limit": 1}
-    headers = {"User-Agent": NOMINATIM_USER_AGENT}
-    async with httpx.AsyncClient(timeout=15, headers=headers) as client_http:
-        r = await client_http.get(url, params=params)
-        r.raise_for_status()
-        data = r.json()
-        if not data:
-            return None
-        return float(data[0]["lat"]), float(data[0]["lon"])
-
-
-async def find_nearest_hospitals_overpass(lat: float, lon: float, limit: int = 3) -> List[Dict[str, Any]]:
-    """Web lookup for nearby hospitals/ER-like clinics near a point."""
-    if not ENABLE_WEB_NEAREST_FACILITY or httpx is None:
-        return []
-
-    radius_m = 20000
-    query = f"""
-    [out:json][timeout:25];
-    (
-      node(around:{radius_m},{lat},{lon})["amenity"="hospital"];
-      way(around:{radius_m},{lat},{lon})["amenity"="hospital"];
-      relation(around:{radius_m},{lat},{lon})["amenity"="hospital"];
-      node(around:{radius_m},{lat},{lon})["amenity"="clinic"]["emergency"="yes"];
-      way(around:{radius_m},{lat},{lon})["amenity"="clinic"]["emergency"="yes"];
-      relation(around:{radius_m},{lat},{lon})["amenity"="clinic"]["emergency"="yes"];
-    );
-    out center tags;
-    """
-
-    url = "https://overpass-api.de/api/interpreter"
-    headers = {"User-Agent": NOMINATIM_USER_AGENT}
-
-    async with httpx.AsyncClient(timeout=30, headers=headers) as client_http:
-        r = await client_http.post(url, data=query)
-        r.raise_for_status()
-        payload = r.json()
-
-    elems = payload.get("elements", []) or []
-
-    def pick_point(e: dict) -> Optional[Tuple[float, float]]:
-        if "lat" in e and "lon" in e:
-            return float(e["lat"]), float(e["lon"])
-        c = e.get("center")
-        if c and "lat" in c and "lon" in c:
-            return float(c["lat"]), float(c["lon"])
-        return None
-
-    results: List[Dict[str, Any]] = []
-    for e in elems:
-        tags = e.get("tags", {}) or {}
-        pt = pick_point(e)
-        if not pt:
-            continue
-
-        name = (tags.get("name") or "Hospital/Clinic").strip()
-        street = tags.get("addr:street") or ""
-        housenumber = tags.get("addr:housenumber") or ""
-        city = tags.get("addr:city") or ""
-        state = tags.get("addr:state") or ""
-        postcode = tags.get("addr:postcode") or ""
-        phone = tags.get("phone") or tags.get("contact:phone") or ""
-
-        address = " ".join([p for p in [housenumber, street] if p]).strip()
-        addr_parts = [p for p in [address, city, state, postcode] if p]
-        full_addr = ", ".join(addr_parts)
-
-        d = haversine_miles(lat, lon, pt[0], pt[1])
-
-        results.append(
-            {
-                "name": name,
-                "address": full_addr,
-                "phone": phone,
-                "distance_miles": d,
-                "lat": pt[0],
-                "lon": pt[1],
-            }
-        )
-
-    results.sort(key=lambda x: x["distance_miles"])
-    return results[: max(1, int(limit or 3))]
-
 
 # ----------------------------
 # DB: resolve code + price lookup
 # ----------------------------
+
+# ----------------------------
+# DB: service_variants matching (universal variant-first)
+# ----------------------------
+async def _detect_service_variants_columns(conn: asyncpg.Connection) -> Dict[str, bool]:
+    cols = {"variant_name": False, "cpt_explanation": False, "patient_summary": False, "patient_summar": False, "cpt_code": False}
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='service_variants'
+            """
+        )
+        have = {r["column_name"] for r in rows}
+        for k in list(cols.keys()):
+            cols[k] = k in have
+    except Exception:
+        pass
+    return cols
+
+
+async def get_service_variants_by_text(conn: asyncpg.Connection, user_text: str, limit: int = 15) -> List[Dict[str, Any]]:
+    """Search public.service_variants for variants matching the user's description (variant_name/cpt_explanation)."""
+    text = (user_text or "").strip()
+    if not text:
+        return []
+
+    cols = await _detect_service_variants_columns(conn)
+    name_col = "variant_name" if cols.get("variant_name") else None
+    expl_col = "cpt_explanation" if cols.get("cpt_explanation") else None
+    # patient_summary may have a historical misspelling
+    if cols.get("patient_summary"):
+        summary_expr = "patient_summary"
+    elif cols.get("patient_summar"):
+        summary_expr = "patient_summar AS patient_summary"
+    else:
+        summary_expr = "NULL::text AS patient_summary"
+
+    if not name_col and not expl_col:
+        return []
+
+    tokens = [t for t in re.split(r"[^a-zA-Z0-9]+", text.lower()) if len(t) >= 3][:8]
+    full_pat = f"%{text.lower()}%"
+    pats = [f"%{t}%" for t in tokens]
+
+    params: List[Any] = [full_pat] + pats
+    def ph(i: int) -> str:
+        return f"${i}"
+
+    ors = []
+    # full text match
+    if name_col:
+        ors.append(f"lower({name_col}) LIKE {ph(1)}")
+    if expl_col:
+        ors.append(f"lower({expl_col}) LIKE {ph(1)}")
+    # token matches
+    for i in range(2, len(params) + 1):
+        if name_col:
+            ors.append(f"lower({name_col}) LIKE {ph(i)}")
+        if expl_col:
+            ors.append(f"lower({expl_col}) LIKE {ph(i)}")
+
+    where_sql = " OR ".join(ors) if ors else "FALSE"
+
+    score_sql = "CASE WHEN (" + (" OR ".join([f"lower({c}) LIKE $1" for c in [name_col, expl_col] if c])) + ") THEN 100 ELSE 0 END"
+    for i in range(2, len(params) + 1):
+        score_sql += " + CASE WHEN (" + (" OR ".join([f"lower({c}) LIKE {ph(i)}" for c in [name_col, expl_col] if c])) + ") THEN 5 ELSE 0 END"
+
+    rows = await conn.fetch(
+        f"""
+        SELECT
+          id,
+          COALESCE(parent_service, '') AS parent_service,
+          {("cpt_code" if cols.get("cpt_code") else "NULL::text AS cpt_code")},
+          {("variant_name" if name_col else "NULL::text AS variant_name")},
+          {summary_expr},
+          COALESCE(is_preventive, FALSE) AS is_preventive,
+          {("cpt_explanation" if expl_col else "NULL::text AS cpt_explanation")},
+          ({score_sql}) AS score
+        FROM public.service_variants
+        WHERE {where_sql}
+        ORDER BY score DESC, variant_name ASC, id ASC
+        LIMIT {int(limit)}
+        """,
+        *params,
+    )
+    return [dict(r) for r in rows]
+
+
+def _simplify_variant_for_patient(v: Dict[str, Any]) -> str:
+    name = (v.get("variant_name") or "").strip()
+    expl = (v.get("cpt_explanation") or "").strip()
+    summary = (v.get("patient_summary") or "").strip()
+
+    base = summary or expl
+    base = re.sub(r"\s+", " ", base).strip()
+    if len(base) > 160:
+        base = base[:157].rstrip() + "..."
+
+    low = (name + " " + base).lower()
+    hints = []
+    if "without contrast" in low or "w/o contrast" in low:
+        hints.append("no IV dye")
+    if "with contrast" in low or "w/ contrast" in low:
+        hints.append("uses IV dye")
+    if "view" in low:
+        hints.append("view count matters")
+    if "screen" in low and "colon" in low:
+        hints.append("routine screening")
+    if "diagn" in low:
+        hints.append("for symptoms/abnormal results")
+    hint = (" (" + ", ".join(hints) + ")") if hints else ""
+    return (base + hint) if base else ("Details affect preparation and price." + hint)
+
+
+def build_variant_options_prompt(service_label: str, variants: List[Dict[str, Any]]) -> str:
+    label = (service_label or "this service").strip()
+    lines = [f"Before I look up prices, which specific **{label.upper()}** do you mean?", ""]
+    for i, v in enumerate(variants, start=1):
+        vname = (v.get("variant_name") or "Option").strip()
+        desc = _simplify_variant_for_patient(v)
+        lines.append(f"{i}) {vname} – {desc}")
+    lines.append("")
+    lines.append("Reply with the number that best matches what you need.")
+    return "\n".join(lines)
+
+
+def build_variant_confirm_prompt(v: Dict[str, Any]) -> str:
+    vname = (v.get("variant_name") or "").strip() or "that option"
+    return f"Just to confirm, you mean: **{vname}**. Is that right? (yes/no)"
+
+
 async def resolve_service_code(conn: asyncpg.Connection, merged: Dict[str, Any]) -> Optional[Tuple[str, str]]:
     if merged.get("code_type") and merged.get("code"):
         return merged["code_type"], merged["code"]
@@ -1267,365 +1176,6 @@ def estimate_cost_range(service_query: str, payment_mode: str) -> str:
 
 
 # ----------------------------
-# Service variants (variant-first, DB-driven)
-# ----------------------------
-_service_variants_has_patient_summary: Optional[bool] = None
-
-def infer_parent_service_key(service_query: str) -> Optional[str]:
-    """Normalize a user service query into a parent_service key used by public.service_variants."""
-    q = (service_query or "").strip().lower()
-    if not q:
-        return None
-    if "mri" in q:
-        return "mri"
-    if "ct" in q or "cat scan" in q or "ct scan" in q:
-        return "ct"
-    if "x-ray" in q or "xray" in q:
-        return "x-ray"
-    if "ultrasound" in q or "sonogram" in q:
-        return "ultrasound"
-    return None
-
-
-def is_generic_imaging_request(message: str, parent_service: str) -> bool:
-    """Return True when the user asked for a modality price (MRI/CT/X-ray/US) without enough detail
-    to pick a specific CPT-backed variant.
-
-    Key behavior:
-      - MRI/CT/US: body part or protocol usually makes it specific enough.
-      - X-ray: body part alone is often still ambiguous because view-count (and sometimes laterality)
-        changes the CPT. Example: "x-ray chest" still needs 1 view vs 2 views.
-    """
-    msg = (message or "").lower()
-    ps = (parent_service or "").lower()
-
-    # Contrast hints: if present, it's not "generic"
-    if "with contrast" in msg or "without contrast" in msg or "w/ contrast" in msg or "wo contrast" in msg:
-        return False
-
-    # Modality presence checks (handles "x ray", "x-ray", "xray")
-    has_mri = "mri" in msg
-    has_ct = ("ct scan" in msg) or ("cat scan" in msg) or (re.search(r"\bct\b", msg) is not None)
-    has_xray = ("x-ray" in msg) or ("xray" in msg) or (re.search(r"\bx\s*ray\b", msg) is not None)
-    has_us = ("ultrasound" in msg) or ("sonogram" in msg)
-
-    # X-ray special case: require view-count for common exams
-    if ps in ("x-ray", "xray"):
-        if not has_xray:
-            return False
-        # If the user included view count, treat as specific enough
-        has_views = ("view" in msg or "views" in msg) or (re.search(r"\b[1-4]\s*[- ]?view\b", msg) is not None)
-        if has_views:
-            return False
-        # If they only said the body part (e.g., "x ray chest", "x-ray knee"), we still need views.
-        body_terms = [
-            "chest", "knee", "shoulder", "ankle", "foot", "wrist", "hand", "elbow", "hip",
-            "pelvis", "spine", "cervical", "thoracic", "lumbar", "abdomen", "rib", "ribs",
-        ]
-        if any(t in msg for t in body_terms):
-            return True
-        # Generic "x-ray" with no body part at all is also generic
-        return True
-
-    # Common body-part/region hints (not exhaustive, just to avoid false-gating)
-    body_terms = [
-        "brain", "head", "neck", "spine", "cervical", "thoracic", "lumbar",
-        "knee", "hip", "shoulder", "ankle", "wrist", "elbow", "hand", "foot",
-        "abdomen", "pelvis", "chest", "heart", "cardiac", "coronary",
-        "breast", "prostate",
-    ]
-    if any(t in msg for t in body_terms):
-        return False
-
-    # If they mention just the modality, treat as generic.
-    if ps == "mri" and has_mri:
-        return True
-    if ps == "ct" and has_ct:
-        return True
-    if ps == "ultrasound" and has_us:
-        return True
-
-    return False
-    # If they mention just the modality, treat as generic.
-    key = (parent_service or "").lower()
-    if key == "mri" and "mri" in msg:
-        return True
-    if key == "ct" and ("ct" in msg or "ct scan" in msg or "cat scan" in msg):
-        return True
-    if key in ("x-ray", "xray") and ("x-ray" in msg or "xray" in msg):
-        return True
-    if key == "ultrasound" and ("ultrasound" in msg or "sonogram" in msg):
-        return True
-
-    return False
-
-
-async def _detect_service_variants_summary_column(conn: asyncpg.Connection) -> bool:
-    """Detect whether public.service_variants uses patient_summary or the legacy patient_summar."""
-    global _service_variants_has_patient_summary
-    if _service_variants_has_patient_summary is not None:
-        return _service_variants_has_patient_summary
-
-    row = await conn.fetchrow(
-        """
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema='public'
-          AND table_name='service_variants'
-          AND column_name='patient_summary'
-        LIMIT 1
-        """
-    )
-    _service_variants_has_patient_summary = bool(row)
-    return _service_variants_has_patient_summary
-
-
-async def get_service_variants_for_parent(conn: asyncpg.Connection, parent_service: str) -> List[Dict[str, Any]]:
-    """Fetch variants for a parent_service from public.service_variants."""
-    if not parent_service:
-        return []
-
-    has_summary = await _detect_service_variants_summary_column(conn)
-    summary_col = "patient_summary" if has_summary else "patient_summar"
-
-    rows = await conn.fetch(
-        f"""
-        SELECT
-          id,
-          parent_service,
-          cpt_code,
-          variant_name,
-          {summary_col} AS patient_summary,
-          is_preventive
-        FROM public.service_variants
-        WHERE lower(parent_service) = lower($1)
-        ORDER BY is_preventive DESC NULLS LAST, variant_name ASC, id ASC
-        """,
-        parent_service,
-    )
-    return [dict(r) for r in rows]
-
-
-def build_service_variant_prompt(parent_service: str, variants: List[Dict[str, Any]]) -> str:
-    """Ask user to choose a variant BEFORE collecting ZIP."""
-    lines: List[str] = []
-    lines.append(f"Before I look up prices, which specific type of **{parent_service.upper()}** do you mean?")
-    lines.append("")
-    lines.append("Common variants include different body parts and whether contrast is used.")
-    lines.append("")
-    for i, v in enumerate(variants, start=1):
-        label = (v.get("variant_name") or "").strip() or "Variant"
-        summary = (v.get("patient_summary") or "").strip()
-        cpt = (v.get("cpt_code") or "").strip()
-        tail = []
-        if cpt:
-            tail.append(f"CPT {cpt}")
-        if summary:
-            tail.append(summary)
-        suffix = " – " + " | ".join(tail) if tail else ""
-        lines.append(f"{i}) {label}{suffix}")
-    lines.append("")
-    lines.append("Reply with the number that matches what you want.")
-    return "\n".join(lines)
-
-
-def build_generic_imaging_variant_prompt(parent_service: str) -> str:
-    ps = (parent_service or "").lower()
-    if ps == "mri":
-        examples = [
-            "MRI brain (with or without contrast)",
-            "MRI knee (usually without contrast)",
-            "MRI lumbar spine (with or without contrast)",
-            "MRI shoulder (with or without contrast)",
-            "MRI abdomen/pelvis (often with contrast)",
-        ]
-    elif ps == "ct":
-        examples = [
-            "CT head without contrast",
-            "CT chest with contrast",
-            "CT abdomen/pelvis with contrast",
-            "CT angiography (CTA)",
-            "CT coronary calcium score (no contrast)",
-        ]
-    elif ps == "x-ray":
-        examples = [
-            "X-ray chest (1 view or 2 views)",
-            "X-ray knee (2–4 views)",
-            "X-ray shoulder",
-            "X-ray ankle/foot",
-        ]
-    elif ps == "ultrasound":
-        examples = [
-            "Ultrasound abdomen (complete)",
-            "Ultrasound pelvis",
-            "Ultrasound pregnancy/OB",
-            "Ultrasound venous Doppler leg",
-        ]
-    else:
-        examples = []
-
-    lines: List[str] = []
-    lines.append(f"Before I look up prices, which specific **{ps.upper()}** do you mean?")
-    lines.append("")
-    if examples:
-        lines.append("For example:")
-        for ex in examples:
-            lines.append(f"- {ex}")
-        lines.append("")
-    lines.append('Reply with the exact variant in a few words (example: "MRI knee without contrast").')
-    return "\n".join(lines)
-
-
-def apply_service_variant_choice(message: str, merged: Dict[str, Any], variants: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Apply a numeric variant choice to session state."""
-    s = (message or "").strip()
-    if not s.isdigit():
-        return merged
-    idx = int(s) - 1
-    if idx < 0 or idx >= len(variants):
-        return merged
-
-    picked = variants[idx]
-    merged["code_type"] = "CPT"
-    merged["code"] = str(picked.get("cpt_code") or "").strip() or merged.get("code")
-    merged["variant_id"] = picked.get("id")
-    merged["variant_name"] = picked.get("variant_name")
-    merged["variant_parent_service"] = picked.get("parent_service")
-    merged["variant_patient_summary"] = picked.get("patient_summary")
-    merged.pop("_awaiting", None)
-    return merged
-
-
-
-async def price_lookup_staging_by_cpt_with_variants(
-    conn: asyncpg.Connection,
-    zipcode: str,
-    cpt_code: str,
-    payment_mode: str,
-    payer_like: Optional[str] = None,
-    plan_like: Optional[str] = None,
-    limit: int = 25,
-) -> List[Dict[str, Any]]:
-    """Pricing using stg_hospital_rates + service_variants, ranked by distance.
-
-    - cash: prefers discounted cash, then estimated, then gross
-    - insurance: prefers negotiated dollar, then estimated, then cash, then gross
-    """
-    if not zipcode or not cpt_code:
-        return []
-
-    z = await conn.fetchrow(
-        "SELECT latitude, longitude FROM public.zip_locations WHERE zipcode = $1 LIMIT 1",
-        zipcode,
-    )
-    if not z or z["latitude"] is None or z["longitude"] is None:
-        return []
-
-    zlat = float(z["latitude"])
-    zlon = float(z["longitude"])
-
-    pm = (payment_mode or "cash").lower()
-    payer_pat = f"%{payer_like}%" if payer_like else "%"
-    plan_pat = f"%{plan_like}%" if plan_like else "%"
-
-    rows = await conn.fetch(
-        """
-        SELECT
-          h.name AS hospital_name,
-          h.address AS address,
-          h.state AS state,
-          h.zipcode AS zipcode,
-          h.phone AS phone,
-          h.latitude AS latitude,
-          h.longitude AS longitude,
-          (3959 * acos(
-              cos(radians($2)) * cos(radians(h.latitude)) * cos(radians(h.longitude) - radians($3)) +
-              sin(radians($2)) * sin(radians(h.latitude))
-          )) AS distance_miles,
-          r.code_type,
-          r.code,
-          r.payer_name,
-          r.plan_name,
-          r.standard_charge_discounted_cash AS standard_charge_cash,
-          r.standard_charge_negotiated_dollar AS negotiated_dollar,
-          r.estimated_amount AS estimated_amount,
-          r.standard_charge_gross AS standard_charge_gross,
-          sv.variant_name AS variant_name,
-          sv.patient_summary AS variant_patient_summary,
-          CASE
-            WHEN $6 = 'insurance' THEN COALESCE(
-              r.standard_charge_negotiated_dollar,
-              r.estimated_amount,
-              r.standard_charge_discounted_cash,
-              r.standard_charge_gross
-            )
-            ELSE COALESCE(
-              r.standard_charge_discounted_cash,
-              r.estimated_amount,
-              r.standard_charge_gross
-            )
-          END AS best_price
-        FROM public.stg_hospital_rates r
-        LEFT JOIN public.hospitals h ON h.id = r.hospital_id
-        LEFT JOIN public.service_variants sv
-          ON sv.cpt_code = r.code
-        WHERE r.code_type ILIKE 'CPT'
-          AND r.code = $1
-          AND h.latitude IS NOT NULL AND h.longitude IS NOT NULL
-          AND ($4::text IS NULL OR r.payer_name ILIKE $7)
-          AND ($5::text IS NULL OR r.plan_name ILIKE $8)
-        ORDER BY distance_miles ASC NULLS LAST, best_price ASC NULLS LAST
-        LIMIT $9
-        """,
-        cpt_code, zlat, zlon, payer_like, plan_like, pm, payer_pat, plan_pat, limit,
-    )
-    return [dict(r) for r in rows]
-
-# ----------------------------
-# Service education bullets (service-specific, avoids colonoscopy-only text)
-# ----------------------------
-def build_service_education_bullets(service_query: str, payment_mode: str) -> List[str]:
-    q = (service_query or "").lower()
-
-    if "colonoscopy" in q:
-        return [
-            "- Colonoscopies can be **screening** (preventive) or **diagnostic** (symptoms/abnormal finding).",
-            "- Facility setting matters, **outpatient endoscopy centers** often differ from **hospital outpatient** pricing.",
-            "- If a biopsy or polyp removal happens, total cost can increase.",
-        ]
-
-    if "mri" in q:
-        return [
-            "- MRI prices vary by **body part** and whether it’s **with or without contrast**.",
-            "- Many totals include both the **technical** fee (scanner/facility) and the **professional** fee (radiologist read).",
-            "- If sedation is used, that can add to the total.",
-        ]
-
-    if "ct" in q or "cat scan" in q:
-        return [
-            "- CT prices vary by **body part** and whether it’s **with or without contrast**.",
-            "- If contrast is used, there may be additional charges for the contrast material and administration.",
-            "- Hospital outpatient CT is often priced differently than freestanding imaging centers.",
-        ]
-
-    if "x-ray" in q or "xray" in q:
-        return [
-            "- X-ray prices vary by **body part** and the number of views.",
-            "- There may be separate charges for the **facility** and the **radiologist interpretation**.",
-        ]
-
-    if "ultrasound" in q:
-        return [
-            "- Ultrasound prices vary by **body part** and whether it’s a **limited** vs **complete** study.",
-            "- Some totals include the **facility** fee and the **radiologist interpretation** separately.",
-        ]
-
-    return [
-        "- Prices can vary by facility setting (hospital outpatient vs freestanding clinic).",
-        "- Additional services (contrast, anesthesia, labs, interpretation fees) can change the total.",
-    ]
-
-# ----------------------------
 # Facility formatting
 # ----------------------------
 def _pick_price_fields(row: Dict[str, Any]) -> Optional[float]:
@@ -1676,7 +1226,6 @@ def build_facility_block(
     payment_mode: str,
     priced_results: List[Dict[str, Any]],
     fallback_hospitals: List[Dict[str, Any]],
-    variant_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """
     Returns (text_answer, facilities_payload_for_ui).
@@ -1719,24 +1268,15 @@ def build_facility_block(
     est_range = estimate_cost_range(service_query or "this service", payment_mode or "cash")
 
     # Build answer text
-    bullets = build_service_education_bullets(service_query or "this service", payment_mode or "cash")
+    bullets = []
+    bullets.append(f"- Colonoscopies can be **screening** (preventive) or **diagnostic** (symptoms/abnormal finding).")
+    bullets.append(f"- Facility setting matters: **outpatient endoscopy centers** often differ from **hospital outpatient** pricing.")
+    bullets.append(f"- If a biopsy or polyp removal happens, total cost can increase.")
 
     lines = []
-    # If we have a selected variant, show it clearly (and keep it patient-friendly).
-    if variant_info:
-        v_name = (variant_info.get("variant_name") or "").strip()
-        v_code = (variant_info.get("cpt_code") or variant_info.get("code") or "").strip()
-        v_sum = (variant_info.get("patient_summary") or variant_info.get("variant_patient_summary") or "").strip()
-        if v_name or v_code:
-            label = v_name if v_name else "Selected service"
-            code_txt = f" (CPT {v_code})" if v_code else ""
-            lines.append(f"Selected: **{label}**{code_txt}")
-            if v_sum:
-                lines.append(f"- {v_sum}")
-            lines.append("")
     lines.extend(bullets)
     lines.append("")
-    lines.append(f"Here are nearby options for **{service_query or 'this service'}** ({payment_mode}):")
+    lines.append(f"Here are nearby options for **{service_query or 'colonoscopy'}** ({payment_mode}):")
 
     for i, f in enumerate(facilities[:MIN_FACILITIES_TO_DISPLAY], start=1):
         name = _pick_hospital_name(f) if "hospital_name" not in f else (f.get("hospital_name") or _pick_hospital_name(f))
@@ -2005,85 +1545,6 @@ async def chat_stream(req: ChatRequest, request: Request):
                 merged = maybe_apply_preview_code(merged, refiner)
 
                 # ----------------------------
-                # CARE NAVIGATION (nearest hospital) - DB-first for ZIP lat/lon, then web
-                # ----------------------------
-                if is_care_navigation_message(req.message):
-                    zipcode = merged.get("zipcode")
-                    if not zipcode:
-                        merged["_awaiting"] = "zip"
-                        msg = "What’s your 5-digit ZIP code so I can find the nearest hospital or urgent care?"
-                        yield sse({"type": "delta", "text": msg})
-                        await save_message(conn, session_id, "assistant", msg, {"mode": "care_navigation"})
-                        await update_session_state(conn, session_id, merged)
-                        await log_query(conn, session_id, req.message, {"mode": "care_navigation"}, None, 0, True, msg)
-                        yield sse({"type": "final", "used_web_search": True})
-                        return
-
-                    # Clear awaiting ZIP if it was set
-                    if merged.get("_awaiting") == "zip":
-                        merged.pop("_awaiting", None)
-
-                    # 1) DB-first ZIP -> lat/lon, then web geocode fallback
-                    latlon = await get_zip_latlon(conn, zipcode)
-                    if not latlon:
-                        try:
-                            latlon = await geocode_zip_nominatim(zipcode)
-                        except Exception as e:
-                            logger.warning(f"Nominatim geocode failed: {e}")
-                            latlon = None
-
-                    if not latlon:
-                        msg = "I couldn’t locate that ZIP code. Can you double-check it (5 digits)?"
-                        yield sse({"type": "delta", "text": msg})
-                        await save_message(conn, session_id, "assistant", msg, {"mode": "care_navigation"})
-                        await update_session_state(conn, session_id, merged)
-                        await log_query(conn, session_id, req.message, {"mode": "care_navigation"}, None, 0, True, msg)
-                        yield sse({"type": "final", "used_web_search": True})
-                        return
-
-                    zlat, zlon = latlon
-
-                    # 2) Web: find nearest hospitals/urgent care
-                    try:
-                        places = await find_nearest_hospitals_overpass(zlat, zlon, limit=WEB_NEAREST_FACILITY_LIMIT)
-                    except Exception as e:
-                        logger.warning(f"Overpass lookup failed: {e}")
-                        places = []
-
-                    safety = (
-                        "If your pain is severe, you can’t bear weight, you have major swelling, fever, numbness, "
-                        "deformity, or you think it’s an emergency, call local emergency services."
-                    )
-
-                    if not places:
-                        msg = (
-                            safety
-                            + "\n\nI couldn’t find nearby hospitals online right now. If you tell me your city, I can try again."
-                        )
-                        yield sse({"type": "delta", "text": msg})
-                        await save_message(conn, session_id, "assistant", msg, {"mode": "care_navigation", "used_web": True})
-                        await update_session_state(conn, session_id, merged)
-                        await log_query(conn, session_id, req.message, {"mode": "care_navigation"}, None, 0, True, msg)
-                        yield sse({"type": "final", "used_web_search": True})
-                        return
-
-                    lines = [safety, "", f"Nearest hospitals/urgent care near **{zipcode}**:"]
-                    for i, p in enumerate(places, start=1):
-                        dist = f"{float(p.get('distance_miles') or 0):.1f} mi"
-                        addr = p.get("address") or "Address not available"
-                        phone = p.get("phone") or ""
-                        lines.append(f"{i}) **{p.get('name') or 'Hospital/Clinic'}** ({dist})")
-                        lines.append(f"   - {addr}" + (f" | Tel: {phone}" if phone else ""))
-
-                    msg = "\n".join(lines)
-                    yield sse({"type": "delta", "text": msg})
-                    await save_message(conn, session_id, "assistant", msg, {"mode": "care_navigation", "used_web": True})
-                    await update_session_state(conn, session_id, merged)
-                    await log_query(conn, session_id, req.message, {"mode": "care_navigation"}, None, len(places), True, msg)
-                    yield sse({"type": "final", "used_web_search": True})
-                    return
-
-                # ----------------------------
                 # GENERAL mode
                 # ----------------------------
                 if mode == "general":
@@ -2102,87 +1563,108 @@ async def chat_stream(req: ChatRequest, request: Request):
                 # PRICE / HYBRID mode (deterministic, DB-first)
                 # ----------------------------
                 if mode in ["price", "hybrid"]:
+
+                    # Universal Variant-First Gate (DB)
+                    # Do not collect ZIP/payment or price until a CPT-backed variant is confirmed.
+                    # 1) Handle pending confirmation
+                    if merged.get("_awaiting") == "variant_confirm" and isinstance(merged.get("_variant_confirm_choice"), dict):
+                        ans = (req.message or "").strip().lower()
+                        if ans in {"yes", "y", "yeah", "yep", "correct", "right", "ok", "okay"}:
+                            choice = merged["_variant_confirm_choice"]
+                            merged["code_type"] = "CPT"
+                            merged["code"] = choice.get("cpt_code")
+                            merged["variant_id"] = choice.get("id")
+                            merged["service_query"] = choice.get("variant_name") or merged.get("service_query")
+                            merged.pop("_awaiting", None)
+                            merged.pop("_variant_confirm_choice", None)
+                        elif ans in {"no", "n", "nope", "incorrect", "wrong"}:
+                            merged["_awaiting"] = "service_variant_text"
+                            merged.pop("_variant_confirm_choice", None)
+                            msg = "Got it. Tell me the specific service in a few words (include body part, with/without contrast, views, or screening vs diagnostic if relevant)."
+                            yield sse({"type": "delta", "text": msg})
+                            await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_variant"})
+                            await update_session_state(conn, session_id, merged)
+                            yield sse({"type": "final", "used_web_search": False})
+                            return
+
+                    # 2) Handle numbered selection
+                    if merged.get("_awaiting") == "service_variant" and isinstance(merged.get("_variant_choices"), list):
+                        merged = apply_service_variant_choice(req.message, merged, merged.get("_variant_choices") or [])
+
+                    # 3) Handle free-text refinement (we'll search again using this)
+                    if merged.get("_awaiting") == "service_variant_text":
+                        free = (req.message or "").strip()
+                        if free:
+                            merged["variant_free_text"] = free
+                            merged.pop("_awaiting", None)
+
+                    # 4) If we still don't have a CPT, search service_variants using the user text and gate here.
+                    if not (merged.get("code_type") and merged.get("code")) and merged.get("variant_id") is None:
+                        query_text = (merged.get("variant_free_text") or merged.get("service_query") or req.message or "").strip()
+                        candidates = await get_service_variants_by_text(conn, query_text, limit=15)
+
+                        seen = set()
+                        uniq = []
+                        for c in candidates:
+                            key = (str(c.get("cpt_code") or ""), str(c.get("variant_name") or ""))
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            uniq.append(c)
+
+                        if len(uniq) == 1:
+                            merged["_awaiting"] = "variant_confirm"
+                            merged["_variant_confirm_choice"] = {
+                                "id": uniq[0].get("id"),
+                                "cpt_code": uniq[0].get("cpt_code"),
+                                "variant_name": uniq[0].get("variant_name"),
+                            }
+                            msg = build_variant_confirm_prompt(uniq[0])
+                            yield sse({"type": "delta", "text": msg})
+                            await save_message(conn, session_id, "assistant", msg, {"mode": "confirm_variant"})
+                            await update_session_state(conn, session_id, merged)
+                            yield sse({"type": "final", "used_web_search": False})
+                            return
+
+                        if len(uniq) > 1:
+                            merged["_awaiting"] = "service_variant"
+                            merged["_variant_choices"] = [
+                                {
+                                    "id": u.get("id"),
+                                    "parent_service": u.get("parent_service"),
+                                    "cpt_code": u.get("cpt_code"),
+                                    "variant_name": u.get("variant_name"),
+                                    "patient_summary": u.get("patient_summary"),
+                                    "is_preventive": u.get("is_preventive"),
+                                    "cpt_explanation": u.get("cpt_explanation"),
+                                }
+                                for u in uniq[:10]
+                            ]
+                            label = (merged.get("service_query") or "this service")
+                            msg = build_variant_options_prompt(label, merged["_variant_choices"])
+                            yield sse({"type": "delta", "text": msg})
+                            await save_message(conn, session_id, "assistant", msg, {"mode": "choose_variant"})
+                            await update_session_state(conn, session_id, merged)
+                            yield sse({"type": "final", "used_web_search": False})
+                            return
+
+                        merged["_awaiting"] = "service_variant_text"
+                        msg = (
+                            "I can price this, but I need a bit more detail on the exact service. "
+                            "For example: body part, with/without contrast, number of views, screening vs diagnostic, or the test name your clinician ordered."
+                        )
+                        yield sse({"type": "delta", "text": msg})
+                        await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_variant"})
+                        await update_session_state(conn, session_id, merged)
+                        yield sse({"type": "final", "used_web_search": False})
+                        return
+
                     # Gate 0: need a service (or a code)
                     if not (merged.get("service_query") or "").strip() and not (merged.get("code_type") and merged.get("code")):
                         # Try deterministic inference for common services
                         inferred = infer_service_query_from_message(req.message)
                         if inferred:
                             merged["service_query"] = inferred
-
-
-                    # Variant-first (DB): for imaging services (MRI/CT/X-ray/Ultrasound), ask the user to pick a specific variant
-                    # BEFORE collecting ZIP or doing any pricing lookup.
-                    parent_service = infer_parent_service_key((merged.get("service_query") or "").strip())
-                    if parent_service:
-                        generic_imaging = is_generic_imaging_request(req.message, parent_service)
-                        # If we're awaiting a variant choice (numeric), try to apply it.
-                        if merged.get("_awaiting") == "service_variant" and isinstance(merged.get("_variant_choices"), list):
-                            merged = apply_service_variant_choice(req.message, merged, merged.get("_variant_choices") or [])
-
-                        # If we're awaiting a free-text variant, accept it and proceed (still before ZIP).
-                        if merged.get("_awaiting") == "service_variant_text":
-                            free = (req.message or "").strip()
-                            if free:
-                                merged["variant_free_text"] = free
-                                merged["service_query"] = f"{parent_service.upper()}: {free}"
-                                merged.pop("_awaiting", None)
-
-                        # If no CPT code yet, prompt for variant now (and do not collect ZIP yet).
-                        if not (merged.get("code_type") and merged.get("code")) and merged.get("variant_id") is None and not merged.get("variant_free_text"):
-                            variants = await get_service_variants_for_parent(conn, parent_service)
-
-                            lite = []
-                            for v in variants:
-                                lite.append(
-                                    {
-                                        "id": v.get("id"),
-                                        "parent_service": v.get("parent_service"),
-                                        "cpt_code": v.get("cpt_code"),
-                                        "variant_name": v.get("variant_name"),
-                                        "patient_summary": v.get("patient_summary"),
-                                        "is_preventive": v.get("is_preventive"),
-                                    }
-                                )
-
-                            # If the user asked generically (e.g., "How much is an MRI?"),
-                            # require a variant selection even if the DB only has 1 variant.
-                            if len(lite) >= 1 and generic_imaging:
-                                merged["_variant_choices"] = lite
-                                merged["_awaiting"] = "service_variant"
-                                msg = build_service_variant_prompt(parent_service, lite)
-                                yield sse({"type": "delta", "text": msg})
-                                await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_service_variant", "intent": intent})
-                                await update_session_state(conn, session_id, merged)
-                                await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-                                yield sse({"type": "final", "used_web_search": False})
-                                return
-
-                            if len(lite) >= 2:
-                                merged["_variant_choices"] = lite
-                                merged["_awaiting"] = "service_variant"
-                                msg = build_service_variant_prompt(parent_service, lite)
-                                yield sse({"type": "delta", "text": msg})
-                                await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_service_variant", "intent": intent})
-                                await update_session_state(conn, session_id, merged)
-                                await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-                                yield sse({"type": "final", "used_web_search": False})
-                                return
-
-                            if len(lite) == 1:
-                                merged = apply_service_variant_choice("1", merged, lite)
-
-                            if len(lite) == 0:
-                                merged["_awaiting"] = "service_variant_text"
-                                msg = build_generic_imaging_variant_prompt(parent_service)
-                                yield sse({"type": "delta", "text": msg})
-                                await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_service_variant", "intent": intent})
-                                await update_session_state(conn, session_id, merged)
-                                await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
-                                yield sse({"type": "final", "used_web_search": False})
-                                return
-
-                        if merged.get("variant_name") and parent_service:
-                            merged["service_query"] = f"{parent_service.upper()}: {merged.get('variant_name')}"
 
                     # Gate 1: ZIP required
                     zipcode = merged.get("zipcode")
@@ -2256,68 +1738,29 @@ async def chat_stream(req: ChatRequest, request: Request):
 
                     # If code is still missing, ask for more detail
                     if not (merged.get("code_type") and merged.get("code")):
-                        parent = (merged.get("parent_service") or "").strip()
-                        variants: List[Dict[str, Any]] = []
-                        if parent:
-                            try:
-                                variants = await get_service_variants_for_parent(conn, parent)
-                            except Exception:
-                                variants = []
-                        if variants:
-                            msg = build_service_variant_prompt(parent, variants[:8])
-                            merged["awaiting_service_variant"] = True
-                            merged["service_variant_parent"] = parent
-                            merged["service_variant_options"] = [
-                                (v.get("variant_name") or "").strip() for v in variants[:8]
-                            ]
-                        else:
-                            msg = "I can price this, but I need a bit more detail on the exact service. What exactly is being ordered?"
+                        msg = "I can price this, but I need a bit more detail on the exact service. What exactly is being ordered?"
                         yield sse({"type": "delta", "text": msg})
                         await save_message(conn, session_id, "assistant", msg, {"mode": "clarify_service_detail", "intent": intent})
                         await update_session_state(conn, session_id, merged)
                         await log_query(conn, session_id, req.message, intent, None, 0, False, msg)
                         yield sse({"type": "final", "used_web_search": False})
                         return
-                    # ---- PRICED LOOKUP (DB-first) ----
-                    # 1) Try the staging table + variants explanation first (stg_hospital_rates JOIN service_variants)
-                    results: List[Dict[str, Any]] = []
-                    used_max_radius = None
 
-                    if (merged.get("code_type") or "").upper() == "CPT" and (merged.get("code") or "").strip():
-                        try:
-                            results = await price_lookup_staging_by_cpt_with_variants(
-                                conn,
-                                merged["zipcode"],
-                                str(merged["code"]).strip(),
-                                payment_mode=merged.get("payment_mode") or "cash",
-                                payer_like=merged.get("payer_like"),
-                                plan_like=merged.get("plan_like"),
-                                limit=max(25, MIN_FACILITIES_TO_DISPLAY * 10),
-                            )
-                        except Exception as e:
-                            logger.warning(f"Staging CPT lookup failed: {e}")
-                            results = []
+                    # ---- PRICED LOOKUP (geo-first, progressive radius) ----
+                    results, used_max_radius = await price_lookup_progressive(
+                        conn,
+                        merged["zipcode"],
+                        merged["code_type"],
+                        merged["code"],
+                        merged.get("service_query") or "",
+                        merged.get("payer_like"),
+                        merged.get("plan_like"),
+                        merged.get("payment_mode") or "cash",
+                    )
 
-                    # 2) If staging does not have enough, fall back to existing normalized pricing lookup
-                    if len(results) < MIN_DB_RESULTS_BEFORE_WEB:
-                        results, used_max_radius = await price_lookup_progressive(
-                            conn,
-                            merged["zipcode"],
-                            merged["code_type"],
-                            merged["code"],
-                            merged.get("service_query") or "",
-                            merged.get("payer_like"),
-                            merged.get("plan_like"),
-                            merged.get("payment_mode") or "cash",
-                        )
                     # Always fetch at least 5 facilities for display
                     try:
-                        # Pull more than we need so de-duping can still leave us with >= MIN_FACILITIES_TO_DISPLAY.
-                        nearby_hospitals = await get_nearby_hospitals(
-                            conn,
-                            merged["zipcode"],
-                            limit=max(20, MIN_FACILITIES_TO_DISPLAY * 5),
-                        )
+                        nearby_hospitals = await get_nearby_hospitals(conn, merged["zipcode"], limit=MIN_FACILITIES_TO_DISPLAY)
                     except Exception as e:
                         logger.warning(f"Nearby hospitals lookup failed: {e}")
                         nearby_hospitals = []
@@ -2327,11 +1770,6 @@ async def chat_stream(req: ChatRequest, request: Request):
                         payment_mode=merged.get("payment_mode") or "cash",
                         priced_results=results,
                         fallback_hospitals=nearby_hospitals,
-                        variant_info={
-                            "variant_name": merged.get("variant_name"),
-                            "cpt_code": merged.get("code"),
-                            "patient_summary": merged.get("variant_patient_summary"),
-                        } if merged.get("variant_name") or merged.get("variant_patient_summary") else None,
                     )
 
                     yield sse(
@@ -2373,7 +1811,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     )
                     await update_session_state(conn, session_id, merged)
 
-                    used_web = False
+                    used_web = len(results) < MIN_DB_RESULTS_BEFORE_WEB
                     await log_query(conn, session_id, req.message, intent, used_max_radius, len(results), used_web, full_answer)
                     yield sse({"type": "final", "used_web_search": used_web})
                     return
