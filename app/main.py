@@ -1514,7 +1514,7 @@ def infer_service_query_from_message(message: str) -> Optional[str]:
         return "office visit"
     return None
 
-h
+
 def should_force_price_mode(message: str, merged: Dict[str, Any]) -> bool:
     if not INTENT_OVERRIDE_FORCE_PRICE_ENABLED:
         return False
