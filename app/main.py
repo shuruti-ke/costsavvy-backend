@@ -1425,32 +1425,100 @@ async def get_nearby_hospitals(conn: asyncpg.Connection, zipcode: str, limit: in
 
 
 # ----------------------------
-# Estimated range (when DB price missing)
+# Web-search price lookup (replaces hallucinated estimates)
 # ----------------------------
-def estimate_cost_range(service_query: str, payment_mode: str) -> str:
+async def web_search_price_range(
+    service_query: str,
+    cpt_code: Optional[str],
+    zipcode: str,
+    payment_mode: str,
+) -> Optional[str]:
     """
-    Returns a short '$X–$Y' range, explicitly an estimate.
-    This is used ONLY when DB pricing is missing.
+    Search the web for real published hospital prices for this service/CPT
+    near the given ZIP. Returns a price-range string extracted from actual
+    search results (e.g. "$800–$2,400") or None if nothing credible is found.
+    Never invents numbers — only returns what is explicitly in the snippets.
     """
-    system = (
-        "You output ONLY a short numeric range for a U.S. healthcare service.\n"
-        "Format: '$X–$Y'. No extra text.\n"
-        "Be conservative and plausible."
+    if not WEB_SEARCH_ENABLED or not (BRAVE_API_KEY or SERPER_API_KEY):
+        return None
+
+    cpt_part = f"CPT {cpt_code}" if cpt_code else ""
+    query = (
+        f"{service_query} {cpt_part} hospital price transparency "
+        f"{zipcode} cash price 2024 2025"
+    ).strip()
+
+    snippets: List[str] = []
+
+    if BRAVE_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=WEB_SEARCH_TIMEOUT) as hc:
+                resp = await hc.get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    headers={"X-Subscription-Token": BRAVE_API_KEY},
+                    params={"q": query, "count": 10},
+                )
+                if resp.status_code == 200:
+                    for item in resp.json().get("web", {}).get("results", [])[:10]:
+                        t = item.get("title", "")
+                        s = item.get("description", "")
+                        if t or s:
+                            snippets.append(f"{t}: {s}")
+        except Exception as e:
+            logger.warning(f"Brave price search failed: {e}")
+
+    if not snippets and SERPER_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=WEB_SEARCH_TIMEOUT) as hc:
+                resp = await hc.post(
+                    "https://google.serper.dev/search",
+                    headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                    json={"q": query, "num": 10},
+                )
+                if resp.status_code == 200:
+                    for item in resp.json().get("organic", [])[:10]:
+                        t = item.get("title", "")
+                        s = item.get("snippet", "")
+                        if t or s:
+                            snippets.append(f"{t}: {s}")
+        except Exception as e:
+            logger.warning(f"Serper price search failed: {e}")
+
+    if not snippets:
+        return None
+
+    # Ask LLM to extract a price ONLY from snippets — not invent one
+    combined = "\n".join(snippets[:10])
+    system_msg = (
+        "You extract a price range from web search snippets for a US healthcare service. "
+        "Output ONLY a '$X–$Y' range if real dollar amounts appear in the snippets. "
+        "If no dollar amounts are mentioned, output exactly: NONE. "
+        "Do not invent or estimate numbers."
     )
-    user = json.dumps({"service": service_query, "payment_mode": payment_mode})
+    user_msg = (
+        f"Service: {service_query} {cpt_part}\n"
+        f"Payment: {payment_mode}\n"
+        f"ZIP: {zipcode}\n\n"
+        f"Search snippets:\n{combined}"
+    )
     try:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            timeout=12,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            timeout=15,
         )
         txt = (resp.choices[0].message.content or "").strip()
-        # basic sanity
-        if "$" in txt and any(ch.isdigit() for ch in txt):
+        if txt.upper() == "NONE" or "$" not in txt:
+            return None
+        if any(ch.isdigit() for ch in txt):
             return txt
-        return "$1,000–$3,000"
-    except Exception:
-        return "$1,000–$3,000"
+    except Exception as e:
+        logger.warning(f"Price extraction from web snippets failed: {e}")
+
+    return None
 
 
 # ----------------------------
@@ -1690,6 +1758,7 @@ def build_facility_block(
     user_lat: Optional[float] = None,
     user_lon: Optional[float] = None,
     user_zipcode: str = "",
+    web_price_range: Optional[str] = None,
 ) -> Tuple[str, List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
     Returns (text_answer, facilities_payload_for_ui, map_data).
@@ -1730,7 +1799,7 @@ def build_facility_block(
         )
 
     # Prepare an estimate range if needed
-    est_range = estimate_cost_range(service_query or "this service", payment_mode or "cash")
+    est_range = web_price_range  # None = no price found; never hallucinate
 
     # Build answer text
     bullets = build_service_education_bullets(service_query or "this service", payment_mode or "cash")
@@ -1754,10 +1823,13 @@ def build_facility_block(
         price = _pick_price_fields(f)
         if price is not None:
             price_txt = _format_money(price)
-            price_note = "DB price"
-        else:
+            price_note = "verified price"
+        elif est_range:
             price_txt = est_range
-            price_note = "ESTIMATE (no DB price yet)"
+            price_note = "web research — verify with facility"
+        else:
+            price_txt = "Contact facility for pricing"
+            price_note = "no published price found"
 
         detail_bits = []
         if addr:
@@ -1792,8 +1864,9 @@ def build_facility_block(
                 "phone": f.get("phone") or _pick_phone(f),
                 "distance_miles": f.get("distance_miles") or f.get("distance"),
                 "price": _pick_price_fields(f),
-                "estimated_range": None if _pick_price_fields(f) is not None else est_range,
+                "estimated_range": None if _pick_price_fields(f) is not None else (est_range or "Contact facility for pricing"),
                 "price_is_estimate": _pick_price_fields(f) is None,
+                "price_from_web": _pick_price_fields(f) is None and est_range is not None,
                 "latitude": f.get("latitude"),
                 "longitude": f.get("longitude"),
             }
@@ -2744,6 +2817,20 @@ async def chat_stream(req: ChatRequest, request: Request):
                     except Exception as e:
                         logger.warning(f"Failed to get user coordinates: {e}")
 
+                    # Search web for real prices when DB has none
+                    web_price = None
+                    has_db_prices = any(_pick_price_fields(r) is not None for r in results)
+                    if not has_db_prices and WEB_SEARCH_ENABLED and (BRAVE_API_KEY or SERPER_API_KEY):
+                        try:
+                            web_price = await web_search_price_range(
+                                service_query=merged.get("service_query") or "",
+                                cpt_code=merged.get("code") if merged.get("code_type") == "CPT" else None,
+                                zipcode=merged.get("zipcode") or "",
+                                payment_mode=merged.get("payment_mode") or "cash",
+                            )
+                        except Exception as _wse:
+                            logger.warning(f"web_search_price_range failed: {_wse}")
+
                     facility_text, facility_payload, map_data = build_facility_block(
                         service_query=merged.get("service_query") or "this service",
                         payment_mode=merged.get("payment_mode") or "cash",
@@ -2752,6 +2839,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                         user_lat=user_lat,
                         user_lon=user_lon,
                         user_zipcode=merged.get("zipcode") or "",
+                        web_price_range=web_price,
                     )
 
                     yield sse(
