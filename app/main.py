@@ -47,7 +47,11 @@ NEARBY_COORD_LOOKUP_LIMIT = int(
 # Web search configuration for health education
 WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "true").lower() in ("1", "true", "yes", "y", "on")
 WEB_SEARCH_TIMEOUT = int(os.getenv("WEB_SEARCH_TIMEOUT", "15"))
-BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "").strip()
+BRAVE_API_KEY = (
+    os.getenv("BRAVE_API_KEY", "").strip()
+    or os.getenv("Brave_API_Key", "").strip()
+    or os.getenv("BRAVE_KEY", "").strip()
+)
 TAVILY_API_KEY = (
     os.getenv("TAVILY_API_KEY", "").strip()
     or os.getenv("Tavily_API_Key", "").strip()
@@ -442,26 +446,29 @@ def _parse_facility_web_prices_batch_llm(
     hospital_snippets: List[Tuple[str, List[Dict[str, Any]]]],
     service_query: str,
     payment_mode: str,
-) -> Dict[str, Optional[float]]:
+) -> Dict[str, float]:
     """One structured pass over all snippets; returns normalized-hospital-key -> USD price."""
     if not hospital_snippets:
         return {}
     blocks = []
     for hosp, results in hospital_snippets:
         body = "\n".join(
-            f"- {r.get('title', '')}: {r.get('snippet', '')}" for r in (results or [])[:6]
+            f"- {r.get('title', '')}: {r.get('snippet', '')}" for r in (results or [])[:10]
         )
         blocks.append(f'### "{hosp}"\n{body}')
     user = (
         f"Service: {service_query}\nPayment context: {payment_mode}\n\n" + "\n\n".join(blocks)
     )
+    n = len(hospital_snippets)
     system = (
-        "You read web search snippets about U.S. hospital pricing. For each ### hospital section, "
-        "extract ONE numeric USD price only if snippets clearly cite an amount for that specific hospital "
+        "You read web search snippets about U.S. hospital pricing. There is one ### hospital section in order; "
+        f"the user message has exactly {n} sections. "
+        "For each section, extract ONE numeric USD price only if snippets clearly cite an amount for that specific hospital "
         "(or its published price list / chargemaster / CDM for this service). "
         "Do not guess from unrelated facilities or generic national averages unless clearly tied to that hospital. "
-        'Return JSON only: an array [{"hospital":"<exact heading name>","price_usd":number|null}, ...] '
-        'in the same order as sections. Use null when unclear.'
+        f'Return JSON only: an array of exactly {n} objects '
+        '[{"hospital":"<exact heading name>","price_usd":number|null}, ...] '
+        "in the SAME order as the ### sections (first object = first hospital). Use null when unclear."
     )
     try:
         resp = client.chat.completions.create(
@@ -480,12 +487,19 @@ def _parse_facility_web_prices_batch_llm(
     by_key: Dict[str, float] = {}
     if not isinstance(arr, list):
         return {}
-    for entry in arr:
+    for i, entry in enumerate(arr):
         if not isinstance(entry, dict):
             continue
-        name = (entry.get("hospital") or "").strip()
         p = entry.get("price_usd")
-        if name and isinstance(p, (int, float)) and p > 0:
+        if not isinstance(p, (int, float)) or p <= 0:
+            continue
+        if i < len(hospital_snippets):
+            anchor = (hospital_snippets[i][0] or "").strip()
+            if anchor:
+                by_key[_normalize_hospital_key(anchor)] = float(p)
+                continue
+        name = (entry.get("hospital") or "").strip()
+        if name:
             by_key[_normalize_hospital_key(name)] = float(p)
     return by_key
 
@@ -596,6 +610,15 @@ async def attach_web_prices_to_facility_results(
 
     pairs = await asyncio.gather(*[fetch_one(r) for r in targets])
     key_to_price = _parse_facility_web_prices_batch_llm(pairs, service_query, payment_mode)
+    missing_pairs = [
+        (hn, sn)
+        for hn, sn in pairs
+        if _normalize_hospital_key(hn) not in key_to_price
+    ]
+    if missing_pairs:
+        key_to_price.update(
+            _parse_facility_web_prices_batch_llm(missing_pairs, service_query, payment_mode)
+        )
 
     for r in targets:
         k = _normalize_hospital_key(_pick_hospital_name(r))
@@ -746,6 +769,138 @@ async def lookup_service_explanation(conn: asyncpg.Connection, topic: str) -> Op
         }
     
     return None
+
+
+async def lookup_procedure_display_for_cpt(conn: asyncpg.Connection, cpt_code: str) -> Optional[str]:
+    """Patient-facing procedure name for results heading when the user searched by CPT only."""
+    code = (cpt_code or "").strip()
+    if not code:
+        return None
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT COALESCE(
+                NULLIF(TRIM(sv.variant_name), ''),
+                NULLIF(TRIM(s.service_description), ''),
+                NULLIF(TRIM(s.cpt_explanation), '')
+            ) AS lbl
+            FROM public.service_variants sv
+            LEFT JOIN public.services s ON s.code = sv.cpt_code AND s.code_type = 'CPT'
+            WHERE sv.cpt_code = $1
+            ORDER BY sv.id ASC
+            LIMIT 1
+            """,
+            code,
+        )
+        if row and row["lbl"]:
+            return str(row["lbl"]).strip()
+        row2 = await conn.fetchrow(
+            """
+            SELECT COALESCE(
+                NULLIF(TRIM(service_description), ''),
+                NULLIF(TRIM(cpt_explanation), '')
+            ) AS lbl
+            FROM public.services
+            WHERE code_type = 'CPT' AND code = $1
+            LIMIT 1
+            """,
+            code,
+        )
+        if row2 and row2["lbl"]:
+            return str(row2["lbl"]).strip()
+    except Exception as e:
+        logger.warning(f"CPT procedure label lookup failed: {e}")
+    return None
+
+
+def _extract_cpt_procedure_name_from_web_snippets(cpt_code: str, results: List[Dict[str, Any]]) -> Optional[str]:
+    """Use snippets from authoritative coding / Medicare sources; no name without snippet support."""
+    code = (cpt_code or "").strip()
+    if not code or not results:
+        return None
+    lines = []
+    for r in results[:8]:
+        url = ((r.get("url") or "")[:180]).strip()
+        title = (r.get("title") or "")[:400]
+        snip = (r.get("snippet") or "")[:1200]
+        lines.append(f"URL: {url}\nTitle: {title}\nSnippet: {snip}")
+    ctx = "\n\n".join(lines)
+    system = (
+        "You read web search snippets that may quote CPT (Current Procedural Terminology) descriptors. "
+        "CPT is AMA-copyrighted; only use wording clearly tied to the requested code in the snippets. "
+        f"For CPT code {code}, return a concise procedure title ONLY if the snippets explicitly describe "
+        "what that code represents. Do not invent or copy unrelated procedures. "
+        'Return JSON only: {"procedure_name": string|null} — procedure_name: max 18 words, Title Case, '
+        "must not contain the CPT numeric code."
+    )
+    user = f"CPT code: {code}\n\n--- Snippets ---\n{ctx}"
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            timeout=25,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
+        raw = re.sub(r"\s*```\s*$", "", raw)
+        obj = json.loads(raw)
+        if not isinstance(obj, dict):
+            return None
+        name = (obj.get("procedure_name") or "").strip()
+        if not name or name.lower() == "null":
+            return None
+        if code in name:
+            return None
+        return name[:240]
+    except Exception as e:
+        logger.warning(f"CPT web snippet parse failed: {e}")
+        return None
+
+
+async def lookup_cpt_descriptor_via_web(cpt_code: str) -> Optional[str]:
+    """
+    When services/service_variants have no row, resolve a display name from the web.
+    Search is biased toward CMS/Medicare and established coding-reference domains.
+    """
+    code = (cpt_code or "").strip()
+    if not code:
+        return None
+    if not WEB_SEARCH_ENABLED or not (BRAVE_API_KEY or TAVILY_API_KEY):
+        return None
+
+    query = (
+        f"CPT code {code} procedure descriptor "
+        "site:cms.gov OR site:medicare.gov OR site:aapc.com OR site:findacode.com OR site:ama-assn.org"
+    )
+    results: List[Dict[str, Any]] = []
+    if BRAVE_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=WEB_SEARCH_TIMEOUT) as http:
+                resp = await http.get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    headers={"X-Subscription-Token": BRAVE_API_KEY},
+                    params={"q": query, "count": 8},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for item in data.get("web", {}).get("results", [])[:8]:
+                        results.append(
+                            {
+                                "title": item.get("title", ""),
+                                "snippet": item.get("description", ""),
+                                "url": item.get("url", ""),
+                                "source": "brave",
+                            }
+                        )
+        except Exception as e:
+            logger.warning(f"Brave CPT descriptor search failed: {e}")
+
+    if not results and TAVILY_API_KEY:
+        results = await _tavily_search(query, num_results=8)
+
+    if not results:
+        return None
+    return _extract_cpt_procedure_name_from_web_snippets(code, results)
 
 
 async def generate_health_education_response(
@@ -2107,6 +2262,7 @@ def build_facility_block(
     web_facility_catalog: Optional[List[Dict[str, Any]]] = None,
     procedure_code: Optional[str] = None,
     prefer_web_sourced_prices: bool = False,
+    procedure_display_name: Optional[str] = None,
 ) -> Tuple[str, List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
     Returns (text_answer, facilities_payload_for_ui, map_data).
@@ -2265,6 +2421,11 @@ def build_facility_block(
             payment_mode or "cash",
             prefer_web_sourced_prices,
         )
+        if map_data is not None:
+            if procedure_display_name:
+                map_data["procedure_display_name"] = procedure_display_name.strip()
+            if procedure_code:
+                map_data["procedure_code"] = str(procedure_code).strip()
 
     return "\n".join(lines), ui_payload, map_data
 
@@ -3223,6 +3384,13 @@ async def chat_stream(req: ChatRequest, request: Request):
                     except Exception as e:
                         logger.warning(f"Failed to get user coordinates: {e}")
 
+                    procedure_display_name: Optional[str] = None
+                    if (merged.get("code_type") or "").upper() == "CPT" and merged.get("code"):
+                        cpt_c = str(merged.get("code") or "")
+                        procedure_display_name = await lookup_procedure_display_for_cpt(conn, cpt_c)
+                        if not procedure_display_name:
+                            procedure_display_name = await lookup_cpt_descriptor_via_web(cpt_c)
+
                     facility_text, facility_payload, map_data = build_facility_block(
                         service_query=merged.get("service_query") or "this service",
                         payment_mode=merged.get("payment_mode") or "cash",
@@ -3234,7 +3402,27 @@ async def chat_stream(req: ChatRequest, request: Request):
                         web_facility_catalog=web_facility_catalog if web_facility_catalog else None,
                         procedure_code=merged.get("code"),
                         prefer_web_sourced_prices=prefer_web_sourced_prices,
+                        procedure_display_name=procedure_display_name,
                     )
+
+                    state_out = {
+                        k: merged.get(k)
+                        for k in [
+                            "zipcode",
+                            "payment_mode",
+                            "payer_like",
+                            "plan_like",
+                            "service_query",
+                            "code_type",
+                            "code",
+                            "refiner_id",
+                            "refiner_choice",
+                        ]
+                    }
+                    if procedure_display_name:
+                        state_out["procedure_display_name"] = procedure_display_name
+                    if merged.get("code"):
+                        state_out["procedure_code"] = merged.get("code")
 
                     yield sse(
                         {
@@ -3243,20 +3431,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                             "facilities": facility_payload,
                             "web_facility_prices": web_facility_catalog,
                             "map_data": map_data,
-                            "state": {
-                                k: merged.get(k)
-                                for k in [
-                                    "zipcode",
-                                    "payment_mode",
-                                    "payer_like",
-                                    "plan_like",
-                                    "service_query",
-                                    "code_type",
-                                    "code",
-                                    "refiner_id",
-                                    "refiner_choice",
-                                ]
-                            },
+                            "state": state_out,
                         }
                     )
                     yield sse({"type": "delta", "text": facility_text})

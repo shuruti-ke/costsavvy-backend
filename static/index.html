@@ -473,7 +473,7 @@
                 if (data.mapData && data.facilities.length > 0) {
                     currentMapData = data.mapData; currentFacilities = data.facilities;
                     currentWebFacilityPrices = data.webFacilityPrices || [];
-                    displayResults(data.mapData, data.facilities, resolvedLabel, currentWebFacilityPrices);
+                    displayResults(data.mapData, data.facilities, resolvedLabel, currentWebFacilityPrices, data.resultState);
                 }
                 // Only show error if no text response AND no results (true error case)
                 if (!data.text && (!data.mapData || data.facilities.length === 0)) {
@@ -504,7 +504,7 @@
                 if (data.mapData && data.facilities.length > 0) {
                     currentMapData = data.mapData; currentFacilities = data.facilities;
                     currentWebFacilityPrices = data.webFacilityPrices || [];
-                    displayResults(data.mapData, data.facilities, null, currentWebFacilityPrices);
+                    displayResults(data.mapData, data.facilities, null, currentWebFacilityPrices, data.resultState);
                 }
             } catch (error) {
                 typingIndicator.classList.remove('active');
@@ -553,10 +553,24 @@
         
         function scrollToBottom() { chatMessages.scrollTop = chatMessages.scrollHeight; }
         
-        function displayResults(mapData, facilities, serviceName, webFacilityPrices) {
+        function displayResults(mapData, facilities, serviceName, webFacilityPrices, resultState) {
             resultsSection.classList.add('active');
-            const service = serviceName || (mapData.service_query ? mapData.service_query.charAt(0).toUpperCase() + mapData.service_query.slice(1) : 'Healthcare Service');
-            resultsTitle.textContent = `Results for ${service}`;
+            const st = resultState || {};
+            const md = mapData || {};
+            const cptCode = (st.code || md.procedure_code || '').toString().trim();
+            const procName = (st.procedure_display_name || md.procedure_display_name || '').trim();
+            let titleBody = (serviceName || '').trim();
+            if (procName && cptCode) {
+                titleBody = `${procName}, CPT code ${cptCode}`;
+            } else if (!titleBody) {
+                titleBody = md.service_query
+                    ? md.service_query.charAt(0).toUpperCase() + md.service_query.slice(1)
+                    : 'Healthcare Service';
+                if (cptCode && titleBody && !/CPT\s+code/i.test(titleBody)) {
+                    titleBody = `${titleBody}, CPT code ${cptCode}`;
+                }
+            }
+            resultsTitle.textContent = `Results for ${titleBody}`;
             resultsCount.textContent = `${facilities.length} ${facilities.length === 1 ? 'facility' : 'facilities'}`;
             renderWebSearchList(webFacilityPrices && webFacilityPrices.length ? webFacilityPrices : []);
 
