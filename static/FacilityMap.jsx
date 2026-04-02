@@ -23,13 +23,13 @@ const FacilityMap = ({ mapData, onFacilityClick, height = "400px" }) => {
     // Dynamically load Leaflet if not already loaded
     if (!window.L) {
       const script = document.createElement('script');
-      script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+      script.src = '/static/leaflet.js';
       script.onload = () => initMap();
       document.head.appendChild(script);
 
       const link = document.createElement('link');
       link.rel = 'stylesheet';
-      link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+      link.href = '/static/leaflet.css';
       document.head.appendChild(link);
     } else {
       initMap();
