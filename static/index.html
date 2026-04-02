@@ -45,6 +45,9 @@
         .search-divider { display: flex; align-items: center; margin: 20px 0; color: #888; font-size: 13px; }
         .search-divider::before, .search-divider::after { content: ''; flex: 1; height: 1px; background: #e5e7eb; }
         .search-divider span { padding: 0 16px; }
+        .cpt-or { display: flex; align-items: center; margin: 8px 0 6px; color: #aaa; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .cpt-or::before, .cpt-or::after { content: ''; flex: 1; height: 1px; background: #e5e7eb; }
+        .cpt-or span { padding: 0 10px; }
         
         /* Error */
         .error-message { background: #fef2f2; color: #dc2626; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; font-size: 14px; display: none; }
@@ -204,7 +207,7 @@
             <form class="search-form" id="quickSearchForm">
                 <div class="form-group">
                     <label for="service">Service</label>
-                    <select id="service" required>
+                    <select id="service">
                         <option value="">Select a service...</option>
                         <optgroup label="Imaging">
                             <option value="xray">X-Ray</option>
@@ -226,6 +229,8 @@
                             <option value="emergency room">Emergency Room</option>
                         </optgroup>
                     </select>
+                    <div class="cpt-or"><span>or CPT code</span></div>
+                    <input type="text" id="cptCode" placeholder="e.g. 71046" maxlength="5" pattern="[0-9]{5}" style="margin-top:0;">
                 </div>
                 <div class="form-group">
                     <label for="zipcode">ZIP Code</label>
@@ -236,6 +241,30 @@
                     <select id="payment">
                         <option value="cash">Cash / Self-Pay</option>
                         <option value="insurance">Insurance</option>
+                    </select>
+                </div>
+                <div class="form-group" id="insuranceGroup" style="display:none;">
+                    <label for="insuranceProvider">Insurance Provider</label>
+                    <select id="insuranceProvider">
+                        <option value="">All providers</option>
+                        <optgroup label="Commercial">
+                            <option value="UnitedHealthcare">UnitedHealthcare</option>
+                            <option value="Blue Cross Blue Shield">Blue Cross Blue Shield</option>
+                            <option value="Aetna">Aetna</option>
+                            <option value="Cigna">Cigna</option>
+                            <option value="Humana">Humana</option>
+                            <option value="Kaiser Permanente">Kaiser Permanente</option>
+                            <option value="Anthem">Anthem</option>
+                            <option value="Centene">Centene / WellCare</option>
+                            <option value="Molina Healthcare">Molina Healthcare</option>
+                            <option value="Oscar Health">Oscar Health</option>
+                            <option value="Ambetter">Ambetter</option>
+                        </optgroup>
+                        <optgroup label="Government">
+                            <option value="Medicare">Medicare</option>
+                            <option value="Medicaid">Medicaid</option>
+                            <option value="Tricare">Tricare (Military)</option>
+                        </optgroup>
                     </select>
                 </div>
                 <button type="submit" class="search-btn" id="quickSearchBtn">
@@ -355,18 +384,33 @@
             sendBtn.addEventListener('click', () => { if (!isProcessing) sendMessage(); });
             document.querySelectorAll('.quick-action').forEach(btn => btn.addEventListener('click', () => { chatInput.value = btn.dataset.message; sendMessage(); }));
             sortSelect.addEventListener('change', sortAndRenderFacilities);
+            $('payment').addEventListener('change', function() {
+                $('insuranceGroup').style.display = this.value === 'insurance' ? 'flex' : 'none';
+            });
+            // Clear service when CPT code is typed, and vice versa
+            $('cptCode').addEventListener('input', function() {
+                if (this.value) $('service').value = '';
+            });
+            $('service').addEventListener('change', function() {
+                if (this.value) $('cptCode').value = '';
+            });
         });
         
         async function handleQuickSearch(e) {
             e.preventDefault();
             const service = $('service').value, zipcode = $('zipcode').value, payment = $('payment').value;
-            if (!service || !zipcode) { showError('Please select a service and enter your ZIP code'); return; }
-            
+            const cptCode = $('cptCode').value.trim();
+            const insuranceProvider = $('insuranceProvider').value;
+            if (!service && !cptCode) { showError('Please select a service or enter a CPT code'); return; }
+            if (!zipcode) { showError('Please enter your ZIP code'); return; }
+
             quickSearchBtn.disabled = true;
             quickSearchBtn.innerHTML = '<div class="spinner"></div> Searching...';
             hideError();
-            
-            const message = `How much does a ${service} cost? My ZIP is ${zipcode} and I'm paying ${payment}.`;
+
+            const serviceQuery = cptCode ? `CPT code ${cptCode}` : service;
+            const paymentInfo = payment === 'insurance' && insuranceProvider ? `${insuranceProvider} insurance` : payment;
+            const message = `How much does ${serviceQuery} cost? My ZIP is ${zipcode} and I'm paying with ${paymentInfo}.`;
             addMessage(message, 'user');
             typingIndicator.classList.add('active');
             scrollToBottom();
