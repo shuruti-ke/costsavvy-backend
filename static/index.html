@@ -688,8 +688,10 @@
                     const facilityIcon = L.divIcon({ className: '', html: `<div class="facility-marker">${idx + 1}</div>`, iconSize: [28, 28], iconAnchor: [14, 14] });
                     const marker = L.marker([f.latitude, f.longitude], { icon: facilityIcon }).addTo(map);
                     const priceText = f.price ? `$${f.price.toLocaleString()}` : 'Contact';
-                    const webLine = (f.web_price != null && Number(f.web_price) > 0)
-                        ? `<div class="popup-web" style="font-size:12px;color:#2563eb;margin-top:4px;">Web search: $${Number(f.web_price).toLocaleString()}</div>` : '';
+                    const wPx = f.web_price != null ? Number(f.web_price) : NaN;
+                    const mainPx = f.price != null ? Number(f.price) : NaN;
+                    const webLine = (Number.isFinite(wPx) && wPx > 0 && (!Number.isFinite(mainPx) || Math.abs(wPx - mainPx) > 5))
+                        ? `<div class="popup-web" style="font-size:12px;color:#2563eb;margin-top:4px;">Web search: $${wPx.toLocaleString()}</div>` : '';
                     marker.bindPopup(`<div class="popup-title">${f.name || 'Healthcare Facility'}</div><div class="popup-address">${f.address || ''}</div><div class="popup-details"><span class="popup-distance">${f.distance_miles ? f.distance_miles.toFixed(1) + ' mi' : ''}</span><span class="popup-price">${priceText}</span></div>${webLine}`);
                     marker.on('click', () => selectFacility(idx));
                     markers.push(marker);

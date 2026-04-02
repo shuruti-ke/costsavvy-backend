@@ -7,6 +7,7 @@ import time
 import logging
 import asyncio
 import httpx
+import statistics
 from typing import Optional, Any, Dict, List, Tuple
 
 import asyncpg
@@ -62,6 +63,17 @@ TAVILY_API_KEY = (
 WEB_PRICE_SEARCH_ENABLED = os.getenv("WEB_PRICE_SEARCH_ENABLED", "true").lower() in (
     "1", "true", "yes", "y", "on"
 )
+
+# Nearest ZIP hospitals → web price first; DB (negotiated_rates + staging) merged for reference + discrepancy checks
+PRICE_WEB_FIRST = os.getenv("PRICE_WEB_FIRST", "true").lower() in ("1", "true", "yes", "y", "on")
+
+# Alert when median web price is far above/below median DB reference (e.g. web ~$1.5k vs DB ~$200)
+PRICE_DISCREPANCY_RATIO = float(os.getenv("PRICE_DISCREPANCY_RATIO", "2.5"))
+PRICE_DISCREPANCY_MIN_WEB = float(os.getenv("PRICE_DISCREPANCY_MIN_WEB", "500"))
+PRICE_DISCREPANCY_MIN_ABS_GAP = float(os.getenv("PRICE_DISCREPANCY_MIN_ABS_GAP", "400"))
+
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+ADMIN_DISCREPANCY_WEBHOOK_URL = os.getenv("ADMIN_DISCREPANCY_WEBHOOK_URL", "").strip()
 
 # Care navigation: symptom keywords that trigger care-finding mode (not pricing)
 SYMPTOM_KEYWORDS = [
@@ -545,17 +557,17 @@ async def attach_web_prices_to_facility_results(
     code: str,
     payment_mode: str,
     fill_hospitals: Optional[List[Dict[str, Any]]] = None,
-) -> Tuple[bool, List[float], List[Dict[str, Any]]]:
+) -> Tuple[bool, List[float], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Always (when enabled + API keys) runs web searches for up to MIN_FACILITIES_TO_DISPLAY
     hospitals to confirm DB pricing — priced rows first, then nearby facilities to reach 5.
     Sets web_candidate_price on rows when extraction succeeds.
-    Returns (attempted, all_web_prices_from_targets, web_facility_catalog) for UI + reconciliation.
+    Returns (attempted, all_web_prices_from_targets, web_facility_catalog, probed_row_refs).
     """
     if not WEB_PRICE_SEARCH_ENABLED or not WEB_SEARCH_ENABLED:
-        return False, [], []
+        return False, [], [], []
     if not (BRAVE_API_KEY or TAVILY_API_KEY):
-        return False, [], []
+        return False, [], [], []
 
     targets: List[Dict[str, Any]] = []
     seen = set()
@@ -580,22 +592,10 @@ async def attach_web_prices_to_facility_results(
             if not key or key in seen:
                 continue
             seen.add(key)
-            targets.append(
-                {
-                    "hospital_name": h.get("hospital_name"),
-                    "address": h.get("address"),
-                    "state": h.get("state"),
-                    "zipcode": h.get("zipcode"),
-                    "phone": h.get("phone"),
-                    "latitude": h.get("latitude"),
-                    "longitude": h.get("longitude"),
-                    "distance_miles": h.get("distance_miles"),
-                    "_web_probe_only": True,
-                }
-            )
+            targets.append(h)
 
     if not targets:
-        return False, [], []
+        return False, [], [], []
 
     sem = asyncio.Semaphore(4)
 
@@ -637,7 +637,176 @@ async def attach_web_prices_to_facility_results(
         if t.get("web_candidate_price") is not None
     ]
     catalog = _web_facility_catalog_from_targets(targets)
-    return True, web_vals_all, catalog
+    return True, web_vals_all, catalog, targets
+
+
+_DB_MERGE_KEYS = (
+    "best_price",
+    "standard_charge_cash",
+    "negotiated_dollar",
+    "estimated_amount",
+    "standard_charge_gross",
+    "payer_name",
+    "plan_name",
+    "code",
+    "code_type",
+)
+
+
+def merge_db_price_fields_into_rows(
+    target_rows: List[Dict[str, Any]], db_rows: List[Dict[str, Any]]
+) -> None:
+    """Copy negotiated_rates-shaped fields from progressive DB lookup onto probed rows (reference only)."""
+    if not target_rows or not db_rows:
+        return
+    by_id: Dict[int, Dict[str, Any]] = {}
+    by_key: Dict[str, Dict[str, Any]] = {}
+    for r in db_rows:
+        hid = r.get("hospital_id")
+        try:
+            if hid is not None:
+                by_id[int(hid)] = r
+        except (TypeError, ValueError):
+            pass
+        k = _normalize_hospital_key(_pick_hospital_name(r))
+        if k and k not in by_key:
+            by_key[k] = r
+    for row in target_rows:
+        src = None
+        hid = row.get("hospital_id")
+        try:
+            if hid is not None:
+                src = by_id.get(int(hid))
+        except (TypeError, ValueError):
+            pass
+        if src is None:
+            src = by_key.get(_normalize_hospital_key(_pick_hospital_name(row)))
+        if not src:
+            continue
+        for k in _DB_MERGE_KEYS:
+            if row.get(k) is None and src.get(k) is not None:
+                row[k] = src[k]
+
+
+def analyze_web_vs_db_discrepancy(
+    rows: List[Dict[str, Any]], payment_mode: str
+) -> Optional[Dict[str, Any]]:
+    """
+    Flag when web-extracted prices cluster high but DB reference is much lower (or the reverse).
+    """
+    web_vals: List[float] = []
+    db_vals: List[float] = []
+    per_hospital: List[Dict[str, Any]] = []
+    for r in rows:
+        w = r.get("web_candidate_price")
+        d = r.get("db_reference_price")
+        wf = float(w) if isinstance(w, (int, float)) and float(w) > 0 else None
+        df = float(d) if isinstance(d, (int, float)) and float(d) > 0 else None
+        if wf is not None:
+            web_vals.append(wf)
+        if df is not None:
+            db_vals.append(df)
+        if wf is not None or df is not None:
+            per_hospital.append(
+                {
+                    "hospital_name": _pick_hospital_name(r),
+                    "web_price": wf,
+                    "db_reference_price": df,
+                }
+            )
+    if len(web_vals) < 2 or not db_vals:
+        return None
+    mw = float(statistics.median(web_vals))
+    md = float(statistics.median(db_vals))
+    if mw < PRICE_DISCREPANCY_MIN_WEB:
+        return None
+    ratio_high = mw / md if md > 0 else None
+    ratio_low = md / mw if mw > 0 else None
+    triggered = False
+    reason = ""
+    if ratio_high is not None and ratio_high >= PRICE_DISCREPANCY_RATIO and (mw - md) >= PRICE_DISCREPANCY_MIN_ABS_GAP:
+        triggered = True
+        reason = f"median_web {mw:.0f} is ~{ratio_high:.1f}x median_db {md:.0f}"
+    elif ratio_low is not None and ratio_low >= PRICE_DISCREPANCY_RATIO and (md - mw) >= PRICE_DISCREPANCY_MIN_ABS_GAP:
+        triggered = True
+        reason = f"median_db {md:.0f} is ~{ratio_low:.1f}x median_web {mw:.0f}"
+    if not triggered:
+        wspread = max(web_vals) - min(web_vals)
+        if (
+            len(web_vals) >= 3
+            and mw > 0
+            and wspread <= 0.4 * mw
+            and ratio_high is not None
+            and ratio_high >= 2.0
+            and (mw - md) >= PRICE_DISCREPANCY_MIN_ABS_GAP
+        ):
+            triggered = True
+            reason = f"tight_web_cluster (spread {wspread:.0f}) vs median_db {md:.0f} (~{ratio_high:.1f}x)"
+    if not triggered:
+        return None
+    return {
+        "reason": reason,
+        "median_web": mw,
+        "median_db": md,
+        "web_prices": web_vals,
+        "db_prices": db_vals,
+        "hospitals": per_hospital,
+        "payment_mode": payment_mode,
+    }
+
+
+async def record_price_discrepancy_alert(
+    conn: Optional[asyncpg.Connection],
+    session_id: Optional[str],
+    zipcode: str,
+    code: Optional[str],
+    payment_mode: str,
+    detail: Dict[str, Any],
+) -> None:
+    """
+    Super-admin signals: structured log, optional webhook POST, optional DB row.
+    Create table (once): see POST /admin/price_discrepancies docs or run:
+      CREATE TABLE IF NOT EXISTS public.admin_price_discrepancy_alerts (
+        id bigserial PRIMARY KEY,
+        created_at timestamptz DEFAULT now(),
+        session_id text,
+        zipcode text,
+        code text,
+        payment_mode text,
+        detail_json jsonb
+      );
+    """
+    payload = {
+        "type": "price_discrepancy",
+        "zipcode": zipcode,
+        "code": code,
+        "payment_mode": payment_mode,
+        "session_id": session_id,
+        "detail": detail,
+    }
+    logger.warning("PRICE_DISCREPANCY_ALERT %s", json.dumps(payload, default=str)[:4000])
+    if ADMIN_DISCREPANCY_WEBHOOK_URL:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as http:
+                await http.post(ADMIN_DISCREPANCY_WEBHOOK_URL, json=payload)
+        except Exception as e:
+            logger.warning(f"Discrepancy webhook post failed: {e}")
+    if conn is not None:
+        try:
+            await conn.execute(
+                """
+                INSERT INTO public.admin_price_discrepancy_alerts
+                  (session_id, zipcode, code, payment_mode, detail_json)
+                VALUES ($1, $2, $3, $4, $5::jsonb)
+                """,
+                session_id,
+                zipcode,
+                code or "",
+                payment_mode,
+                json.dumps(detail, default=str),
+            )
+        except Exception as e:
+            logger.info("admin_price_discrepancy_alerts insert skipped: %s", e)
 
 
 def _row_effective_price(
@@ -646,12 +815,12 @@ def _row_effective_price(
     prefer_web_sourced_prices: bool = False,
 ) -> Optional[float]:
     """
-    When web search returned at least one parsed price, use that hospital's web price if present;
-    otherwise fall back to DB. If web search produced no usable prices, use DB only.
+    Prefer this facility's web-extracted price whenever present; otherwise DB/staging transparency price.
+    prefer_web_sourced_prices is kept for call-site compatibility but does not gate per-row web display.
     """
     wp = row.get("web_candidate_price")
     web_pf = float(wp) if isinstance(wp, (int, float)) and wp and float(wp) > 0 else None
-    if prefer_web_sourced_prices and web_pf is not None:
+    if web_pf is not None:
         return web_pf
     return _pick_transparency_price(row, payment_mode)
 
@@ -663,7 +832,7 @@ def _row_price_display_note(
 ) -> str:
     wp = row.get("web_candidate_price")
     web_pf = float(wp) if isinstance(wp, (int, float)) and wp and float(wp) > 0 else None
-    if prefer_web_sourced_prices and web_pf is not None:
+    if web_pf is not None:
         return "Web search price"
     if _pick_transparency_price(row, payment_mode) is not None:
         pm = (payment_mode or "").lower()
@@ -1807,6 +1976,228 @@ async def price_lookup_progressive(
 # ----------------------------
 # Nearby hospitals (for facility list even when no prices)
 # ----------------------------
+def _pick_best_staging_rate_row(
+    recs: List[Dict[str, Any]], payment_mode: str
+) -> Optional[Dict[str, Any]]:
+    """Choose one stg_hospital_rates row per hospital for cash vs insurance display logic."""
+    if not recs:
+        return None
+    pm = (payment_mode or "cash").lower()
+
+    def score(rec: Dict[str, Any]) -> Tuple[int, float]:
+        sc = rec.get("standard_charge_discounted_cash")
+        nd = rec.get("standard_charge_negotiated_dollar")
+        ea = rec.get("estimated_amount")
+        gr = rec.get("standard_charge_gross")
+        if pm.startswith("insur"):
+            # Prefer listed gross (transparency), then negotiated, then estimates / cash columns
+            if gr is not None and float(gr) >= 400:
+                return (0, -float(gr))
+            if nd is not None:
+                return (1, -float(nd))
+            if ea is not None:
+                return (2, -float(ea))
+            if sc is not None:
+                return (3, -float(sc))
+            return (9, 0.0)
+        # cash / self-pay
+        if sc is not None:
+            return (0, float(sc))
+        if ea is not None:
+            return (1, float(ea))
+        if gr is not None:
+            return (2, float(gr))
+        if nd is not None:
+            return (3, float(nd))
+        return (9, 0.0)
+
+    def usable(rec: Dict[str, Any]) -> bool:
+        for k in (
+            "standard_charge_discounted_cash",
+            "standard_charge_negotiated_dollar",
+            "estimated_amount",
+            "standard_charge_gross",
+        ):
+            v = rec.get(k)
+            if v is None:
+                continue
+            try:
+                if float(v) > 0:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        return False
+
+    filtered = [r for r in recs if usable(r)]
+    if not filtered:
+        return None
+    try:
+        return min(filtered, key=lambda r: score(r))
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_staging_rate_to_row(row: Dict[str, Any], staging: Dict[str, Any]) -> None:
+    """Copy staging price fields onto a facility row in negotiated_rates-compatible shape."""
+    sc = staging.get("standard_charge_discounted_cash")
+    nd = staging.get("standard_charge_negotiated_dollar")
+    ea = staging.get("estimated_amount")
+    gr = staging.get("standard_charge_gross")
+    row["standard_charge_cash"] = sc
+    row["negotiated_dollar"] = nd
+    row["estimated_amount"] = ea
+    row["standard_charge_gross"] = gr
+    row["payer_name"] = staging.get("payer_name") or row.get("payer_name")
+    row["plan_name"] = staging.get("plan_name") or row.get("plan_name")
+    try:
+        bp = None
+        for v in (nd, ea, sc):
+            if isinstance(v, (int, float)) and float(v) > 0:
+                bp = float(v)
+                break
+        if bp is None and isinstance(gr, (int, float)) and float(gr) > 0:
+            bp = float(gr)
+        if bp is not None:
+            row["best_price"] = bp
+    except (TypeError, ValueError):
+        pass
+
+
+async def enrich_facility_rows_from_staging(
+    conn: asyncpg.Connection,
+    rows: List[Dict[str, Any]],
+    code_type: Optional[str],
+    code: Optional[str],
+    payment_mode: str,
+    payer_like: Optional[str],
+    plan_like: Optional[str],
+) -> None:
+    """
+    Fill missing transparency prices from public.stg_hospital_rates (CPT + hospital).
+    Negotiated_rates is often sparse; staging MRF data frequently has rows negotiated_rates does not.
+    """
+    c = (code or "").strip()
+    if not c or not rows:
+        return
+    ct = (code_type or "").strip() or None
+    payer_f = (payer_like or "").strip() or None
+    plan_f = (plan_like or "").strip() or None
+
+    need_idx: List[int] = []
+    for i, row in enumerate(rows):
+        if _pick_transparency_price(row, payment_mode) is not None:
+            continue
+        need_idx.append(i)
+    if not need_idx:
+        return
+
+    by_hid: Dict[int, List[int]] = {}
+    name_by_idx: Dict[int, str] = {}
+
+    for i in need_idx:
+        row = rows[i]
+        hid = row.get("hospital_id")
+        try:
+            if hid is not None:
+                ih = int(hid)
+                by_hid.setdefault(ih, []).append(i)
+                continue
+        except (TypeError, ValueError):
+            pass
+        nm = _pick_hospital_name(row)
+        if nm:
+            name_by_idx[i] = nm.strip().lower()
+
+    if by_hid:
+        hid_list = list(by_hid.keys())
+        stg_rows = await conn.fetch(
+            """
+            SELECT
+              r.hospital_id,
+              r.hospital_name,
+              r.standard_charge_discounted_cash,
+              r.standard_charge_negotiated_dollar,
+              r.estimated_amount,
+              r.standard_charge_gross,
+              r.payer_name,
+              r.plan_name
+            FROM public.stg_hospital_rates r
+            WHERE r.hospital_id = ANY($1::int[])
+              AND r.code = $2
+              AND ($3::text IS NULL OR r.code_type IS NULL OR r.code_type = $3)
+              AND ($4::text IS NULL OR r.payer_name ILIKE '%' || $4 || '%')
+              AND ($5::text IS NULL OR r.plan_name ILIKE '%' || $5 || '%')
+              AND (
+                r.standard_charge_discounted_cash IS NOT NULL
+                OR r.standard_charge_negotiated_dollar IS NOT NULL
+                OR r.estimated_amount IS NOT NULL
+                OR r.standard_charge_gross IS NOT NULL
+              )
+            """,
+            hid_list,
+            c,
+            ct,
+            payer_f,
+            plan_f,
+        )
+        grouped: Dict[int, List[Dict[str, Any]]] = {}
+        for r in stg_rows:
+            hid = int(r["hospital_id"])
+            grouped.setdefault(hid, []).append(dict(r))
+        for hid, idxs in by_hid.items():
+            best = _pick_best_staging_rate_row(grouped.get(hid, []), payment_mode)
+            if not best:
+                continue
+            for ix in idxs:
+                _apply_staging_rate_to_row(rows[ix], best)
+
+    if name_by_idx:
+        uniq_names = sorted({v for v in name_by_idx.values() if v})
+        if uniq_names:
+            stg_n = await conn.fetch(
+                """
+                SELECT
+                  LOWER(TRIM(r.hospital_name)) AS hn,
+                  r.standard_charge_discounted_cash,
+                  r.standard_charge_negotiated_dollar,
+                  r.estimated_amount,
+                  r.standard_charge_gross,
+                  r.payer_name,
+                  r.plan_name
+                FROM public.stg_hospital_rates r
+                WHERE r.code = $1
+                  AND ($2::text IS NULL OR r.code_type IS NULL OR r.code_type = $2)
+                  AND ($3::text IS NULL OR r.payer_name ILIKE '%' || $3 || '%')
+                  AND ($4::text IS NULL OR r.plan_name ILIKE '%' || $4 || '%')
+                  AND LOWER(TRIM(r.hospital_name)) = ANY($5::text[])
+                  AND (
+                    r.standard_charge_discounted_cash IS NOT NULL
+                    OR r.standard_charge_negotiated_dollar IS NOT NULL
+                    OR r.estimated_amount IS NOT NULL
+                    OR r.standard_charge_gross IS NOT NULL
+                  )
+                """,
+                c,
+                ct,
+                payer_f,
+                plan_f,
+                uniq_names,
+            )
+            by_name: Dict[str, List[Dict[str, Any]]] = {}
+            for r in stg_n:
+                key = (r["hn"] or "").strip().lower()
+                if not key:
+                    continue
+                by_name.setdefault(key, []).append(dict(r))
+            for ix, hn in name_by_idx.items():
+                if _pick_transparency_price(rows[ix], payment_mode) is not None:
+                    continue
+                best = _pick_best_staging_rate_row(by_name.get(hn, []), payment_mode)
+                if best:
+                    best.pop("hn", None)
+                    _apply_staging_rate_to_row(rows[ix], best)
+
+
 async def get_nearby_hospitals(conn: asyncpg.Connection, zipcode: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
     Returns nearby hospitals with name/address/state/zipcode/phone (+ distance if possible).
@@ -1823,6 +2214,7 @@ async def get_nearby_hospitals(conn: asyncpg.Connection, zipcode: str, limit: in
     if zlat is not None and zlon is not None:
         q = """
         SELECT
+          h.hospital_id AS hospital_id,
           h.hospital_name AS hospital_name,
           h.address AS address,
           h.state AS state,
@@ -1844,6 +2236,7 @@ async def get_nearby_hospitals(conn: asyncpg.Connection, zipcode: str, limit: in
         if not rows:
             q_fallback = """
             SELECT
+              h.id AS hospital_id,
               h.name AS hospital_name,
               h.address AS address,
               h.state AS state,
@@ -1867,6 +2260,7 @@ async def get_nearby_hospitals(conn: asyncpg.Connection, zipcode: str, limit: in
     # If we can't compute distance, still return facilities (join both tables)
     q2 = """
     SELECT
+      COALESCE(hd.hospital_id, h.id) AS hospital_id,
       COALESCE(hd.hospital_name, h.name) AS hospital_name,
       COALESCE(hd.address, h.address) AS address,
       COALESCE(hd.state, h.state) AS state,
@@ -2388,7 +2782,7 @@ def build_facility_block(
             else None
         )
         plat, plon = _extract_lat_lon(f)
-        if prefer_web_sourced_prices and web_pf is not None:
+        if web_pf is not None:
             psrc = "web_search"
         elif eff is not None:
             psrc = "db"
@@ -3335,19 +3729,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                         yield sse({"type": "final", "used_web_search": False})
                         return
 
-                    # ---- PRICED LOOKUP (geo-first, progressive radius) ----
-                    results, used_max_radius = await price_lookup_progressive(
-                        conn,
-                        merged["zipcode"],
-                        merged["code_type"],
-                        merged["code"],
-                        merged.get("service_query") or "",
-                        merged.get("payer_like"),
-                        merged.get("plan_like"),
-                        merged.get("payment_mode") or "cash",
-                    )
+                    pay_mode = merged.get("payment_mode") or "cash"
 
-                    # Nearby list first so web confirmation can always probe up to 5 hospitals
                     try:
                         nearby_hospitals = await get_nearby_hospitals(
                             conn, merged["zipcode"], limit=NEARBY_COORD_LOOKUP_LIMIT
@@ -3359,17 +3742,137 @@ async def chat_stream(req: ChatRequest, request: Request):
                     web_price_attempted = False
                     web_vals_all: List[float] = []
                     web_facility_catalog: List[Dict[str, Any]] = []
-                    try:
-                        web_price_attempted, web_vals_all, web_facility_catalog = await attach_web_prices_to_facility_results(
-                            results,
+                    probed_targets: List[Dict[str, Any]] = []
+                    results: List[Dict[str, Any]] = []
+                    used_max_radius: Optional[int] = None
+                    prefer_web_sourced_prices = False
+                    results_for_block: List[Dict[str, Any]] = []
+                    fallback_for_block: List[Dict[str, Any]] = []
+                    web_first_applied = False
+
+                    web_first = (
+                        PRICE_WEB_FIRST
+                        and WEB_PRICE_SEARCH_ENABLED
+                        and WEB_SEARCH_ENABLED
+                        and (BRAVE_API_KEY or TAVILY_API_KEY)
+                        and len(nearby_hospitals) > 0
+                    )
+
+                    if web_first:
+                        try:
+                            (
+                                web_price_attempted,
+                                web_vals_all,
+                                web_facility_catalog,
+                                probed_targets,
+                            ) = await attach_web_prices_to_facility_results(
+                                [],
+                                merged.get("service_query") or "",
+                                merged.get("code") or "",
+                                pay_mode,
+                                fill_hospitals=nearby_hospitals,
+                            )
+                        except Exception as e:
+                            logger.warning(f"Web facility price enrichment failed: {e}")
+                        if not probed_targets:
+                            web_first = False
+
+                    if web_first:
+                        # DB lookup for reference only (merge onto nearest hospitals already web-searched)
+                        results, used_max_radius = await price_lookup_progressive(
+                            conn,
+                            merged["zipcode"],
+                            merged["code_type"],
+                            merged["code"],
                             merged.get("service_query") or "",
-                            merged.get("code") or "",
-                            merged.get("payment_mode") or "cash",
-                            fill_hospitals=nearby_hospitals,
+                            merged.get("payer_like"),
+                            merged.get("plan_like"),
+                            pay_mode,
                         )
-                    except Exception as e:
-                        logger.warning(f"Web facility price enrichment failed: {e}")
-                    prefer_web_sourced_prices = bool(web_price_attempted and web_vals_all)
+                        merge_db_price_fields_into_rows(probed_targets, results)
+                        try:
+                            await enrich_facility_rows_from_staging(
+                                conn,
+                                probed_targets,
+                                merged.get("code_type"),
+                                merged.get("code"),
+                                pay_mode,
+                                merged.get("payer_like"),
+                                merged.get("plan_like"),
+                            )
+                        except Exception as e:
+                            logger.warning(f"Staging table price enrichment failed: {e}")
+                        for r in probed_targets:
+                            r["db_reference_price"] = _pick_transparency_price(r, pay_mode)
+                        prefer_web_sourced_prices = bool(web_price_attempted and web_vals_all)
+                        results_for_block = probed_targets
+                        fallback_for_block = []
+                        web_first_applied = True
+                    else:
+                        results, used_max_radius = await price_lookup_progressive(
+                            conn,
+                            merged["zipcode"],
+                            merged["code_type"],
+                            merged["code"],
+                            merged.get("service_query") or "",
+                            merged.get("payer_like"),
+                            merged.get("plan_like"),
+                            pay_mode,
+                        )
+                        try:
+                            await enrich_facility_rows_from_staging(
+                                conn,
+                                results,
+                                merged.get("code_type"),
+                                merged.get("code"),
+                                pay_mode,
+                                merged.get("payer_like"),
+                                merged.get("plan_like"),
+                            )
+                            await enrich_facility_rows_from_staging(
+                                conn,
+                                nearby_hospitals,
+                                merged.get("code_type"),
+                                merged.get("code"),
+                                pay_mode,
+                                merged.get("payer_like"),
+                                merged.get("plan_like"),
+                            )
+                        except Exception as e:
+                            logger.warning(f"Staging table price enrichment failed: {e}")
+                        try:
+                            (
+                                web_price_attempted,
+                                web_vals_all,
+                                web_facility_catalog,
+                                probed_targets,
+                            ) = await attach_web_prices_to_facility_results(
+                                results,
+                                merged.get("service_query") or "",
+                                merged.get("code") or "",
+                                pay_mode,
+                                fill_hospitals=nearby_hospitals,
+                            )
+                        except Exception as e:
+                            logger.warning(f"Web facility price enrichment failed: {e}")
+                        for r in probed_targets:
+                            r["db_reference_price"] = _pick_transparency_price(r, pay_mode)
+                        prefer_web_sourced_prices = bool(web_price_attempted and web_vals_all)
+                        results_for_block = results
+                        fallback_for_block = nearby_hospitals
+
+                    disc_detail = (
+                        analyze_web_vs_db_discrepancy(probed_targets, pay_mode) if probed_targets else None
+                    )
+                    if disc_detail:
+                        await record_price_discrepancy_alert(
+                            conn,
+                            session_id,
+                            str(merged.get("zipcode") or ""),
+                            str(merged.get("code") or "") if merged.get("code") else None,
+                            pay_mode,
+                            disc_detail,
+                        )
 
                     # Get user's coordinates for map
                     user_lat, user_lon = None, None
@@ -3394,8 +3897,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                     facility_text, facility_payload, map_data = build_facility_block(
                         service_query=merged.get("service_query") or "this service",
                         payment_mode=merged.get("payment_mode") or "cash",
-                        priced_results=results,
-                        fallback_hospitals=nearby_hospitals,
+                        priced_results=results_for_block,
+                        fallback_hospitals=fallback_for_block,
                         user_lat=user_lat,
                         user_lon=user_lon,
                         user_zipcode=merged.get("zipcode") or "",
@@ -3423,11 +3926,13 @@ async def chat_stream(req: ChatRequest, request: Request):
                         state_out["procedure_display_name"] = procedure_display_name
                     if merged.get("code"):
                         state_out["procedure_code"] = merged.get("code")
+                    if disc_detail:
+                        state_out["price_discrepancy_flag"] = True
 
                     yield sse(
                         {
                             "type": "results",
-                            "results": results[:25],
+                            "results": results_for_block[:25],
                             "facilities": facility_payload,
                             "web_facility_prices": web_facility_catalog,
                             "map_data": map_data,
@@ -3445,15 +3950,26 @@ async def chat_stream(req: ChatRequest, request: Request):
                         {
                             "mode": mode,
                             "intent": intent,
-                            "result_count": len(results),
+                            "result_count": len(results_for_block),
                             "used_max_radius": used_max_radius,
                             "refiner_id": (refiner or {}).get("id"),
+                            "price_web_first": web_first_applied,
+                            "price_discrepancy": bool(disc_detail),
                         },
                     )
                     await update_session_state(conn, session_id, merged)
 
                     used_web = len(results) < MIN_DB_RESULTS_BEFORE_WEB or web_price_attempted
-                    await log_query(conn, session_id, req.message, intent, used_max_radius, len(results), used_web, full_answer)
+                    await log_query(
+                        conn,
+                        session_id,
+                        req.message,
+                        intent,
+                        used_max_radius,
+                        len(results_for_block),
+                        used_web,
+                        full_answer,
+                    )
                     yield sse({"type": "final", "used_web_search": used_web})
                     return
 
@@ -3472,6 +3988,53 @@ async def chat_stream(req: ChatRequest, request: Request):
 
     headers = {"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
     return StreamingResponse(event_gen(), media_type="text/event-stream", headers=headers)
+
+
+@app.get("/admin/price_discrepancies")
+async def admin_price_discrepancies(request: Request, limit: int = 50):
+    """
+    Super-admin: recent web-vs-DB price discrepancy alerts.
+    Header: X-Admin-Key: <ADMIN_API_KEY>
+    Requires table public.admin_price_discrepancy_alerts (see record_price_discrepancy_alert docstring).
+    """
+    if not ADMIN_API_KEY:
+        raise HTTPException(503, detail="ADMIN_API_KEY is not configured")
+    if request.headers.get("X-Admin-Key", "") != ADMIN_API_KEY:
+        raise HTTPException(403, detail="Invalid or missing X-Admin-Key")
+    if pool is None:
+        raise HTTPException(503, detail="Database pool not ready")
+    lim = max(1, min(int(limit), 200))
+    async with pool.acquire() as conn:
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT id, created_at, session_id, zipcode, code, payment_mode, detail_json
+                FROM public.admin_price_discrepancy_alerts
+                ORDER BY id DESC
+                LIMIT $1
+                """,
+                lim,
+            )
+        except Exception as e:
+            raise HTTPException(
+                503,
+                detail=f"Could not read admin_price_discrepancy_alerts (create table?): {e}",
+            ) from e
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        ca = r["created_at"]
+        out.append(
+            {
+                "id": r["id"],
+                "created_at": ca.isoformat() if hasattr(ca, "isoformat") else str(ca),
+                "session_id": r["session_id"],
+                "zipcode": r["zipcode"],
+                "code": r["code"],
+                "payment_mode": r["payment_mode"],
+                "detail": r["detail_json"],
+            }
+        )
+    return out
 
 
 @app.post("/chat")
