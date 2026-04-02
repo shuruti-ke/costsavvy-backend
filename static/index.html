@@ -528,9 +528,9 @@
                         if (data.type === 'delta' && data.text) fullText += data.text;
                         if (data.type === 'results') {
                             mapData = data.map_data;
-                            facilities = data.facilities || [];
+                            facilities = Array.isArray(data.facilities) ? data.facilities : [];
                             resultState = data.state || {};
-                            webFacilityPrices = data.web_facility_prices || [];
+                            webFacilityPrices = Array.isArray(data.web_facility_prices) ? data.web_facility_prices : [];
                         }
                     } catch (e) {}
                 }
