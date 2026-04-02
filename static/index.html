@@ -553,6 +553,39 @@
         
         function scrollToBottom() { chatMessages.scrollTop = chatMessages.scrollHeight; }
         
+        function normalizeAddressText(s) {
+            if (s == null || s === '') return '';
+            return String(s).replace(/\u00a0/g, ' ').replace(/Â+/g, '').replace(/\s+/g, ' ').trim();
+        }
+        
+        function syncMapMarkersToSortedFacilities(sorted) {
+            if (!currentMapData) return;
+            const facilities = [];
+            sorted.slice(0, 5).forEach((f, i) => {
+                if (f.latitude == null || f.longitude == null) return;
+                facilities.push({
+                    list_index: i + 1,
+                    facility_key: f.facility_key || '',
+                    name: f.hospital_name || 'Healthcare Facility',
+                    latitude: f.latitude,
+                    longitude: f.longitude,
+                    address: normalizeAddressText(f.address || ''),
+                    price: f.price,
+                    web_price: f.web_price,
+                    distance_miles: f.distance_miles,
+                    estimated_range: f.estimated_range || '',
+                    website_url: f.website_url || '',
+                });
+            });
+            currentMapData = { ...currentMapData, facilities };
+            if (map) updateMap(currentMapData);
+        }
+        
+        function facilityLinkLabel(url) {
+            if (!url) return 'View location';
+            return url.includes('google.com/maps') ? 'View on Google Maps' : 'Facility website';
+        }
+        
         function displayResults(mapData, facilities, serviceName, webFacilityPrices, resultState) {
             resultsSection.classList.add('active');
             const st = resultState || {};
@@ -589,7 +622,8 @@
                 estimateNote.style.display = 'inline';
             }
             sortAndRenderFacilities();
-            if (!map) initMap(mapData); else updateMap(mapData);
+            if (!map) initMap(currentMapData || mapData);
+            else if (currentMapData) updateMap(currentMapData);
             if (mapData.google_maps_url) { openMapsBtn.href = mapData.google_maps_url; openMapsBtn.style.display = 'flex'; }
             
             // Scroll to results section after a brief delay to ensure rendering is complete
@@ -603,6 +637,7 @@
             if (sortSelect.value === 'price') sorted.sort((a, b) => (a.price || Infinity) - (b.price || Infinity));
             else sorted.sort((a, b) => (a.distance_miles || Infinity) - (b.distance_miles || Infinity));
             renderFacilityList(sorted);
+            syncMapMarkersToSortedFacilities(sorted);
         }
         
         // Keep track of currently displayed (sorted) facilities
@@ -615,7 +650,7 @@
                 const card = document.createElement('div');
                 card.className = 'facility-card';
                 const priceText = f.price ? `$${f.price.toLocaleString()}` : (f.estimated_range || 'Contact');
-                const priceClass = f.price ? (f.price <= (currentFacilities[0]?.price || 0) * 1.2 ? 'low' : '') : 'estimate';
+                const priceClass = f.price ? (f.price <= (sorted[0]?.price || 0) * 1.2 ? 'low' : '') : 'estimate';
                 const showWeb = f.web_price != null && Number(f.web_price) > 0;
                 let noteText = 'Estimate';
                 if (f.price) {
@@ -625,7 +660,7 @@
                     else noteText = 'Verified';
                 }
                 const webRow = (showWeb && f.price_source !== 'web_search') ? `<div class="facility-web-price">Web search: $${Number(f.web_price).toLocaleString()}</div>` : '';
-                card.innerHTML = `<div class="facility-row"><div class="facility-info"><div class="facility-index">${i + 1}</div><div class="facility-details"><div class="facility-name">${f.hospital_name || 'Healthcare Facility'}</div><div class="facility-type">Healthcare Facility</div><div class="facility-location">${f.distance_miles ? `<span>📍 ${f.distance_miles.toFixed(1)} mi</span>` : ''} <span>${f.address || ''}</span></div></div></div><div class="facility-pricing"><div class="facility-price ${priceClass}">${priceText}</div><div class="price-note">${noteText}</div>${webRow}</div></div>`;
+                card.innerHTML = `<div class="facility-row"><div class="facility-info"><div class="facility-index">${i + 1}</div><div class="facility-details"><div class="facility-name">${f.hospital_name || 'Healthcare Facility'}</div><div class="facility-type">Healthcare Facility</div><div class="facility-location">${f.distance_miles ? `<span>📍 ${f.distance_miles.toFixed(1)} mi</span>` : ''} <span>${escapeHtml(normalizeAddressText(f.address || ''))}</span></div></div></div><div class="facility-pricing"><div class="facility-price ${priceClass}">${priceText}</div><div class="price-note">${noteText}</div>${webRow}</div></div>`;
                 card.addEventListener('click', () => selectFacility(i));
                 facilityList.appendChild(card);
             });
@@ -685,18 +720,43 @@
             if (mapData.facilities?.length > 0) {
                 mapData.facilities.forEach((f, idx) => {
                     if (!f.latitude || !f.longitude) return;
-                    const facilityIcon = L.divIcon({ className: '', html: `<div class="facility-marker">${idx + 1}</div>`, iconSize: [28, 28], iconAnchor: [14, 14] });
+                    const num = f.list_index != null ? f.list_index : (idx + 1);
+                    const facilityIcon = L.divIcon({ className: '', html: `<div class="facility-marker">${num}</div>`, iconSize: [28, 28], iconAnchor: [14, 14] });
                     const marker = L.marker([f.latitude, f.longitude], { icon: facilityIcon }).addTo(map);
-                    const priceText = f.price ? `$${f.price.toLocaleString()}` : 'Contact';
+                    marker._facilityKey = f.facility_key || '';
+                    const addrSafe = escapeHtml(normalizeAddressText(f.address || ''));
+                    let costHtml = '';
+                    if (f.price != null && Number(f.price) > 0) {
+                        costHtml = `<div class="popup-cost" style="margin-top:8px;font-size:15px;font-weight:600;color:#059669;">$${Number(f.price).toLocaleString()}</div>`;
+                    } else if (f.estimated_range) {
+                        costHtml = `<div class="popup-cost" style="margin-top:8px;font-size:14px;font-weight:600;color:#666;">${escapeHtml(f.estimated_range)} <span style="font-size:11px;font-weight:400;">(estimate)</span></div>`;
+                    } else {
+                        costHtml = `<div class="popup-cost" style="margin-top:6px;font-size:13px;color:#888;">Contact for pricing</div>`;
+                    }
                     const wPx = f.web_price != null ? Number(f.web_price) : NaN;
                     const mainPx = f.price != null ? Number(f.price) : NaN;
                     const webLine = (Number.isFinite(wPx) && wPx > 0 && (!Number.isFinite(mainPx) || Math.abs(wPx - mainPx) > 5))
                         ? `<div class="popup-web" style="font-size:12px;color:#2563eb;margin-top:4px;">Web search: $${wPx.toLocaleString()}</div>` : '';
-                    marker.bindPopup(`<div class="popup-title">${f.name || 'Healthcare Facility'}</div><div class="popup-address">${f.address || ''}</div><div class="popup-details"><span class="popup-distance">${f.distance_miles ? f.distance_miles.toFixed(1) + ' mi' : ''}</span><span class="popup-price">${priceText}</span></div>${webLine}`);
-                    marker.on('click', () => selectFacility(idx));
+                    let safeHref = '';
+                    try {
+                        const u = new URL((f.website_url || '').trim());
+                        if (u.protocol === 'http:' || u.protocol === 'https:') safeHref = u.href;
+                    } catch (e) { /* ignore */ }
+                    const linkHtml = safeHref
+                        ? `<div style="margin-top:10px;"><a href=${JSON.stringify(safeHref)} target="_blank" rel="noopener noreferrer" style="color:#2563eb;font-weight:600;">${escapeHtml(facilityLinkLabel(safeHref))} ↗</a></div>`
+                        : '';
+                    marker.bindPopup(`<div class="popup-title">${escapeHtml(f.name || 'Healthcare Facility')}</div><div class="popup-address">${addrSafe}</div><div class="popup-details"><span class="popup-distance">${f.distance_miles != null ? Number(f.distance_miles).toFixed(1) + ' mi' : ''}</span></div>${costHtml}${webLine}${linkHtml}`);
+                    marker.on('click', () => {
+                        const ix = displayedFacilities.findIndex(x => (x.facility_key || '') === (f.facility_key || ''));
+                        if (ix >= 0) selectFacility(ix);
+                    });
                     markers.push(marker);
-                    if (f.price) {
-                        const priceIcon = L.divIcon({ className: '', html: `<div class="price-label">$${f.price.toLocaleString()}</div>`, iconSize: [60, 20], iconAnchor: [30, -6] });
+                    if (f.price != null && Number(f.price) > 0) {
+                        const priceIcon = L.divIcon({ className: '', html: `<div class="price-label">$${Number(f.price).toLocaleString()}</div>`, iconSize: [60, 20], iconAnchor: [30, -6] });
+                        priceLabels.push(L.marker([f.latitude, f.longitude], { icon: priceIcon, interactive: false, zIndexOffset: -100 }).addTo(map));
+                    } else if (f.estimated_range) {
+                        const shortEst = f.estimated_range.length > 14 ? f.estimated_range.slice(0, 12) + '…' : f.estimated_range;
+                        const priceIcon = L.divIcon({ className: '', html: `<div class="price-label" style="font-size:10px;">${escapeHtml(shortEst)}</div>`, iconSize: [72, 22], iconAnchor: [36, -6] });
                         priceLabels.push(L.marker([f.latitude, f.longitude], { icon: priceIcon, interactive: false, zIndexOffset: -100 }).addTo(map));
                     }
                 });

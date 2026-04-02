@@ -2377,7 +2377,39 @@ def _pick_address(row: Dict[str, Any]) -> str:
     state = row.get("state") or ""
     z = row.get("zipcode") or row.get("zip") or ""
     parts = [p for p in [addr, city, state, z] if p]
-    return ", ".join(parts).strip()
+    s = ", ".join(parts).strip()
+    # Strip UTF-8 nbsp / mojibake (e.g. "06489Â") from bad CSV encodings
+    s = s.replace("\xc2\xa0", " ").replace("\xa0", " ")
+    s = re.sub(r"Â+", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _facility_stable_key(row: Dict[str, Any]) -> str:
+    hid = row.get("hospital_id")
+    try:
+        if hid is not None:
+            return f"id:{int(hid)}"
+    except (TypeError, ValueError):
+        pass
+    z = (str(row.get("zipcode") or row.get("zip") or "")).strip()
+    return f"n:{_normalize_hospital_key(_pick_hospital_name(row))}|{z}"
+
+
+def _public_facility_website_or_maps(row: Dict[str, Any]) -> str:
+    """Prefer an explicit website column when present; else Google Maps search (always usable)."""
+    import urllib.parse
+
+    for k in ("website", "website_url", "hospital_website", "url"):
+        w = (row.get(k) or "").strip()
+        if not w or "@" in w:
+            continue
+        if w.startswith("http://") or w.startswith("https://"):
+            return w
+        if "." in w and " " not in w:
+            return "https://" + w.lstrip("/")
+    q = f"{_pick_hospital_name(row)} {_pick_address(row)}".strip()
+    return "https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote(q)
 
 
 def _extract_lat_lon(row: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
@@ -2541,6 +2573,7 @@ def _generate_map_data(
     facilities: List[Dict[str, Any]],
     payment_mode: str = "cash",
     prefer_web_sourced_prices: bool = False,
+    default_estimate_range: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generate map data including URLs and coordinates for the frontend.
@@ -2553,13 +2586,17 @@ def _generate_map_data(
     for i, f in enumerate(facilities[:MIN_FACILITIES_TO_DISPLAY], start=1):
         la, lo = _extract_lat_lon(f)
         if la is not None:
+            eff = _row_effective_price(f, payment_mode, prefer_web_sourced_prices)
             facility_markers.append({
                 "index": i,
+                "list_index": i,
+                "facility_key": _facility_stable_key(f),
                 "name": _pick_hospital_name(f),
                 "latitude": la,
                 "longitude": lo,
                 "address": _pick_address(f),
-                "price": _row_effective_price(f, payment_mode, prefer_web_sourced_prices),
+                "price": eff,
+                "estimated_range": (default_estimate_range or "") if eff is None else None,
                 "web_price": (
                     float(f["web_candidate_price"])
                     if f.get("web_candidate_price") is not None
@@ -2568,6 +2605,7 @@ def _generate_map_data(
                     else None
                 ),
                 "distance_miles": f.get("distance_miles"),
+                "website_url": _public_facility_website_or_maps(f),
             })
     
     return {
@@ -2801,6 +2839,8 @@ def build_facility_block(
                 "price_source": psrc,
                 "latitude": plat,
                 "longitude": plon,
+                "facility_key": _facility_stable_key(f),
+                "website_url": _public_facility_website_or_maps(f),
             }
         )
 
@@ -2814,6 +2854,7 @@ def build_facility_block(
             facilities,
             payment_mode or "cash",
             prefer_web_sourced_prices,
+            default_estimate_range=est_range,
         )
         if map_data is not None:
             if procedure_display_name:
