@@ -605,12 +605,12 @@
                 const showWeb = f.web_price != null && Number(f.web_price) > 0;
                 let noteText = 'Estimate';
                 if (f.price) {
-                    if (f.price_source === 'web_reconciled') noteText = 'Web-aligned';
-                    else if (f.price_source === 'web_gap_fill') noteText = 'Web est.';
+                    if (f.price_source === 'web_search') noteText = 'Web search';
+                    else if (f.price_source === 'db') noteText = 'DB price';
                     else if (showWeb) noteText = 'DB + web';
                     else noteText = 'Verified';
                 }
-                const webRow = showWeb ? `<div class="facility-web-price">Web search: $${Number(f.web_price).toLocaleString()}</div>` : '';
+                const webRow = (showWeb && f.price_source !== 'web_search') ? `<div class="facility-web-price">Web search: $${Number(f.web_price).toLocaleString()}</div>` : '';
                 card.innerHTML = `<div class="facility-row"><div class="facility-info"><div class="facility-index">${i + 1}</div><div class="facility-details"><div class="facility-name">${f.hospital_name || 'Healthcare Facility'}</div><div class="facility-type">Healthcare Facility</div><div class="facility-location">${f.distance_miles ? `<span>📍 ${f.distance_miles.toFixed(1)} mi</span>` : ''} <span>${f.address || ''}</span></div></div></div><div class="facility-pricing"><div class="facility-price ${priceClass}">${priceText}</div><div class="price-note">${noteText}</div>${webRow}</div></div>`;
                 card.addEventListener('click', () => selectFacility(i));
                 facilityList.appendChild(card);
