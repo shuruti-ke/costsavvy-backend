@@ -86,6 +86,17 @@
         .facility-price.low { color: #059669; }
         .facility-price.estimate { color: #888; font-size: 14px; }
         .price-note { font-size: 11px; color: #888; }
+        .facility-web-price { font-size: 12px; color: #2563eb; font-weight: 600; margin-top: 4px; }
+        .web-search-section { border-top: 1px solid #eee; padding: 12px 16px 16px; background: #fafbff; }
+        .web-search-section h3 { font-size: 13px; font-weight: 600; color: #444; margin-bottom: 6px; }
+        .web-search-hint { font-size: 11px; color: #666; margin-bottom: 10px; line-height: 1.4; }
+        .web-search-list { display: flex; flex-direction: column; gap: 8px; max-height: 220px; overflow-y: auto; }
+        .web-search-row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 10px; background: white; border-radius: 8px; border: 1px solid #e8ecf4; }
+        .web-search-idx { flex-shrink: 0; width: 22px; height: 22px; border-radius: 50%; background: #2563eb; color: white; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; }
+        .web-search-body { flex: 1; min-width: 0; }
+        .web-search-name { font-size: 13px; font-weight: 600; color: #333; }
+        .web-search-meta { font-size: 11px; color: #666; margin-top: 2px; }
+        .web-search-price { font-size: 15px; font-weight: 700; color: #1d4ed8; flex-shrink: 0; }
         
         /* Map */
         .map-section { position: relative; }
@@ -302,6 +313,11 @@
                         </select>
                     </div>
                     <div class="facility-list" id="facilityList"></div>
+                    <div class="web-search-section" id="webSearchSection" style="display:none;">
+                        <h3>Web search (per hospital)</h3>
+                        <p class="web-search-hint">Individual prices extracted from web results for each facility we searched (may differ from the displayed “best” price when we blend DB + web).</p>
+                        <div class="web-search-list" id="webSearchList"></div>
+                    </div>
                 </div>
                 <div class="map-section">
                     <div class="map-container">
@@ -370,7 +386,7 @@
     <script>
         const API_BASE_URL = window.location.origin;
         let sessionId = 'session-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
-        let map = null, markers = [], priceLabels = [], currentMapData = null, currentFacilities = [], isProcessing = false;
+        let map = null, markers = [], priceLabels = [], currentMapData = null, currentFacilities = [], currentWebFacilityPrices = [], isProcessing = false;
         
         const $ = id => document.getElementById(id);
         const quickSearchForm = $('quickSearchForm'), quickSearchBtn = $('quickSearchBtn'), chatMessages = $('chatMessages');
@@ -378,6 +394,33 @@
         const resultsSection = $('resultsSection'), facilityList = $('facilityList'), resultsTitle = $('resultsTitle');
         const resultsCount = $('resultsCount'), priceMin = $('priceMin'), priceMax = $('priceMax');
         const openMapsBtn = $('openMapsBtn'), sortSelect = $('sortSelect'), errorMessage = $('errorMessage');
+        const webSearchSection = $('webSearchSection'), webSearchList = $('webSearchList');
+        
+        function escapeHtml(str) {
+            if (str == null || str === '') return '';
+            const d = document.createElement('div');
+            d.textContent = String(str);
+            return d.innerHTML;
+        }
+        
+        function renderWebSearchList(items) {
+            if (!webSearchSection || !webSearchList) return;
+            if (!items || items.length === 0) {
+                webSearchSection.style.display = 'none';
+                webSearchList.innerHTML = '';
+                return;
+            }
+            webSearchSection.style.display = 'block';
+            webSearchList.innerHTML = items.map((w, i) => {
+                const dist = w.distance_miles != null && !Number.isNaN(Number(w.distance_miles))
+                    ? `${Number(w.distance_miles).toFixed(1)} mi · ` : '';
+                const addr = escapeHtml(w.address || '');
+                const name = escapeHtml(w.hospital_name || 'Healthcare facility');
+                const px = Number(w.web_price);
+                const priceStr = Number.isFinite(px) ? `$${px.toLocaleString()}` : '—';
+                return `<div class="web-search-row"><span class="web-search-idx">${i + 1}</span><div class="web-search-body"><div class="web-search-name">${name}</div><div class="web-search-meta">${dist}${addr}</div></div><div class="web-search-price">${priceStr}</div></div>`;
+            }).join('');
+        }
         
         document.addEventListener('DOMContentLoaded', () => {
             quickSearchForm.addEventListener('submit', handleQuickSearch);
@@ -429,7 +472,8 @@
 
                 if (data.mapData && data.facilities.length > 0) {
                     currentMapData = data.mapData; currentFacilities = data.facilities;
-                    displayResults(data.mapData, data.facilities, resolvedLabel);
+                    currentWebFacilityPrices = data.webFacilityPrices || [];
+                    displayResults(data.mapData, data.facilities, resolvedLabel, currentWebFacilityPrices);
                 }
                 // Only show error if no text response AND no results (true error case)
                 if (!data.text && (!data.mapData || data.facilities.length === 0)) {
@@ -459,7 +503,8 @@
                 if (data.text) addMessage(data.text, 'assistant');
                 if (data.mapData && data.facilities.length > 0) {
                     currentMapData = data.mapData; currentFacilities = data.facilities;
-                    displayResults(data.mapData, data.facilities);
+                    currentWebFacilityPrices = data.webFacilityPrices || [];
+                    displayResults(data.mapData, data.facilities, null, currentWebFacilityPrices);
                 }
             } catch (error) {
                 typingIndicator.classList.remove('active');
@@ -474,17 +519,22 @@
             });
             if (!response.ok) throw new Error(`API error: ${response.status}`);
             const text = await response.text(), lines = text.split('\n');
-            let fullText = '', mapData = null, facilities = [], resultState = {};
+            let fullText = '', mapData = null, facilities = [], resultState = {}, webFacilityPrices = [];
             for (const line of lines) {
                 if (line.startsWith('data: ')) {
                     try {
                         const data = JSON.parse(line.slice(6));
                         if (data.type === 'delta' && data.text) fullText += data.text;
-                        if (data.type === 'results') { mapData = data.map_data; facilities = data.facilities || []; resultState = data.state || {}; }
+                        if (data.type === 'results') {
+                            mapData = data.map_data;
+                            facilities = data.facilities || [];
+                            resultState = data.state || {};
+                            webFacilityPrices = data.web_facility_prices || [];
+                        }
                     } catch (e) {}
                 }
             }
-            return { text: fullText, mapData, facilities, resultState };
+            return { text: fullText, mapData, facilities, resultState, webFacilityPrices };
         }
         
         function showError(msg) { errorMessage.textContent = msg; errorMessage.classList.add('active'); }
@@ -503,11 +553,12 @@
         
         function scrollToBottom() { chatMessages.scrollTop = chatMessages.scrollHeight; }
         
-        function displayResults(mapData, facilities, serviceName) {
+        function displayResults(mapData, facilities, serviceName, webFacilityPrices) {
             resultsSection.classList.add('active');
             const service = serviceName || (mapData.service_query ? mapData.service_query.charAt(0).toUpperCase() + mapData.service_query.slice(1) : 'Healthcare Service');
             resultsTitle.textContent = `Results for ${service}`;
             resultsCount.textContent = `${facilities.length} ${facilities.length === 1 ? 'facility' : 'facilities'}`;
+            renderWebSearchList(webFacilityPrices && webFacilityPrices.length ? webFacilityPrices : []);
 
             const prices = facilities.filter(f => f.price).map(f => f.price);
             const estimateNote = document.getElementById('priceEstimateNote');
@@ -551,7 +602,16 @@
                 card.className = 'facility-card';
                 const priceText = f.price ? `$${f.price.toLocaleString()}` : (f.estimated_range || 'Contact');
                 const priceClass = f.price ? (f.price <= (currentFacilities[0]?.price || 0) * 1.2 ? 'low' : '') : 'estimate';
-                card.innerHTML = `<div class="facility-row"><div class="facility-info"><div class="facility-index">${i + 1}</div><div class="facility-details"><div class="facility-name">${f.hospital_name || 'Healthcare Facility'}</div><div class="facility-type">Healthcare Facility</div><div class="facility-location">${f.distance_miles ? `<span>📍 ${f.distance_miles.toFixed(1)} mi</span>` : ''} <span>${f.address || ''}</span></div></div></div><div class="facility-pricing"><div class="facility-price ${priceClass}">${priceText}</div><div class="price-note">${f.price ? 'Verified' : 'Estimate'}</div></div></div>`;
+                const showWeb = f.web_price != null && Number(f.web_price) > 0;
+                let noteText = 'Estimate';
+                if (f.price) {
+                    if (f.price_source === 'web_reconciled') noteText = 'Web-aligned';
+                    else if (f.price_source === 'web_gap_fill') noteText = 'Web est.';
+                    else if (showWeb) noteText = 'DB + web';
+                    else noteText = 'Verified';
+                }
+                const webRow = showWeb ? `<div class="facility-web-price">Web search: $${Number(f.web_price).toLocaleString()}</div>` : '';
+                card.innerHTML = `<div class="facility-row"><div class="facility-info"><div class="facility-index">${i + 1}</div><div class="facility-details"><div class="facility-name">${f.hospital_name || 'Healthcare Facility'}</div><div class="facility-type">Healthcare Facility</div><div class="facility-location">${f.distance_miles ? `<span>📍 ${f.distance_miles.toFixed(1)} mi</span>` : ''} <span>${f.address || ''}</span></div></div></div><div class="facility-pricing"><div class="facility-price ${priceClass}">${priceText}</div><div class="price-note">${noteText}</div>${webRow}</div></div>`;
                 card.addEventListener('click', () => selectFacility(i));
                 facilityList.appendChild(card);
             });
@@ -614,7 +674,9 @@
                     const facilityIcon = L.divIcon({ className: '', html: `<div class="facility-marker">${idx + 1}</div>`, iconSize: [28, 28], iconAnchor: [14, 14] });
                     const marker = L.marker([f.latitude, f.longitude], { icon: facilityIcon }).addTo(map);
                     const priceText = f.price ? `$${f.price.toLocaleString()}` : 'Contact';
-                    marker.bindPopup(`<div class="popup-title">${f.name || 'Healthcare Facility'}</div><div class="popup-address">${f.address || ''}</div><div class="popup-details"><span class="popup-distance">${f.distance_miles ? f.distance_miles.toFixed(1) + ' mi' : ''}</span><span class="popup-price">${priceText}</span></div>`);
+                    const webLine = (f.web_price != null && Number(f.web_price) > 0)
+                        ? `<div class="popup-web" style="font-size:12px;color:#2563eb;margin-top:4px;">Web search: $${Number(f.web_price).toLocaleString()}</div>` : '';
+                    marker.bindPopup(`<div class="popup-title">${f.name || 'Healthcare Facility'}</div><div class="popup-address">${f.address || ''}</div><div class="popup-details"><span class="popup-distance">${f.distance_miles ? f.distance_miles.toFixed(1) + ' mi' : ''}</span><span class="popup-price">${priceText}</span></div>${webLine}`);
                     marker.on('click', () => selectFacility(idx));
                     markers.push(marker);
                     if (f.price) {
@@ -630,7 +692,9 @@
             const coords = [];
             if (mapData.user_location?.latitude && mapData.user_location?.longitude) coords.push([mapData.user_location.latitude, mapData.user_location.longitude]);
             mapData.facilities?.forEach(f => { if (f.latitude && f.longitude) coords.push([f.latitude, f.longitude]); });
-            if (coords.length > 1) map.fitBounds(L.latLngBounds(coords), { padding: [40, 40] });
+            if (coords.length > 1) {
+                map.fitBounds(L.latLngBounds(coords), { padding: [48, 48], maxZoom: 13 });
+            }
         }
     </script>
 </body>

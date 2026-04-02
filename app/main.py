@@ -5,12 +5,14 @@ import re
 import uuid
 import time
 import logging
+import asyncio
+import statistics
 import httpx
 from typing import Optional, Any, Dict, List, Tuple
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -38,13 +40,33 @@ MIN_DB_RESULTS_BEFORE_WEB = int(os.getenv("MIN_DB_RESULTS_BEFORE_WEB", "3"))
 
 # Always try to show at least this many facilities in the answer
 MIN_FACILITIES_TO_DISPLAY = int(os.getenv("MIN_FACILITIES_TO_DISPLAY", "5"))
+# Fetch extra nearby rows so priced results can inherit lat/lon and the map can show 5 pins vs ZIP
+NEARBY_COORD_LOOKUP_LIMIT = int(
+    os.getenv("NEARBY_COORD_LOOKUP_LIMIT", str(max(30, MIN_FACILITIES_TO_DISPLAY * 6)))
+)
 
 # Web search configuration for health education
 WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "true").lower() in ("1", "true", "yes", "y", "on")
 WEB_SEARCH_TIMEOUT = int(os.getenv("WEB_SEARCH_TIMEOUT", "15"))
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "").strip()
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
+
+# Optional: enrich facility rows with web prices + reconcile vs DB
+WEB_PRICE_SEARCH_ENABLED = os.getenv("WEB_PRICE_SEARCH_ENABLED", "true").lower() in (
+    "1", "true", "yes", "y", "on"
+)
+WEB_PRICE_RECONCILE_ENABLED = os.getenv("WEB_PRICE_RECONCILE_ENABLED", "true").lower() in (
+    "1", "true", "yes", "y", "on"
+)
+WEB_PRICE_CV_MAX_SIMILAR = float(os.getenv("WEB_PRICE_CV_MAX_SIMILAR", "0.38"))
+WEB_DB_WEB_MEDIAN_GAP = float(os.getenv("WEB_DB_WEB_MEDIAN_GAP", "0.33"))
+WEB_PRICE_MIN_CONSENSUS = max(2, int(os.getenv("WEB_PRICE_MIN_CONSENSUS", "2")))
+# Strong confirmation: always run web (when API keys exist); if ≥N web prices cluster and DB disagrees, show web
+WEB_PRICE_CONFIRM_MIN_SAMPLES = max(2, int(os.getenv("WEB_PRICE_CONFIRM_MIN_SAMPLES", "5")))
+WEB_CLUSTER_SPREAD_MAX = float(os.getenv("WEB_CLUSTER_SPREAD_MAX", "0.72"))
+WEB_DB_MEDIAN_VS_WEB_MIN = float(os.getenv("WEB_DB_MEDIAN_VS_WEB_MIN", "0.42"))
+WEB_DB_MEDIAN_VS_WEB_MAX = float(os.getenv("WEB_DB_MEDIAN_VS_WEB_MAX", "1.85"))
+WEB_STRONG_MEDIAN_GAP = float(os.getenv("WEB_STRONG_MEDIAN_GAP", "0.30"))
 
 # Care navigation: symptom keywords that trigger care-finding mode (not pricing)
 SYMPTOM_KEYWORDS = [
@@ -169,11 +191,6 @@ async def shutdown():
 async def health():
     return {"status": "ok"}
 
-
-
-@app.get("/favicon.ico", include_in_schema=False)
-async def favicon():
-    return RedirectResponse(url="/static/favicon.svg")
 
 @app.get("/")
 async def home():
@@ -351,36 +368,418 @@ async def web_search_health_info(query: str, num_results: int = 5) -> List[Dict[
                         })
         except Exception as e:
             logger.warning(f"Serper search failed: {e}")
+    
+    return results
 
-    # Fallback to Tavily
-    if not results and TAVILY_API_KEY:
+
+def _normalize_hospital_key(name: str) -> str:
+    s = (name or "").lower()
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
+
+
+def _coefficient_of_variation(values: List[float]) -> Optional[float]:
+    if len(values) < 2:
+        return None
+    m = statistics.mean(values)
+    if m <= 0:
+        return None
+    try:
+        st = statistics.stdev(values)
+    except statistics.StatisticsError:
+        return None
+    return st / m
+
+
+def _web_prices_cluster_similar(web_vals: List[float]) -> bool:
+    """True if web-derived prices sit in a tight band (e.g. $1.4k–$2.5k)."""
+    if len(web_vals) < 2:
+        return False
+    med = statistics.median(web_vals)
+    if med <= 0:
+        return False
+    spread_ratio = (max(web_vals) - min(web_vals)) / med
+    cv_w = _coefficient_of_variation(web_vals)
+    ok_spread = spread_ratio <= WEB_CLUSTER_SPREAD_MAX
+    ok_cv = cv_w is not None and cv_w <= WEB_PRICE_CV_MAX_SIMILAR
+    return ok_spread or ok_cv
+
+
+def _should_prefer_web_strong(db_vals: List[float], web_vals: List[float]) -> bool:
+    """
+    ≥ WEB_PRICE_CONFIRM_MIN_SAMPLES web prices form a similar cluster, but DB (even one row)
+    is far from that cluster — e.g. DB $200 vs web $1.4k–$2.5k across five hospitals.
+    """
+    if len(web_vals) < WEB_PRICE_CONFIRM_MIN_SAMPLES or not db_vals:
+        return False
+    if not _web_prices_cluster_similar(web_vals):
+        return False
+    min_w, max_w = min(web_vals), max(web_vals)
+    med_w = statistics.median(web_vals)
+    med_d = statistics.median(db_vals)
+    if med_w <= 0:
+        return False
+    median_too_low = med_d < min_w * WEB_DB_MEDIAN_VS_WEB_MIN
+    median_too_high = med_d > max_w * WEB_DB_MEDIAN_VS_WEB_MAX
+    rel_gap = abs(med_d - med_w) / med_w
+    return median_too_low or median_too_high or rel_gap >= WEB_STRONG_MEDIAN_GAP
+
+
+def _should_prefer_web_weak(db_vals: List[float], web_vals: List[float]) -> bool:
+    """Smaller sample fallback (≥2 web, ≥2 DB) when we do not have five web hits."""
+    if len(web_vals) < WEB_PRICE_MIN_CONSENSUS or len(db_vals) < WEB_PRICE_MIN_CONSENSUS:
+        return False
+    cv_w = _coefficient_of_variation(web_vals)
+    if cv_w is None or cv_w > WEB_PRICE_CV_MAX_SIMILAR:
+        return False
+    med_w = statistics.median(web_vals)
+    med_d = statistics.median(db_vals)
+    if med_w <= 0:
+        return False
+    rel_gap = abs(med_d - med_w) / med_w
+    if rel_gap < WEB_DB_WEB_MEDIAN_GAP:
+        return False
+    cv_d = _coefficient_of_variation(db_vals)
+    if cv_d is None:
+        return True
+    return rel_gap >= WEB_DB_WEB_MEDIAN_GAP and (cv_d > cv_w * 1.15 or rel_gap >= WEB_DB_WEB_MEDIAN_GAP * 1.25)
+
+
+def _should_prefer_web_over_db(db_vals: List[float], web_vals: List[float]) -> bool:
+    """
+    Prefer web when (1) strong confirmation: enough similar web prices and DB clearly wrong, or
+    (2) weak: smaller samples but prior median/CV logic applies.
+    """
+    if not WEB_PRICE_RECONCILE_ENABLED:
+        return False
+    if _should_prefer_web_strong(db_vals, web_vals):
+        return True
+    return _should_prefer_web_weak(db_vals, web_vals)
+
+
+async def _web_search_hospital_pricing_snippets(
+    hospital_name: str,
+    location_hint: str,
+    service_query: str,
+    code: str,
+    payment_mode: str,
+    num_results: int = 8,
+) -> List[Dict[str, Any]]:
+    """General web search tuned for facility-level price signals (not health-education sites)."""
+    if not WEB_SEARCH_ENABLED or not WEB_PRICE_SEARCH_ENABLED:
+        return []
+    parts = [f'"{hospital_name}"', (service_query or "").strip() or "medical procedure"]
+    if code:
+        parts.append(str(code))
+    if location_hint:
+        parts.append(location_hint)
+    pm = (payment_mode or "cash").lower()
+    if pm.startswith("insur"):
+        parts.append("negotiated rate insurance hospital price")
+    else:
+        parts.append("cash price self-pay hospital chargemaster")
+    query = " ".join(p for p in parts if p)
+
+    out: List[Dict[str, Any]] = []
+
+    if SERPER_API_KEY:
         try:
-            async with httpx.AsyncClient(timeout=WEB_SEARCH_TIMEOUT) as client:
-                resp = await client.post(
-                    "https://api.tavily.com/search",
-                    json={
-                        "api_key": TAVILY_API_KEY,
-                        "query": f"{query} health medical",
-                        "max_results": num_results,
-                        "search_depth": "basic",
-                        "include_domains": [
-                            "mayoclinic.org", "webmd.com", "healthline.com",
-                            "medlineplus.gov", "cdc.gov", "nih.gov"
-                        ],
-                    },
+            async with httpx.AsyncClient(timeout=WEB_SEARCH_TIMEOUT) as http:
+                resp = await http.post(
+                    "https://google.serper.dev/search",
+                    headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                    json={"q": query, "num": num_results},
                 )
                 if resp.status_code == 200:
-                    for item in resp.json().get("results", [])[:num_results]:
-                        results.append({
-                            "title": item.get("title", ""),
-                            "snippet": item.get("content", ""),
-                            "url": item.get("url", ""),
-                            "source": "tavily"
-                        })
+                    data = resp.json()
+                    for item in data.get("organic", [])[:num_results]:
+                        out.append(
+                            {
+                                "title": item.get("title", ""),
+                                "snippet": item.get("snippet", ""),
+                                "url": item.get("link", ""),
+                                "source": "serper",
+                            }
+                        )
         except Exception as e:
-            logger.warning(f"Tavily health search failed: {e}")
+            logger.warning(f"Serper facility price search failed: {e}")
 
-    return results
+    if not out and BRAVE_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=WEB_SEARCH_TIMEOUT) as http:
+                resp = await http.get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    headers={"X-Subscription-Token": BRAVE_API_KEY},
+                    params={"q": query, "count": num_results},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for item in data.get("web", {}).get("results", [])[:num_results]:
+                        out.append(
+                            {
+                                "title": item.get("title", ""),
+                                "snippet": item.get("description", ""),
+                                "url": item.get("url", ""),
+                                "source": "brave",
+                            }
+                        )
+        except Exception as e:
+            logger.warning(f"Brave facility price search failed: {e}")
+
+    return out
+
+
+def _parse_facility_web_prices_batch_llm(
+    hospital_snippets: List[Tuple[str, List[Dict[str, Any]]]],
+    service_query: str,
+    payment_mode: str,
+) -> Dict[str, Optional[float]]:
+    """One structured pass over all snippets; returns normalized-hospital-key -> USD price."""
+    if not hospital_snippets:
+        return {}
+    blocks = []
+    for hosp, results in hospital_snippets:
+        body = "\n".join(
+            f"- {r.get('title', '')}: {r.get('snippet', '')}" for r in (results or [])[:6]
+        )
+        blocks.append(f'### "{hosp}"\n{body}')
+    user = (
+        f"Service: {service_query}\nPayment context: {payment_mode}\n\n" + "\n\n".join(blocks)
+    )
+    system = (
+        "You read web search snippets about U.S. hospital pricing. For each ### hospital section, "
+        "extract ONE numeric USD price only if snippets clearly cite an amount for that specific hospital "
+        "(or its published price list / chargemaster / CDM for this service). "
+        "Do not guess from unrelated facilities or generic national averages unless clearly tied to that hospital. "
+        'Return JSON only: an array [{"hospital":"<exact heading name>","price_usd":number|null}, ...] '
+        'in the same order as sections. Use null when unclear.'
+    )
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            timeout=45,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
+        raw = re.sub(r"\s*```\s*$", "", raw)
+        arr = json.loads(raw)
+    except Exception as e:
+        logger.warning(f"Batch web price parse failed: {e}")
+        return {}
+
+    by_key: Dict[str, float] = {}
+    if not isinstance(arr, list):
+        return {}
+    for entry in arr:
+        if not isinstance(entry, dict):
+            continue
+        name = (entry.get("hospital") or "").strip()
+        p = entry.get("price_usd")
+        if name and isinstance(p, (int, float)) and p > 0:
+            by_key[_normalize_hospital_key(name)] = float(p)
+    return by_key
+
+
+def _web_facility_catalog_from_targets(targets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """One entry per probed hospital that got a web-extracted price (for UI + API)."""
+    out: List[Dict[str, Any]] = []
+    for t in targets:
+        wp = t.get("web_candidate_price")
+        if wp is None:
+            continue
+        try:
+            wf = float(wp)
+        except (TypeError, ValueError):
+            continue
+        if wf <= 0:
+            continue
+        lat, lon = t.get("latitude"), t.get("longitude")
+        try:
+            lat_f = float(lat) if lat is not None else None
+        except (TypeError, ValueError):
+            lat_f = None
+        try:
+            lon_f = float(lon) if lon is not None else None
+        except (TypeError, ValueError):
+            lon_f = None
+        out.append(
+            {
+                "hospital_name": _pick_hospital_name(t),
+                "address": _pick_address(t),
+                "distance_miles": t.get("distance_miles") or t.get("distance"),
+                "web_price": wf,
+                "latitude": lat_f,
+                "longitude": lon_f,
+            }
+        )
+    return out
+
+
+async def attach_web_prices_to_facility_results(
+    results: List[Dict[str, Any]],
+    service_query: str,
+    code: str,
+    payment_mode: str,
+    fill_hospitals: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[bool, List[float], List[Dict[str, Any]]]:
+    """
+    Always (when enabled + API keys) runs web searches for up to MIN_FACILITIES_TO_DISPLAY
+    hospitals to confirm DB pricing — priced rows first, then nearby facilities to reach 5.
+    Sets web_candidate_price on rows when extraction succeeds.
+    Returns (attempted, all_web_prices_from_targets, web_facility_catalog) for UI + reconciliation.
+    """
+    if not WEB_PRICE_SEARCH_ENABLED or not WEB_SEARCH_ENABLED:
+        return False, [], []
+    if not (SERPER_API_KEY or BRAVE_API_KEY):
+        return False, [], []
+
+    targets: List[Dict[str, Any]] = []
+    seen = set()
+    limit = MIN_FACILITIES_TO_DISPLAY
+
+    for r in results:
+        name = _pick_hospital_name(r)
+        key = name.lower().strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        targets.append(r)
+        if len(targets) >= limit:
+            break
+
+    if fill_hospitals and len(targets) < limit:
+        for h in fill_hospitals:
+            if len(targets) >= limit:
+                break
+            name = (h.get("hospital_name") or "").strip()
+            key = name.lower().strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            targets.append(
+                {
+                    "hospital_name": h.get("hospital_name"),
+                    "address": h.get("address"),
+                    "state": h.get("state"),
+                    "zipcode": h.get("zipcode"),
+                    "phone": h.get("phone"),
+                    "latitude": h.get("latitude"),
+                    "longitude": h.get("longitude"),
+                    "distance_miles": h.get("distance_miles"),
+                    "_web_probe_only": True,
+                }
+            )
+
+    if not targets:
+        return False, [], []
+
+    sem = asyncio.Semaphore(4)
+
+    async def fetch_one(row: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]]]:
+        name = _pick_hospital_name(row)
+        loc = _pick_address(row) or ""
+        async with sem:
+            snips = await _web_search_hospital_pricing_snippets(
+                name, loc, service_query, code, payment_mode
+            )
+        return name, snips
+
+    pairs = await asyncio.gather(*[fetch_one(r) for r in targets])
+    key_to_price = _parse_facility_web_prices_batch_llm(pairs, service_query, payment_mode)
+
+    for r in targets:
+        k = _normalize_hospital_key(_pick_hospital_name(r))
+        p = key_to_price.get(k)
+        if p is None and key_to_price:
+            for kk, pv in key_to_price.items():
+                if len(k) >= 6 and (k in kk or kk in k):
+                    p = pv
+                    break
+        if p is not None:
+            r["web_candidate_price"] = p
+
+    web_vals_all = [
+        float(t["web_candidate_price"])
+        for t in targets
+        if t.get("web_candidate_price") is not None
+    ]
+    catalog = _web_facility_catalog_from_targets(targets)
+    return True, web_vals_all, catalog
+
+
+def apply_db_web_price_reconciliation(
+    results: List[Dict[str, Any]],
+    web_vals_all: Optional[List[float]] = None,
+) -> None:
+    """
+    Sets price_override + price_source when web consensus overrides DB or fills gaps.
+    web_vals_all includes prices from all probed hospitals (including fill-only rows).
+    """
+    db_vals = [p for r in results if (p := _pick_price_fields(r)) is not None]
+    row_web = [
+        float(r["web_candidate_price"])
+        for r in results
+        if r.get("web_candidate_price") is not None
+    ]
+    web_for_decision = web_vals_all if web_vals_all is not None else row_web
+    prefer_web = _should_prefer_web_over_db(db_vals, web_for_decision)
+    consensus_m = statistics.median(web_for_decision) if web_for_decision else None
+
+    for r in results:
+        db_p = _pick_price_fields(r)
+        web_p = r.get("web_candidate_price")
+        web_pf = float(web_p) if isinstance(web_p, (int, float)) and web_p > 0 else None
+
+        if prefer_web:
+            chosen = web_pf if web_pf is not None else None
+            if chosen is None and consensus_m is not None and consensus_m > 0:
+                chosen = float(consensus_m)
+            if chosen is not None and chosen > 0:
+                r["price_override"] = chosen
+                r["price_source"] = "web_reconciled"
+            else:
+                r.pop("price_override", None)
+                if r.get("price_source") == "web_reconciled":
+                    r.pop("price_source", None)
+            continue
+
+        if web_pf is not None:
+            if db_p is None:
+                r["price_override"] = web_pf
+                r["price_source"] = "web_gap_fill"
+            else:
+                r.pop("price_override", None)
+                r.pop("price_source", None)
+        else:
+            r.pop("price_override", None)
+            if r.get("price_source") in ("web_reconciled", "web_gap_fill"):
+                r.pop("price_source", None)
+
+
+def _row_effective_price(row: Dict[str, Any]) -> Optional[float]:
+    o = row.get("price_override")
+    if o is not None:
+        try:
+            v = float(o)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return _pick_price_fields(row)
+
+
+def _row_price_display_note(row: Dict[str, Any]) -> str:
+    if row.get("price_override") is not None:
+        ps = row.get("price_source")
+        if ps == "web_reconciled":
+            return "Web-aligned (market check)"
+        if ps == "web_gap_fill":
+            return "Web-sourced estimate"
+        return "Web-sourced estimate"
+    if _pick_price_fields(row) is not None:
+        return "DB price"
+    return "ESTIMATE (no DB price yet)"
 
 
 def is_symptom_query(message: str) -> bool:
@@ -1454,121 +1853,32 @@ async def get_nearby_hospitals(conn: asyncpg.Connection, zipcode: str, limit: in
 
 
 # ----------------------------
-# Web-search price lookup (replaces hallucinated estimates)
+# Estimated range (when DB price missing)
 # ----------------------------
-async def web_search_price_range(
-    service_query: str,
-    cpt_code: Optional[str],
-    zipcode: str,
-    payment_mode: str,
-) -> Optional[str]:
+def estimate_cost_range(service_query: str, payment_mode: str) -> str:
     """
-    Search the web for real published hospital prices for this service/CPT
-    near the given ZIP. Returns a price-range string extracted from actual
-    search results (e.g. "$800–$2,400") or None if nothing credible is found.
-    Never invents numbers — only returns what is explicitly in the snippets.
+    Returns a short '$X–$Y' range, explicitly an estimate.
+    This is used ONLY when DB pricing is missing.
     """
-    if not WEB_SEARCH_ENABLED or not (BRAVE_API_KEY or SERPER_API_KEY or TAVILY_API_KEY):
-        return None
-
-    cpt_part = f"CPT {cpt_code}" if cpt_code else ""
-    query = (
-        f"{service_query} {cpt_part} hospital price transparency "
-        f"{zipcode} cash price 2024 2025"
-    ).strip()
-
-    snippets: List[str] = []
-
-    if BRAVE_API_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=WEB_SEARCH_TIMEOUT) as hc:
-                resp = await hc.get(
-                    "https://api.search.brave.com/res/v1/web/search",
-                    headers={"X-Subscription-Token": BRAVE_API_KEY},
-                    params={"q": query, "count": 10},
-                )
-                if resp.status_code == 200:
-                    for item in resp.json().get("web", {}).get("results", [])[:10]:
-                        t = item.get("title", "")
-                        s = item.get("description", "")
-                        if t or s:
-                            snippets.append(f"{t}: {s}")
-        except Exception as e:
-            logger.warning(f"Brave price search failed: {e}")
-
-    if not snippets and SERPER_API_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=WEB_SEARCH_TIMEOUT) as hc:
-                resp = await hc.post(
-                    "https://google.serper.dev/search",
-                    headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-                    json={"q": query, "num": 10},
-                )
-                if resp.status_code == 200:
-                    for item in resp.json().get("organic", [])[:10]:
-                        t = item.get("title", "")
-                        s = item.get("snippet", "")
-                        if t or s:
-                            snippets.append(f"{t}: {s}")
-        except Exception as e:
-            logger.warning(f"Serper price search failed: {e}")
-
-    if not snippets and TAVILY_API_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=WEB_SEARCH_TIMEOUT) as hc:
-                resp = await hc.post(
-                    "https://api.tavily.com/search",
-                    json={
-                        "api_key": TAVILY_API_KEY,
-                        "query": query,
-                        "max_results": 10,
-                        "search_depth": "advanced",
-                    },
-                )
-                if resp.status_code == 200:
-                    for item in resp.json().get("results", [])[:10]:
-                        t = item.get("title", "")
-                        s = item.get("content", "")
-                        if t or s:
-                            snippets.append(f"{t}: {s}")
-        except Exception as e:
-            logger.warning(f"Tavily price search failed: {e}")
-
-    if not snippets:
-        return None
-
-    # Ask LLM to extract a price ONLY from snippets — not invent one
-    combined = "\n".join(snippets[:10])
-    system_msg = (
-        "You extract a price range from web search snippets for a US healthcare service. "
-        "Output ONLY a '$X–$Y' range if real dollar amounts appear in the snippets. "
-        "If no dollar amounts are mentioned, output exactly: NONE. "
-        "Do not invent or estimate numbers."
+    system = (
+        "You output ONLY a short numeric range for a U.S. healthcare service.\n"
+        "Format: '$X–$Y'. No extra text.\n"
+        "Be conservative and plausible."
     )
-    user_msg = (
-        f"Service: {service_query} {cpt_part}\n"
-        f"Payment: {payment_mode}\n"
-        f"ZIP: {zipcode}\n\n"
-        f"Search snippets:\n{combined}"
-    )
+    user = json.dumps({"service": service_query, "payment_mode": payment_mode})
     try:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            timeout=15,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            timeout=12,
         )
         txt = (resp.choices[0].message.content or "").strip()
-        if txt.upper() == "NONE" or "$" not in txt:
-            return None
-        if any(ch.isdigit() for ch in txt):
+        # basic sanity
+        if "$" in txt and any(ch.isdigit() for ch in txt):
             return txt
-    except Exception as e:
-        logger.warning(f"Price extraction from web snippets failed: {e}")
-
-    return None
+        return "$1,000–$3,000"
+    except Exception:
+        return "$1,000–$3,000"
 
 
 # ----------------------------
@@ -1608,6 +1918,79 @@ def _pick_address(row: Dict[str, Any]) -> str:
     return ", ".join(parts).strip()
 
 
+def _extract_lat_lon(row: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    lat, lon = row.get("latitude"), row.get("longitude")
+    try:
+        if lat is not None and lon is not None:
+            la, lo = float(lat), float(lon)
+            if -90 <= la <= 90 and -180 <= lo <= 180:
+                return la, lo
+    except (TypeError, ValueError):
+        pass
+    return None, None
+
+
+def _coords_by_hospital_key_from_rows(rows: List[Dict[str, Any]]) -> Dict[str, Tuple[float, float]]:
+    """Map normalized hospital name -> (lat, lon) from the first row that has coordinates."""
+    idx: Dict[str, Tuple[float, float]] = {}
+    for row in rows:
+        la, lo = _extract_lat_lon(row)
+        if la is None:
+            continue
+        k = _normalize_hospital_key(_pick_hospital_name(row))
+        if k and k not in idx:
+            idx[k] = (la, lo)
+    return idx
+
+
+def _enrich_facilities_with_coordinates(
+    facilities: List[Dict[str, Any]],
+    priced_results: List[Dict[str, Any]],
+    fallback_hospitals: List[Dict[str, Any]],
+) -> None:
+    """Copy lat/lon onto facility rows when the same hospital appears with geometry elsewhere."""
+    idx = _coords_by_hospital_key_from_rows(list(priced_results) + list(fallback_hospitals))
+    for f in facilities:
+        if _extract_lat_lon(f)[0] is not None:
+            continue
+        k = _normalize_hospital_key(_pick_hospital_name(f))
+        pair = idx.get(k)
+        if pair:
+            f["latitude"], f["longitude"] = pair[0], pair[1]
+
+
+def _backfill_facilities_missing_coordinates(
+    facilities: List[Dict[str, Any]],
+    fallback_hospitals: List[Dict[str, Any]],
+) -> None:
+    """
+    Replace facilities still lacking coordinates with the nearest fallback rows that have coords,
+    so the map can show five hospitals relative to the ZIP (unique names only).
+    """
+    changed = True
+    safety = 0
+    while changed and safety < 12:
+        safety += 1
+        changed = False
+        for i in range(len(facilities)):
+            if _extract_lat_lon(facilities[i])[0] is not None:
+                continue
+            other_names = {
+                _pick_hospital_name(facilities[j]).lower().strip()
+                for j in range(len(facilities))
+                if j != i
+            }
+            for h in fallback_hospitals:
+                if _extract_lat_lon(h)[0] is None:
+                    continue
+                hn = (h.get("hospital_name") or "").strip().lower()
+                if not hn or hn in other_names:
+                    continue
+                facilities[i] = dict(h)
+                changed = True
+                break
+
+
 def _generate_google_maps_url(
     user_lat: float, 
     user_lon: float, 
@@ -1620,32 +2003,21 @@ def _generate_google_maps_url(
     """
     import urllib.parse
     
-    # If we have facilities with coordinates, create a multi-destination map
-    valid_facilities = [
-        f for f in facilities 
-        if f.get("latitude") and f.get("longitude")
-    ]
-    
+    valid_facilities = [f for f in facilities if _extract_lat_lon(f)[0] is not None]
+
     if not valid_facilities:
-        # Fallback: just show user's location
         return f"https://www.google.com/maps?q={user_lat},{user_lon}&z=12"
-    
-    # Option 1: Create a map with markers for all hospitals
-    # Using the "dir" (directions) mode with waypoints
+
     if len(valid_facilities) == 1:
-        # Single destination - simple directions
         f = valid_facilities[0]
-        dest_lat, dest_lon = f["latitude"], f["longitude"]
+        dest_lat, dest_lon = _extract_lat_lon(f)
         return f"https://www.google.com/maps/dir/{user_lat},{user_lon}/{dest_lat},{dest_lon}"
-    
-    # Option 2: Create a search-based map centered on user location
-    # This shows hospitals in the area
-    # Build markers string for static map or use search
+
     markers = []
-    for i, f in enumerate(valid_facilities[:5], start=1):  # Limit to 5 markers
-        name = _pick_hospital_name(f)
-        lat, lon = f["latitude"], f["longitude"]
-        markers.append(f"{lat},{lon}")
+    for f in valid_facilities[:MIN_FACILITIES_TO_DISPLAY]:
+        la, lo = _extract_lat_lon(f)
+        if la is not None:
+            markers.append(f"{la},{lo}")
     
     # Use Google Maps with multiple destinations (waypoints)
     # Format: origin -> waypoint1 -> waypoint2 -> ... -> final destination
@@ -1681,9 +2053,10 @@ def _generate_static_map_url(
     markers = [f"color:blue|label:U|{user_lat},{user_lon}"]
     
     # Hospital markers (red, numbered)
-    for i, f in enumerate(facilities[:5], start=1):
-        if f.get("latitude") and f.get("longitude"):
-            markers.append(f"color:red|label:{i}|{f['latitude']},{f['longitude']}")
+    for i, f in enumerate(facilities[:MIN_FACILITIES_TO_DISPLAY], start=1):
+        la, lo = _extract_lat_lon(f)
+        if la is not None:
+            markers.append(f"color:red|label:{i}|{la},{lo}")
     
     params = {
         "size": "600x400",
@@ -1713,15 +2086,23 @@ def _generate_map_data(
     
     # Prepare facility coordinates for frontend map rendering
     facility_markers = []
-    for i, f in enumerate(facilities[:5], start=1):
-        if f.get("latitude") and f.get("longitude"):
+    for i, f in enumerate(facilities[:MIN_FACILITIES_TO_DISPLAY], start=1):
+        la, lo = _extract_lat_lon(f)
+        if la is not None:
             facility_markers.append({
                 "index": i,
                 "name": _pick_hospital_name(f),
-                "latitude": float(f["latitude"]),
-                "longitude": float(f["longitude"]),
+                "latitude": la,
+                "longitude": lo,
                 "address": _pick_address(f),
-                "price": _pick_price_fields(f),
+                "price": _row_effective_price(f),
+                "web_price": (
+                    float(f["web_candidate_price"])
+                    if f.get("web_candidate_price") is not None
+                    and isinstance(f.get("web_candidate_price"), (int, float))
+                    and float(f["web_candidate_price"]) > 0
+                    else None
+                ),
                 "distance_miles": f.get("distance_miles"),
             })
     
@@ -1808,7 +2189,7 @@ def build_facility_block(
     user_lat: Optional[float] = None,
     user_lon: Optional[float] = None,
     user_zipcode: str = "",
-    web_prices: Optional[Dict[str, str]] = None,
+    web_facility_catalog: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[str, List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
     Returns (text_answer, facilities_payload_for_ui, map_data).
@@ -1840,16 +2221,22 @@ def build_facility_block(
         seen.add(key)
         facilities.append(h)
 
+    # Ensure lat/lon for map pins: match priced rows to nearby directory, then swap in coords-only rows
+    if facilities:
+        _enrich_facilities_with_coordinates(facilities, priced_results, fallback_hospitals)
+        _backfill_facilities_missing_coordinates(facilities, fallback_hospitals)
+
     # If still empty, return a graceful message (should be rare if hospitals are loaded)
     if not facilities:
         return (
             "I couldn’t find hospitals near that ZIP code in my database yet. "
             "Try another nearby ZIP, or expand the search radius.",
             [],
+            None,
         )
 
     # Prepare an estimate range if needed
-    web_prices = web_prices or {}
+    est_range = estimate_cost_range(service_query or "this service", payment_mode or "cash")
 
     # Build answer text
     bullets = build_service_education_bullets(service_query or "this service", payment_mode or "cash")
@@ -1870,23 +2257,13 @@ def build_facility_block(
         except Exception:
             pass
 
-        price = _pick_price_fields(f)
-        # Look up web price for this specific hospital
-        hosp_key = name.lower().strip()
-        web_price_for_facility = next(
-            (v for k, v in web_prices.items()
-             if k.lower() in hosp_key or hosp_key in k.lower()),
-            None
-        )
+        price = _row_effective_price(f)
         if price is not None:
             price_txt = _format_money(price)
-            price_note = "verified price"
-        elif web_price_for_facility:
-            price_txt = web_price_for_facility
-            price_note = "web research — verify with facility"
+            price_note = _row_price_display_note(f)
         else:
-            price_txt = "Contact facility for pricing"
-            price_note = "no published price found"
+            price_txt = est_range
+            price_note = _row_price_display_note(f)
 
         detail_bits = []
         if addr:
@@ -1902,6 +2279,15 @@ def build_facility_block(
         lines.append(f"   - {detail}")
         lines.append(f"   - Price: **{price_txt}** ({price_note})")
 
+    if web_facility_catalog:
+        lines.append("")
+        lines.append("**Web search — price found (per hospital):**")
+        for j, w in enumerate(web_facility_catalog, start=1):
+            wname = (w.get("hospital_name") or "Unknown facility").strip()
+            wpx = w.get("web_price")
+            if isinstance(wpx, (int, float)) and wpx > 0:
+                lines.append(f"{j}) **{wname}** — **{_format_money(float(wpx))}** (from web)")
+
     lines.append("")
     lines.append("Confirm with the facility and your insurer.")
     
@@ -1914,23 +2300,27 @@ def build_facility_block(
     # Build facility payload for UI
     ui_payload = []
     for f in facilities[:MIN_FACILITIES_TO_DISPLAY]:
+        eff = _row_effective_price(f)
+        wraw = f.get("web_candidate_price")
+        web_pf = (
+            float(wraw)
+            if isinstance(wraw, (int, float)) and wraw and float(wraw) > 0
+            else None
+        )
+        plat, plon = _extract_lat_lon(f)
         ui_payload.append(
             {
                 "hospital_name": f.get("hospital_name") or _pick_hospital_name(f),
                 "address": _pick_address(f),
                 "phone": f.get("phone") or _pick_phone(f),
                 "distance_miles": f.get("distance_miles") or f.get("distance"),
-                "price": _pick_price_fields(f),
-                "estimated_range": None if _pick_price_fields(f) is not None else (
-                    next((v for k, v in web_prices.items()
-                          if k.lower() in (f.get("hospital_name") or _pick_hospital_name(f)).lower()
-                          or (f.get("hospital_name") or _pick_hospital_name(f)).lower() in k.lower()),
-                         "Contact facility for pricing")
-                ),
-                "price_is_estimate": _pick_price_fields(f) is None,
-                "price_from_web": _pick_price_fields(f) is None and bool(web_prices),
-                "latitude": f.get("latitude"),
-                "longitude": f.get("longitude"),
+                "price": eff,
+                "web_price": web_pf,
+                "estimated_range": None if eff is not None else est_range,
+                "price_is_estimate": eff is None,
+                "price_source": f.get("price_source"),
+                "latitude": plat,
+                "longitude": plon,
             }
         )
 
@@ -2859,12 +3249,30 @@ async def chat_stream(req: ChatRequest, request: Request):
                         merged.get("payment_mode") or "cash",
                     )
 
-                    # Always fetch at least 5 facilities for display
+                    # Nearby list first so web confirmation can always probe up to 5 hospitals
                     try:
-                        nearby_hospitals = await get_nearby_hospitals(conn, merged["zipcode"], limit=MIN_FACILITIES_TO_DISPLAY)
+                        nearby_hospitals = await get_nearby_hospitals(
+                            conn, merged["zipcode"], limit=NEARBY_COORD_LOOKUP_LIMIT
+                        )
                     except Exception as e:
                         logger.warning(f"Nearby hospitals lookup failed: {e}")
                         nearby_hospitals = []
+
+                    web_price_attempted = False
+                    web_vals_all: List[float] = []
+                    web_facility_catalog: List[Dict[str, Any]] = []
+                    try:
+                        web_price_attempted, web_vals_all, web_facility_catalog = await attach_web_prices_to_facility_results(
+                            results,
+                            merged.get("service_query") or "",
+                            merged.get("code") or "",
+                            merged.get("payment_mode") or "cash",
+                            fill_hospitals=nearby_hospitals,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Web facility price enrichment failed: {e}")
+                    if web_price_attempted:
+                        apply_db_web_price_reconciliation(results, web_vals_all)
 
                     # Get user's coordinates for map
                     user_lat, user_lon = None, None
@@ -2879,26 +3287,6 @@ async def chat_stream(req: ChatRequest, request: Request):
                     except Exception as e:
                         logger.warning(f"Failed to get user coordinates: {e}")
 
-                    # Search web for real per-hospital prices when DB has none
-                    web_prices_found: Dict[str, str] = {}
-                    has_db_prices = any(_pick_price_fields(r) is not None for r in results)
-                    if not has_db_prices and WEB_SEARCH_ENABLED and (BRAVE_API_KEY or SERPER_API_KEY or TAVILY_API_KEY):
-                        try:
-                            hosp_names = [
-                                _pick_hospital_name(h) for h in nearby_hospitals[:5]
-                                if _pick_hospital_name(h)
-                            ]
-                            web_prices_found = await web_search_price_range(
-                                service_query=merged.get("service_query") or "",
-                                cpt_code=merged.get("code") if merged.get("code_type") == "CPT" else None,
-                                zipcode=merged.get("zipcode") or "",
-                                payment_mode=merged.get("payment_mode") or "cash",
-                                payer=merged.get("payer_like"),
-                                hospital_names=hosp_names,
-                            )
-                        except Exception as _wse:
-                            logger.warning(f"web_search_price_range failed: {_wse}")
-
                     facility_text, facility_payload, map_data = build_facility_block(
                         service_query=merged.get("service_query") or "this service",
                         payment_mode=merged.get("payment_mode") or "cash",
@@ -2907,7 +3295,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                         user_lat=user_lat,
                         user_lon=user_lon,
                         user_zipcode=merged.get("zipcode") or "",
-                        web_prices=web_prices_found,
+                        web_facility_catalog=web_facility_catalog if web_facility_catalog else None,
                     )
 
                     yield sse(
@@ -2915,6 +3303,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                             "type": "results",
                             "results": results[:25],
                             "facilities": facility_payload,
+                            "web_facility_prices": web_facility_catalog,
                             "map_data": map_data,
                             "state": {
                                 k: merged.get(k)
@@ -2928,7 +3317,6 @@ async def chat_stream(req: ChatRequest, request: Request):
                                     "code",
                                     "refiner_id",
                                     "refiner_choice",
-                                    "variant_name",
                                 ]
                             },
                         }
@@ -2951,7 +3339,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     )
                     await update_session_state(conn, session_id, merged)
 
-                    used_web = len(results) < MIN_DB_RESULTS_BEFORE_WEB
+                    used_web = len(results) < MIN_DB_RESULTS_BEFORE_WEB or web_price_attempted
                     await log_query(conn, session_id, req.message, intent, used_max_radius, len(results), used_web, full_answer)
                     yield sse({"type": "final", "used_web_search": used_web})
                     return
