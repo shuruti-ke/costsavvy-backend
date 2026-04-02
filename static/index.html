@@ -2,7 +2,6 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cost Savvy - Healthcare Price Transparency</title>
     <link rel="stylesheet" href="/static/leaflet.css" />
@@ -283,11 +282,12 @@
             <div class="results-header-bar">
                 <div class="results-title" id="resultsTitle">Results</div>
                 <div class="results-meta">
-                    <div class="price-range">
+                    <div class="price-range" id="priceRangeBlock">
                         <span style="color:#888">Price range:</span>
-                        <span class="price-min" id="priceMin">$0</span>
-                        <span>–</span>
-                        <span class="price-max" id="priceMax">$0</span>
+                        <span class="price-min" id="priceMin"></span>
+                        <span id="priceRangeSep">–</span>
+                        <span class="price-max" id="priceMax"></span>
+                        <span id="priceEstimateNote" style="display:none; color:#888; font-style:italic;">estimates only — contact facilities for exact pricing</span>
                     </div>
                     <span id="resultsCount">0 facilities</span>
                 </div>
@@ -422,11 +422,11 @@
                 if (data.text) addMessage(data.text, 'assistant');
                 if (data.mapData && data.facilities.length > 0) {
                     currentMapData = data.mapData; currentFacilities = data.facilities;
-                    displayResults(data.mapData, data.facilities, service);
+                    displayResults(data.mapData, data.facilities, serviceQuery);
                 }
                 // Only show error if no text response AND no results (true error case)
                 if (!data.text && (!data.mapData || data.facilities.length === 0)) {
-                    showError('No results found. Try a different service or location.');
+                    showError(`No pricing information found for ${serviceQuery} near ZIP ${zipcode}. Try a different service, CPT code, or location.`);
                 }
             } catch (error) {
                 typingIndicator.classList.remove('active');
@@ -500,9 +500,22 @@
             resultsSection.classList.add('active');
             const service = serviceName || mapData.service_query || 'Healthcare Service';
             resultsTitle.textContent = `Results for ${service.charAt(0).toUpperCase() + service.slice(1)}`;
-            resultsCount.textContent = `${facilities.length} facilities`;
+            resultsCount.textContent = `${facilities.length} ${facilities.length === 1 ? 'facility' : 'facilities'}`;
+
             const prices = facilities.filter(f => f.price).map(f => f.price);
-            if (prices.length > 0) { priceMin.textContent = `$${Math.min(...prices).toLocaleString()}`; priceMax.textContent = `$${Math.max(...prices).toLocaleString()}`; }
+            const estimateNote = document.getElementById('priceEstimateNote');
+            const priceRangeSep = document.getElementById('priceRangeSep');
+            if (prices.length > 0) {
+                priceMin.textContent = `$${Math.min(...prices).toLocaleString()}`;
+                priceMax.textContent = `$${Math.max(...prices).toLocaleString()}`;
+                priceRangeSep.style.display = '';
+                estimateNote.style.display = 'none';
+            } else {
+                priceMin.textContent = '';
+                priceMax.textContent = '';
+                priceRangeSep.style.display = 'none';
+                estimateNote.style.display = 'inline';
+            }
             sortAndRenderFacilities();
             if (!map) initMap(mapData); else updateMap(mapData);
             if (mapData.google_maps_url) { openMapsBtn.href = mapData.google_maps_url; openMapsBtn.style.display = 'flex'; }
