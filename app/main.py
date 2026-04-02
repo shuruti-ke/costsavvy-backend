@@ -2910,6 +2910,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                                     "code",
                                     "refiner_id",
                                     "refiner_choice",
+                                    "variant_name",
                                 ]
                             },
                         }
