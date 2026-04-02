@@ -12,7 +12,7 @@ from typing import Optional, Any, Dict, List, Tuple
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -29,6 +29,8 @@ except ImportError:
 # ----------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("costsavvy")
+# Per-request HTTP logs (Brave/OpenAI) are very noisy at INFO
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
@@ -197,6 +199,15 @@ async def shutdown():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon_ico():
+    """Browsers request /favicon.ico by default; serve branded SVG (widely supported)."""
+    p = pathlib.Path("static/favicon.svg")
+    if p.is_file():
+        return FileResponse(p, media_type="image/svg+xml")
+    return Response(status_code=204)
 
 
 @app.get("/")
@@ -1503,7 +1514,7 @@ def infer_service_query_from_message(message: str) -> Optional[str]:
         return "office visit"
     return None
 
-
+h
 def should_force_price_mode(message: str, merged: Dict[str, Any]) -> bool:
     if not INTENT_OVERRIDE_FORCE_PRICE_ENABLED:
         return False
@@ -2364,24 +2375,46 @@ def _pick_transparency_price(row: Dict[str, Any], payment_mode: str) -> Optional
 
 
 def _pick_hospital_name(row: Dict[str, Any]) -> str:
-    return (row.get("hospital_name") or row.get("name") or "Unknown facility").strip()
+    s = (row.get("hospital_name") or row.get("name") or "Unknown facility").strip()
+    s = re.sub(r"\++", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
 
 def _pick_phone(row: Dict[str, Any]) -> str:
     return (row.get("phone") or "").strip()
 
 
 def _pick_address(row: Dict[str, Any]) -> str:
-    # Build a readable one-liner from common fields
-    addr = row.get("address") or row.get("street_address") or ""
-    city = row.get("city") or ""
-    state = row.get("state") or ""
-    z = row.get("zipcode") or row.get("zip") or ""
-    parts = [p for p in [addr, city, state, z] if p]
-    s = ", ".join(parts).strip()
-    # Strip UTF-8 nbsp / mojibake (e.g. "06489Â") from bad CSV encodings
+    """One-line address for display and web search. Avoid duplicating city/state/ZIP when street already has them."""
+    addr = (row.get("address") or row.get("street_address") or "").strip()
+    city = (row.get("city") or "").strip()
+    state = (row.get("state") or "").strip()
+    z = (str(row.get("zipcode") or row.get("zip") or "")).strip()
+    addr_l = addr.lower()
+
+    # Street line often already includes ", City, ST 12345" — do not append state/zip again
+    if addr and (
+        re.search(r"\b[A-Z]{2}\s+\d{5}(?:-\d{4})?\s*$", addr, re.I)
+        or re.search(r",\s*[^,]+\s*,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?\s*$", addr, re.I)
+    ):
+        s = addr
+    elif addr and z and z in addr.replace(" ", ""):
+        s = addr
+    else:
+        parts = [addr] if addr else []
+        if city and city.lower() not in addr_l:
+            parts.append(city)
+        if state and state.lower() not in addr_l and (len(state) != 2 or f", {state.upper()}" not in addr.upper()):
+            parts.append(state)
+        if z and z not in addr:
+            parts.append(z)
+        s = ", ".join(p for p in parts if p).strip()
+
     s = s.replace("\xc2\xa0", " ").replace("\xa0", " ")
     s = re.sub(r"Â+", "", s)
     s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\s*,\s*", ", ", s)
     return s
 
 
