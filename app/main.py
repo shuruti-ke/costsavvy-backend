@@ -1808,7 +1808,7 @@ def build_facility_block(
     user_lat: Optional[float] = None,
     user_lon: Optional[float] = None,
     user_zipcode: str = "",
-    web_price_range: Optional[str] = None,
+    web_prices: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
     Returns (text_answer, facilities_payload_for_ui, map_data).
@@ -1849,7 +1849,7 @@ def build_facility_block(
         )
 
     # Prepare an estimate range if needed
-    est_range = web_price_range  # None = no price found; never hallucinate
+    web_prices = web_prices or {}
 
     # Build answer text
     bullets = build_service_education_bullets(service_query or "this service", payment_mode or "cash")
@@ -1871,11 +1871,18 @@ def build_facility_block(
             pass
 
         price = _pick_price_fields(f)
+        # Look up web price for this specific hospital
+        hosp_key = name.lower().strip()
+        web_price_for_facility = next(
+            (v for k, v in web_prices.items()
+             if k.lower() in hosp_key or hosp_key in k.lower()),
+            None
+        )
         if price is not None:
             price_txt = _format_money(price)
             price_note = "verified price"
-        elif est_range:
-            price_txt = est_range
+        elif web_price_for_facility:
+            price_txt = web_price_for_facility
             price_note = "web research — verify with facility"
         else:
             price_txt = "Contact facility for pricing"
@@ -1914,9 +1921,14 @@ def build_facility_block(
                 "phone": f.get("phone") or _pick_phone(f),
                 "distance_miles": f.get("distance_miles") or f.get("distance"),
                 "price": _pick_price_fields(f),
-                "estimated_range": None if _pick_price_fields(f) is not None else (est_range or "Contact facility for pricing"),
+                "estimated_range": None if _pick_price_fields(f) is not None else (
+                    next((v for k, v in web_prices.items()
+                          if k.lower() in (f.get("hospital_name") or _pick_hospital_name(f)).lower()
+                          or (f.get("hospital_name") or _pick_hospital_name(f)).lower() in k.lower()),
+                         "Contact facility for pricing")
+                ),
                 "price_is_estimate": _pick_price_fields(f) is None,
-                "price_from_web": _pick_price_fields(f) is None and est_range is not None,
+                "price_from_web": _pick_price_fields(f) is None and bool(web_prices),
                 "latitude": f.get("latitude"),
                 "longitude": f.get("longitude"),
             }
@@ -2867,16 +2879,22 @@ async def chat_stream(req: ChatRequest, request: Request):
                     except Exception as e:
                         logger.warning(f"Failed to get user coordinates: {e}")
 
-                    # Search web for real prices when DB has none
-                    web_price = None
+                    # Search web for real per-hospital prices when DB has none
+                    web_prices_found: Dict[str, str] = {}
                     has_db_prices = any(_pick_price_fields(r) is not None for r in results)
                     if not has_db_prices and WEB_SEARCH_ENABLED and (BRAVE_API_KEY or SERPER_API_KEY or TAVILY_API_KEY):
                         try:
-                            web_price = await web_search_price_range(
+                            hosp_names = [
+                                _pick_hospital_name(h) for h in nearby_hospitals[:5]
+                                if _pick_hospital_name(h)
+                            ]
+                            web_prices_found = await web_search_price_range(
                                 service_query=merged.get("service_query") or "",
                                 cpt_code=merged.get("code") if merged.get("code_type") == "CPT" else None,
                                 zipcode=merged.get("zipcode") or "",
                                 payment_mode=merged.get("payment_mode") or "cash",
+                                payer=merged.get("payer_like"),
+                                hospital_names=hosp_names,
                             )
                         except Exception as _wse:
                             logger.warning(f"web_search_price_range failed: {_wse}")
@@ -2889,7 +2907,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                         user_lat=user_lat,
                         user_lon=user_lon,
                         user_zipcode=merged.get("zipcode") or "",
-                        web_price_range=web_price,
+                        web_prices=web_prices_found,
                     )
 
                     yield sse(
