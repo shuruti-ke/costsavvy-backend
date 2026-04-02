@@ -388,13 +388,7 @@
             $('payment').addEventListener('change', function() {
                 $('insuranceGroup').style.display = this.value === 'insurance' ? 'flex' : 'none';
             });
-            // Clear service when CPT code is typed, and vice versa
-            $('cptCode').addEventListener('input', function() {
-                if (this.value) $('service').value = '';
-            });
-            $('service').addEventListener('change', function() {
-                if (this.value) $('cptCode').value = '';
-            });
+            // No mutual exclusivity — both service name and CPT code can be used together
         });
         
         async function handleQuickSearch(e) {
@@ -409,24 +403,30 @@
             quickSearchBtn.innerHTML = '<div class="spinner"></div> Searching...';
             hideError();
 
-            const serviceQuery = cptCode ? `CPT code ${cptCode}` : service;
+            // Build query string for the API and display label for the title
+            const serviceQuery = service && cptCode ? `${service} (CPT code ${cptCode})`
+                               : cptCode ? `CPT code ${cptCode}`
+                               : service;
+            const displayLabel = service && cptCode ? `${service.charAt(0).toUpperCase() + service.slice(1)} (CPT code ${cptCode})`
+                               : cptCode ? `CPT code ${cptCode}`
+                               : service.charAt(0).toUpperCase() + service.slice(1);
             const paymentInfo = payment === 'insurance' && insuranceProvider ? `${insuranceProvider} insurance` : payment;
             const message = `How much does ${serviceQuery} cost? My ZIP is ${zipcode} and I'm paying with ${paymentInfo}.`;
             addMessage(message, 'user');
             typingIndicator.classList.add('active');
             scrollToBottom();
-            
+
             try {
                 const data = await fetchPrices(message);
                 typingIndicator.classList.remove('active');
                 if (data.text) addMessage(data.text, 'assistant');
                 if (data.mapData && data.facilities.length > 0) {
                     currentMapData = data.mapData; currentFacilities = data.facilities;
-                    displayResults(data.mapData, data.facilities, serviceQuery);
+                    displayResults(data.mapData, data.facilities, displayLabel);
                 }
                 // Only show error if no text response AND no results (true error case)
                 if (!data.text && (!data.mapData || data.facilities.length === 0)) {
-                    showError(`No pricing information found for ${serviceQuery} near ZIP ${zipcode}. Try a different service, CPT code, or location.`);
+                    showError(`No pricing information found for ${displayLabel} near ZIP ${zipcode}. Try a different service, CPT code, or location.`);
                 }
             } catch (error) {
                 typingIndicator.classList.remove('active');
@@ -498,8 +498,8 @@
         
         function displayResults(mapData, facilities, serviceName) {
             resultsSection.classList.add('active');
-            const service = serviceName || mapData.service_query || 'Healthcare Service';
-            resultsTitle.textContent = `Results for ${service.charAt(0).toUpperCase() + service.slice(1)}`;
+            const service = serviceName || (mapData.service_query ? mapData.service_query.charAt(0).toUpperCase() + mapData.service_query.slice(1) : 'Healthcare Service');
+            resultsTitle.textContent = `Results for ${service}`;
             resultsCount.textContent = `${facilities.length} ${facilities.length === 1 ? 'facility' : 'facilities'}`;
 
             const prices = facilities.filter(f => f.price).map(f => f.price);
