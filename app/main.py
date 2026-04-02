@@ -10,7 +10,7 @@ from typing import Optional, Any, Dict, List, Tuple
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -168,6 +168,11 @@ async def shutdown():
 async def health():
     return {"status": "ok"}
 
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return RedirectResponse(url="/static/favicon.svg")
 
 @app.get("/")
 async def home():
