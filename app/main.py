@@ -44,6 +44,7 @@ WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "true").lower() in ("1", "t
 WEB_SEARCH_TIMEOUT = int(os.getenv("WEB_SEARCH_TIMEOUT", "15"))
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "").strip()
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 
 # Care navigation: symptom keywords that trigger care-finding mode (not pricing)
 SYMPTOM_KEYWORDS = [
@@ -350,7 +351,35 @@ async def web_search_health_info(query: str, num_results: int = 5) -> List[Dict[
                         })
         except Exception as e:
             logger.warning(f"Serper search failed: {e}")
-    
+
+    # Fallback to Tavily
+    if not results and TAVILY_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=WEB_SEARCH_TIMEOUT) as client:
+                resp = await client.post(
+                    "https://api.tavily.com/search",
+                    json={
+                        "api_key": TAVILY_API_KEY,
+                        "query": f"{query} health medical",
+                        "max_results": num_results,
+                        "search_depth": "basic",
+                        "include_domains": [
+                            "mayoclinic.org", "webmd.com", "healthline.com",
+                            "medlineplus.gov", "cdc.gov", "nih.gov"
+                        ],
+                    },
+                )
+                if resp.status_code == 200:
+                    for item in resp.json().get("results", [])[:num_results]:
+                        results.append({
+                            "title": item.get("title", ""),
+                            "snippet": item.get("content", ""),
+                            "url": item.get("url", ""),
+                            "source": "tavily"
+                        })
+        except Exception as e:
+            logger.warning(f"Tavily health search failed: {e}")
+
     return results
 
 
@@ -1439,7 +1468,7 @@ async def web_search_price_range(
     search results (e.g. "$800–$2,400") or None if nothing credible is found.
     Never invents numbers — only returns what is explicitly in the snippets.
     """
-    if not WEB_SEARCH_ENABLED or not (BRAVE_API_KEY or SERPER_API_KEY):
+    if not WEB_SEARCH_ENABLED or not (BRAVE_API_KEY or SERPER_API_KEY or TAVILY_API_KEY):
         return None
 
     cpt_part = f"CPT {cpt_code}" if cpt_code else ""
@@ -1483,6 +1512,27 @@ async def web_search_price_range(
                             snippets.append(f"{t}: {s}")
         except Exception as e:
             logger.warning(f"Serper price search failed: {e}")
+
+    if not snippets and TAVILY_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=WEB_SEARCH_TIMEOUT) as hc:
+                resp = await hc.post(
+                    "https://api.tavily.com/search",
+                    json={
+                        "api_key": TAVILY_API_KEY,
+                        "query": query,
+                        "max_results": 10,
+                        "search_depth": "advanced",
+                    },
+                )
+                if resp.status_code == 200:
+                    for item in resp.json().get("results", [])[:10]:
+                        t = item.get("title", "")
+                        s = item.get("content", "")
+                        if t or s:
+                            snippets.append(f"{t}: {s}")
+        except Exception as e:
+            logger.warning(f"Tavily price search failed: {e}")
 
     if not snippets:
         return None
@@ -2820,7 +2870,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     # Search web for real prices when DB has none
                     web_price = None
                     has_db_prices = any(_pick_price_fields(r) is not None for r in results)
-                    if not has_db_prices and WEB_SEARCH_ENABLED and (BRAVE_API_KEY or SERPER_API_KEY):
+                    if not has_db_prices and WEB_SEARCH_ENABLED and (BRAVE_API_KEY or SERPER_API_KEY or TAVILY_API_KEY):
                         try:
                             web_price = await web_search_price_range(
                                 service_query=merged.get("service_query") or "",

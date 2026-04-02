@@ -36,6 +36,9 @@ services:
       #   sync: false
       # - key: SERPER_API_KEY
       #   sync: false
+      # Tavily search (free: 1,000 searches/month — sign up at tavily.com)
+      - key: TAVILY_API_KEY
+        sync: false
       
       # 📍 Progressive radius for price lookups (miles)
       - key: PRICE_RADIUS_ATTEMPTS
