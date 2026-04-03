@@ -1226,6 +1226,44 @@ def merge_state(state: Dict[str, Any], intent: Dict[str, Any]) -> Dict[str, Any]
     return out
 
 
+def extract_explicit_cpt_code(message: str) -> Optional[str]:
+    """Match phrases like 'CPT code 70551' (avoids treating bare 5-digit numbers as CPT)."""
+    m = re.search(r"(?i)\bCPT\s*(?:code)?\s*(\d{5})\b", message or "")
+    return m.group(1).strip() if m else None
+
+
+def extract_zip_from_price_message(message: str) -> Optional[str]:
+    """Prefer explicit ZIP phrases from Quick Search templates (e.g. 'My ZIP is 06119')."""
+    m = message or ""
+    mm = re.search(r"(?i)\b(?:my\s+)?zip\s*(?:code)?\s*(?:is)?[:\s]+(\d{5})\b", m)
+    if mm:
+        return mm.group(1)
+    mm = re.search(r"(?i)\bnear\s+(?:zip\s*)?(\d{5})\b", m)
+    return mm.group(1) if mm else None
+
+
+def resolve_zip_digit_groups(message: str) -> Optional[str]:
+    """
+    Pick a likely ZIP from the message. When both CPT and ZIP appear, do not use the CPT
+    digits as the ZIP (first bare \\d{5} in the string is often CPT, not location).
+    """
+    z = extract_zip_from_price_message(message)
+    if z:
+        return z
+    cpt = extract_explicit_cpt_code(message)
+    blocks = re.findall(r"\b(\d{5})\b", message or "")
+    if not blocks:
+        return None
+    if len(blocks) == 1 and cpt and blocks[0] == cpt:
+        return None
+    if cpt and len(blocks) > 1:
+        for b in blocks:
+            if b != cpt:
+                return b
+        return None
+    return blocks[0]
+
+
 def _is_zip_only_message(msg: str) -> bool:
     s = (msg or "").strip()
     return len(s) == 5 and s.isdigit()
@@ -1291,10 +1329,27 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
             "clarifying_question": None,
         }
 
-    # 0) ZIP detection anywhere in the message
-    zip_match = re.search(r"\b(\d{5})\b", msg)
-    if zip_match:
-        z = zip_match.group(1)
+    # 0) User explicitly named a different CPT than the session — new procedure (Quick Search / chat).
+    explicit_cpt = extract_explicit_cpt_code(msg)
+    prev_code = (st.get("code") or "").strip()
+    if explicit_cpt and explicit_cpt != prev_code:
+        z = resolve_zip_digit_groups(msg) or st.get("zipcode")
+        return {
+            "mode": "price",
+            "code_type": "CPT",
+            "code": explicit_cpt,
+            "zipcode": z,
+            "payment_mode": st.get("payment_mode"),
+            "payer_like": st.get("payer_like"),
+            "plan_like": st.get("plan_like"),
+            "cash_only": st.get("cash_only"),
+            "clarifying_question": None,
+            "_explicit_cpt_update": True,
+        }
+
+    # 0b) ZIP detection — prefer 'My ZIP is #####'; never treat CPT 5-digit codes as the ZIP.
+    z = resolve_zip_digit_groups(msg)
+    if z:
         # If we are awaiting a ZIP for care mode, return to care mode with the ZIP
         if awaiting == "care_zip":
             return {
@@ -1450,11 +1505,8 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
     # Also extract ZIP and payment info from the same message if present.
     inferred_service = infer_service_query_from_message(msg)
     if inferred_service:
-        # Extract ZIP from this message if present
-        extracted_zip = None
-        zip_match_new = re.search(r"\b(\d{5})\b", msg)
-        if zip_match_new:
-            extracted_zip = zip_match_new.group(1)
+        # Extract ZIP from this message if present (avoid using CPT digits as ZIP)
+        extracted_zip = resolve_zip_digit_groups(msg)
         
         # Extract payment mode from this message if present
         extracted_payment = None
@@ -3361,6 +3413,18 @@ async def chat_stream(req: ChatRequest, request: Request):
                 # 1) Intent + state merge
                 intent = await extract_intent(req.message, state)
                 merged = merge_state(state, intent)
+
+                if intent.get("_explicit_cpt_update"):
+                    merged.pop("service_query", None)
+                    merged.pop("_awaiting", None)
+                    for k in (
+                        "variant_id",
+                        "variant_name",
+                        "variant_confirmed",
+                        "_variant_candidates",
+                        "_variant_single",
+                    ):
+                        merged.pop(k, None)
 
                 # If this message is a NEW pricing question (service inferred) and the user did not provide a ZIP,
                 # do not reuse a prior ZIP/payment from the session. Force ZIP collection first.
