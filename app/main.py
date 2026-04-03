@@ -1358,6 +1358,13 @@ def apply_payment_hints_from_message(message: str, merged: Dict[str, Any], inten
         merged.pop("_awaiting", None)
 
 
+def apply_zip_hint_from_message(message: str, merged: Dict[str, Any]) -> None:
+    """Force ZIP from the current user message so a changed ZIP overrides stale session state."""
+    z = resolve_zip_digit_groups(message or "")
+    if z:
+        merged["zipcode"] = z
+
+
 def _is_zip_only_message(msg: str) -> bool:
     s = (msg or "").strip()
     return len(s) == 5 and s.isdigit()
@@ -2360,6 +2367,11 @@ async def get_nearby_hospitals(conn: asyncpg.Connection, zipcode: str, limit: in
     Returns nearby hospitals with name/address/state/zipcode/phone (+ distance if possible).
     Uses public.hospital_details for facility directory fields:
       name, address, state, zipcode, phone, latitude, longitude
+
+    Important: we only consider facilities within a reasonable driving distance of the user's ZIP.
+    Without a distance cap, the query ordered *all* rows globally by distance — if the table is
+    sparse in the user's region (e.g. PA) but dense elsewhere (CT), the "nearest" five could be
+    hundreds of miles away in another state.
     """
     z = await conn.fetchrow(
         "SELECT latitude, longitude FROM public.zip_locations WHERE zipcode = $1 LIMIT 1",
@@ -2368,30 +2380,40 @@ async def get_nearby_hospitals(conn: asyncpg.Connection, zipcode: str, limit: in
     zlat = float(z["latitude"]) if z and z["latitude"] is not None else None
     zlon = float(z["longitude"]) if z and z["longitude"] is not None else None
 
-    if zlat is not None and zlon is not None:
-        q = """
-        SELECT
-          h.hospital_id AS hospital_id,
-          h.hospital_name AS hospital_name,
-          h.address AS address,
-          h.state AS state,
-          h.zipcode AS zipcode,
-          h.phone AS phone,
-          h.latitude AS latitude,
-          h.longitude AS longitude,
-          (3959 * acos(
+    dist_sql = """(
+          3959 * acos(
               cos(radians($2)) * cos(radians(h.latitude)) * cos(radians(h.longitude) - radians($3)) +
               sin(radians($2)) * sin(radians(h.latitude))
-          )) AS distance_miles
-        FROM public.hospital_details h
-        WHERE h.latitude IS NOT NULL AND h.longitude IS NOT NULL
-        ORDER BY distance_miles ASC
-        LIMIT $1
-        """
-        rows = await conn.fetch(q, limit, zlat, zlon)
-        # If no results from hospital_details, try hospitals table
-        if not rows:
-            q_fallback = """
+          )
+        )"""
+
+    if zlat is not None and zlon is not None:
+        # Expand radius until we find facilities; cap each step so we prefer truly local rows.
+        # Stop at 300 mi: beyond that, "nearby" is misleading (e.g. CT vs PA); prefer empty + web enrichment.
+        radius_steps = (50, 100, 150, 200, 300)
+        for max_miles in radius_steps:
+            q = f"""
+            SELECT
+              h.hospital_id AS hospital_id,
+              h.hospital_name AS hospital_name,
+              h.address AS address,
+              h.state AS state,
+              h.zipcode AS zipcode,
+              h.phone AS phone,
+              h.latitude AS latitude,
+              h.longitude AS longitude,
+              {dist_sql} AS distance_miles
+            FROM public.hospital_details h
+            WHERE h.latitude IS NOT NULL AND h.longitude IS NOT NULL
+              AND {dist_sql} <= $4
+            ORDER BY distance_miles ASC
+            LIMIT $1
+            """
+            rows = await conn.fetch(q, limit, zlat, zlon, float(max_miles))
+            if rows:
+                return [dict(r) for r in rows]
+
+            q_fallback = f"""
             SELECT
               h.id AS hospital_id,
               h.name AS hospital_name,
@@ -2401,18 +2423,18 @@ async def get_nearby_hospitals(conn: asyncpg.Connection, zipcode: str, limit: in
               h.phone AS phone,
               h.latitude AS latitude,
               h.longitude AS longitude,
-              (3959 * acos(
-                  cos(radians($2)) * cos(radians(h.latitude)) * cos(radians(h.longitude) - radians($3)) +
-                  sin(radians($2)) * sin(radians(h.latitude))
-              )) AS distance_miles
+              {dist_sql} AS distance_miles
             FROM public.hospitals h
             WHERE h.latitude IS NOT NULL AND h.longitude IS NOT NULL
+              AND {dist_sql} <= $4
             ORDER BY distance_miles ASC
             LIMIT $1
             """
-            rows = await conn.fetch(q_fallback, limit, zlat, zlon)
-        
-        return [dict(r) for r in rows]
+            rows = await conn.fetch(q_fallback, limit, zlat, zlon, float(max_miles))
+            if rows:
+                return [dict(r) for r in rows]
+
+        return []
 
     # If we can't compute distance, still return facilities (join both tables)
     q2 = """
@@ -3543,6 +3565,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     merged.pop("_variant_candidates", None)
                     merged.pop("_variant_single", None)
                     logger.info(f"Reset code fields for new price question: {intent.get('service_query')}")
+                apply_zip_hint_from_message(req.message, merged)
                 apply_payment_hints_from_message(req.message, merged, intent)
                 _normalize_payment_mode(merged)
 
