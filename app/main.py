@@ -1266,6 +1266,98 @@ def resolve_zip_digit_groups(message: str) -> Optional[str]:
     return blocks[0]
 
 
+# Carrier tokens for extract_carrier_from_text (same semantics as extract_intent inner helper).
+_CARRIER_KEYWORDS: Dict[str, str] = {
+    "aetna": "Aetna",
+    "cigna": "Cigna",
+    "anthem": "Anthem",
+    "blue cross": "Blue Cross Blue Shield",
+    "bcbs": "Blue Cross Blue Shield",
+    "united": "UnitedHealthcare",
+    "uhc": "UnitedHealthcare",
+    "humana": "Humana",
+    "kaiser": "Kaiser Permanente",
+    "molina": "Molina",
+    "centene": "Centene",
+    "wellcare": "Wellcare",
+    "medicaid": "Medicaid",
+    "medicare": "Medicare",
+}
+
+
+def extract_carrier_from_text(message: str) -> Optional[str]:
+    """Resolve a payer/carrier name from free text (Quick Search + chat templates)."""
+    m = (message or "").strip()
+    if not m:
+        return None
+    ml = m.lower()
+    for k, v in _CARRIER_KEYWORDS.items():
+        if k in ml:
+            return v
+    clean = m
+    for stop in ["i have", "i use", "use", "with", "insurance", "my", "have", "paying"]:
+        clean = re.sub(r"\b" + re.escape(stop) + r"\b", "", clean, flags=re.IGNORECASE)
+    clean = clean.strip()
+    tokens = re.findall(r"[a-zA-Z]+", clean)
+    if len(tokens) == 1 and len(tokens[0]) >= 3:
+        return tokens[0].title()
+    if 2 <= len(tokens) <= 3:
+        return " ".join([t.title() for t in tokens])
+    return None
+
+
+def apply_payment_hints_from_message(message: str, merged: Dict[str, Any], intent: Dict[str, Any]) -> None:
+    """
+    Fill payment_mode / payer_like when the user stated them in the same message as CPT/ZIP
+    (extract_intent early exits often copy stale None from session — Gate 2 then asks for payment in a loop).
+    """
+    mode = (intent.get("mode") or "").lower()
+    if mode in ("education", "care", "general"):
+        return
+    if not (
+        merged.get("zipcode")
+        or merged.get("code")
+        or (merged.get("service_query") or "").strip()
+    ):
+        return
+
+    msg = (message or "").strip()
+    if not msg:
+        return
+    msg_l = msg.lower()
+    cash_terms = {
+        "cash",
+        "self pay",
+        "self-pay",
+        "selfpay",
+        "out of pocket",
+        "oop",
+        "paying cash",
+        "pay cash",
+        "cash pay",
+        "self pay patient",
+        "selfpay patient",
+    }
+    insurance_terms = {"insurance", "insured", "use insurance", "with insurance"}
+    carrier = extract_carrier_from_text(msg)
+    has_ins = any(t in msg_l for t in insurance_terms)
+    has_cash = any(t in msg_l for t in cash_terms)
+
+    if has_ins or carrier:
+        merged["payment_mode"] = "insurance"
+        merged["cash_only"] = False
+        if carrier:
+            merged["payer_like"] = carrier
+        merged.pop("_awaiting", None)
+        return
+    if has_cash:
+        merged["payment_mode"] = "cash"
+        merged["cash_only"] = True
+        merged["payer_like"] = None
+        merged["plan_like"] = None
+        merged.pop("_awaiting", None)
+
+
 def _is_zip_only_message(msg: str) -> bool:
     s = (msg or "").strip()
     return len(s) == 5 and s.isdigit()
@@ -3451,6 +3543,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     merged.pop("_variant_candidates", None)
                     merged.pop("_variant_single", None)
                     logger.info(f"Reset code fields for new price question: {intent.get('service_query')}")
+                apply_payment_hints_from_message(req.message, merged, intent)
                 _normalize_payment_mode(merged)
 
                 # 2) Force/override pricing intent when we are mid-flow
