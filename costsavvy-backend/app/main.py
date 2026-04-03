@@ -249,6 +249,39 @@ async def queue_hospitals_for_enrichment(
     return queued
 
 
+async def _geocode_nominatim_fast(name: str, address: str, zipcode: str) -> Optional[tuple]:
+    """
+    Quick geocode for search-time use. Tries:
+    1. Nominatim with full address
+    2. Nominatim with name + zipcode fallback
+    Short timeout (6s) so it never blocks the response significantly.
+    """
+    attempts = []
+    if address and zipcode:
+        attempts.append(f"{address} {zipcode}")
+    elif address:
+        attempts.append(address)
+    if zipcode:
+        attempts.append(f"{name} {zipcode}")
+    attempts.append(f"{name} hospital")
+
+    for query in attempts:
+        try:
+            async with httpx.AsyncClient(timeout=6) as hc:
+                resp = await hc.get(
+                    "https://nominatim.openstreetmap.org/search",
+                    params={"q": query, "format": "json", "limit": 1},
+                    headers={"User-Agent": "CostSavvy-HealthPriceApp/1.0"},
+                )
+                if resp.status_code == 200:
+                    results = resp.json()
+                    if results:
+                        return float(results[0]["lat"]), float(results[0]["lon"])
+        except Exception:
+            pass
+    return None
+
+
 async def _geocode_nominatim(address: str) -> Optional[tuple]:
     """
     Free geocoding via OpenStreetMap Nominatim. Returns (lat, lon) or None.
@@ -4768,6 +4801,29 @@ async def chat_stream(req: ChatRequest, request: Request):
                                         web_only.append(wh)
                                         existing_keys.add(wkey)
                                     # (DB row already present — web search confirmed it exists; keep DB version for coords)
+                                # Geocode web-only hospitals in parallel so they appear on the map now
+                                if web_only:
+                                    try:
+                                        geo_tasks = [
+                                            _geocode_nominatim_fast(
+                                                wh.get("hospital_name", ""),
+                                                wh.get("address", ""),
+                                                wh.get("zipcode", "") or str(merged.get("zipcode") or ""),
+                                            )
+                                            for wh in web_only
+                                        ]
+                                        geo_results = await asyncio.gather(*geo_tasks, return_exceptions=True)
+                                        geocoded_count = 0
+                                        for wh, coords in zip(web_only, geo_results):
+                                            if isinstance(coords, tuple) and len(coords) == 2:
+                                                wh["latitude"] = coords[0]
+                                                wh["longitude"] = coords[1]
+                                                geocoded_count += 1
+                                        if geocoded_count:
+                                            logger.info("Geocoded %d/%d web hospitals inline", geocoded_count, len(web_only))
+                                    except Exception as _ge:
+                                        logger.warning("Inline geocoding failed: %s", _ge)
+
                                 nearby_hospitals = nearby_hospitals + web_only
                                 nearby_hospitals = nearby_hospitals[:NEARBY_COORD_LOOKUP_LIMIT]
                                 logger.info(
