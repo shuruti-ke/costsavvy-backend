@@ -282,6 +282,56 @@ async def _geocode_nominatim_fast(name: str, address: str, zipcode: str) -> Opti
     return None
 
 
+async def _lookup_hospital_website_fast(name: str, address: str, zipcode: str) -> Optional[str]:
+    """
+    Quick lookup of a hospital's official website URL.
+    Uses Brave/Tavily search and picks the first result that looks like
+    an official hospital domain (not Maps, Wikipedia, or directories).
+    """
+    q = f'"{name}" official website hospital {zipcode or address or ""}'
+    SKIP = ("google.com", "yelp.com", "healthgrades.com", "vitals.com",
+            "wikipedia.org", "facebook.com", "twitter.com", "linkedin.com",
+            "medicare.gov", "cms.gov", "maps.google", "bing.com/maps",
+            "yellowpages.com", "mapquest.com", "bbb.org")
+
+    urls: list = []
+    if BRAVE_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=6) as hc:
+                resp = await hc.get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    headers={"X-Subscription-Token": BRAVE_API_KEY},
+                    params={"q": q, "count": 6},
+                )
+                if resp.status_code == 200:
+                    for item in resp.json().get("web", {}).get("results", [])[:6]:
+                        u = (item.get("url") or "").strip()
+                        if u:
+                            urls.append(u)
+        except Exception:
+            pass
+
+    if not urls and TAVILY_API_KEY:
+        try:
+            raw = await _tavily_search(q, num_results=6)
+            urls = [r.get("url", "") for r in raw if r.get("url")]
+        except Exception:
+            pass
+
+    for url in urls:
+        ul = url.lower()
+        if any(skip in ul for skip in SKIP):
+            continue
+        # Must look like a proper domain URL
+        try:
+            u = __import__("urllib.parse", fromlist=["urlparse"]).urlparse(url)
+            if u.scheme in ("http", "https") and u.netloc and "." in u.netloc:
+                return url
+        except Exception:
+            pass
+    return None
+
+
 async def _geocode_nominatim(address: str) -> Optional[tuple]:
     """
     Free geocoding via OpenStreetMap Nominatim. Returns (lat, lon) or None.
@@ -4804,21 +4854,35 @@ async def chat_stream(req: ChatRequest, request: Request):
                                 # Geocode web-only hospitals in parallel so they appear on the map now
                                 if web_only:
                                     try:
+                                        _zip_str = str(merged.get("zipcode") or "")
                                         geo_tasks = [
                                             _geocode_nominatim_fast(
                                                 wh.get("hospital_name", ""),
                                                 wh.get("address", ""),
-                                                wh.get("zipcode", "") or str(merged.get("zipcode") or ""),
+                                                wh.get("zipcode", "") or _zip_str,
                                             )
                                             for wh in web_only
                                         ]
-                                        geo_results = await asyncio.gather(*geo_tasks, return_exceptions=True)
+                                        site_tasks = [
+                                            _lookup_hospital_website_fast(
+                                                wh.get("hospital_name", ""),
+                                                wh.get("address", ""),
+                                                wh.get("zipcode", "") or _zip_str,
+                                            )
+                                            for wh in web_only
+                                        ]
+                                        geo_results, site_results = await asyncio.gather(
+                                            asyncio.gather(*geo_tasks, return_exceptions=True),
+                                            asyncio.gather(*site_tasks, return_exceptions=True),
+                                        )
                                         geocoded_count = 0
-                                        for wh, coords in zip(web_only, geo_results):
+                                        for wh, coords, site in zip(web_only, geo_results, site_results):
                                             if isinstance(coords, tuple) and len(coords) == 2:
                                                 wh["latitude"] = coords[0]
                                                 wh["longitude"] = coords[1]
                                                 geocoded_count += 1
+                                            if isinstance(site, str) and site.startswith("http"):
+                                                wh["website"] = site
                                         if geocoded_count:
                                             logger.info("Geocoded %d/%d web hospitals inline", geocoded_count, len(web_only))
                                     except Exception as _ge:
