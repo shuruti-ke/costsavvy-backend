@@ -10,8 +10,10 @@ import httpx
 import statistics
 from typing import Optional, Any, Dict, List, Tuple
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
 import asyncpg
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -121,6 +123,10 @@ PRICE_RADIUS_ATTEMPTS = [
     int(x) for x in os.getenv("PRICE_RADIUS_ATTEMPTS", "10,25,50,100,200").split(",") if x.strip().isdigit()
 ] or [10, 25, 50, 100, 200]
 
+ENRICHMENT_SCHEDULE_HOUR = int(os.getenv("ENRICHMENT_SCHEDULE_HOUR", "2"))   # 2 AM by default
+ENRICHMENT_BATCH_SIZE = int(os.getenv("ENRICHMENT_BATCH_SIZE", "20"))
+TRANSPARENCY_FILE_SIZE_LIMIT_MB = int(os.getenv("TRANSPARENCY_FILE_SIZE_LIMIT_MB", "100"))
+
 # ----------------------------
 # App
 # ----------------------------
@@ -184,16 +190,560 @@ def require_auth(request: Request):
 
 
 # ----------------------------
+# Nightly hospital enrichment
+# ----------------------------
+
+_scheduler: Optional[AsyncIOScheduler] = None
+
+
+async def _ensure_enrichment_table(conn: asyncpg.Connection) -> None:
+    """Create the pending enrichment queue table if it doesn't exist."""
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS public.pending_hospital_enrichment (
+            id              SERIAL PRIMARY KEY,
+            hospital_name   TEXT NOT NULL,
+            address         TEXT,
+            zipcode         TEXT,
+            discovered_zip  TEXT,
+            source          TEXT DEFAULT 'web_search',
+            status          TEXT DEFAULT 'pending',
+            hospital_id     INT,
+            error_message   TEXT,
+            discovered_at   TIMESTAMPTZ DEFAULT NOW(),
+            processed_at    TIMESTAMPTZ,
+            UNIQUE (hospital_name, COALESCE(zipcode, ''))
+        )
+    """)
+
+
+async def queue_hospitals_for_enrichment(
+    conn: asyncpg.Connection,
+    hospitals: List[Dict[str, Any]],
+    discovered_zip: str,
+) -> int:
+    """
+    Queue newly web-discovered hospitals for nightly enrichment.
+    Returns count of newly queued rows.
+    """
+    queued = 0
+    for h in hospitals:
+        name = (h.get("hospital_name") or "").strip()
+        if not name or len(name) < 4:
+            continue
+        try:
+            await conn.execute(
+                """
+                INSERT INTO public.pending_hospital_enrichment
+                    (hospital_name, address, zipcode, discovered_zip, source, status)
+                VALUES ($1, $2, $3, $4, 'web_search', 'pending')
+                ON CONFLICT (hospital_name, COALESCE(zipcode, '')) DO NOTHING
+                """,
+                name,
+                (h.get("address") or "").strip() or None,
+                (h.get("zipcode") or "").strip() or None,
+                discovered_zip or None,
+            )
+            queued += 1
+        except Exception as e:
+            logger.warning("Failed to queue hospital %s for enrichment: %s", name, e)
+    return queued
+
+
+async def _geocode_nominatim(address: str) -> Optional[tuple]:
+    """
+    Free geocoding via OpenStreetMap Nominatim. Returns (lat, lon) or None.
+    Rate-limited to 1 req/s by Nominatim policy — caller must throttle.
+    """
+    if not address:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as hc:
+            resp = await hc.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": address, "format": "json", "limit": 1},
+                headers={"User-Agent": "CostSavvy-HealthPriceApp/1.0 (health price transparency)"},
+            )
+            if resp.status_code == 200:
+                results = resp.json()
+                if results:
+                    return float(results[0]["lat"]), float(results[0]["lon"])
+    except Exception as e:
+        logger.warning("Nominatim geocode failed for '%s': %s", address, e)
+    return None
+
+
+async def _enrich_hospital_details_from_web(
+    hospital_name: str, address: str, zipcode: str
+) -> Dict[str, Any]:
+    """
+    Use web search to fill in missing hospital details (phone, full address, state).
+    Returns a dict with whatever fields could be extracted.
+    """
+    q = f'"{hospital_name}" hospital address phone number {zipcode or address or ""}'
+    snippets: List[str] = []
+
+    if BRAVE_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=WEB_SEARCH_TIMEOUT) as hc:
+                resp = await hc.get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    headers={"X-Subscription-Token": BRAVE_API_KEY},
+                    params={"q": q, "count": 5},
+                )
+                if resp.status_code == 200:
+                    for item in resp.json().get("web", {}).get("results", [])[:5]:
+                        t = item.get("title", "")
+                        s = item.get("description", "")
+                        if t or s:
+                            snippets.append(f"{t}: {s}")
+        except Exception as e:
+            logger.warning("Brave hospital detail search failed: %s", e)
+
+    if not snippets and TAVILY_API_KEY:
+        raw = await _tavily_search(q, num_results=5)
+        snippets = [f"{r.get('title','')}: {r.get('snippet','')}" for r in raw if r.get('title') or r.get('snippet')]
+
+    if not snippets:
+        return {}
+
+    system = (
+        "Extract hospital contact details from web snippets. "
+        'Return JSON only: {"address": "full street address", "city": "city", "state": "2-letter state", '
+        '"zipcode": "5-digit zip", "phone": "phone number"}. '
+        "Only include fields you can confirm from the snippets. Return {} if nothing found."
+    )
+    user = f"Hospital: {hospital_name}\nSnippets:\n" + "\n".join(snippets[:5])
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            response_format={"type": "json_object"},
+            timeout=15,
+        )
+        return json.loads(resp.choices[0].message.content or "{}")
+    except Exception as e:
+        logger.warning("LLM hospital detail extraction failed: %s", e)
+        return {}
+
+
+async def _find_price_transparency_url(hospital_name: str, state: str) -> Optional[str]:
+    """
+    Search for the hospital's CMS-mandated machine-readable price transparency file URL.
+    """
+    q = f'"{hospital_name}" {state or ""} hospital price transparency machine readable file JSON CSV 2024 2025'
+    snippets: List[Dict[str, Any]] = []
+
+    if BRAVE_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=WEB_SEARCH_TIMEOUT) as hc:
+                resp = await hc.get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    headers={"X-Subscription-Token": BRAVE_API_KEY},
+                    params={"q": q, "count": 8},
+                )
+                if resp.status_code == 200:
+                    snippets = resp.json().get("web", {}).get("results", [])[:8]
+        except Exception as e:
+            logger.warning("Brave transparency URL search failed: %s", e)
+
+    if not snippets and TAVILY_API_KEY:
+        raw = await _tavily_search(q, num_results=8)
+        snippets = [{"url": r.get("url",""), "title": r.get("title",""), "description": r.get("snippet","")} for r in raw]
+
+    if not snippets:
+        return None
+
+    # Look for direct file URLs in results
+    file_extensions = (".json", ".csv", ".xlsx", ".xls", ".zip")
+    for item in snippets:
+        url = (item.get("url") or "").lower()
+        if any(url.endswith(ext) for ext in file_extensions):
+            return item["url"]
+
+    # Ask LLM to extract a file URL from snippets
+    body = "\n".join(
+        f"- URL: {s.get('url','')} | {s.get('title','')}: {(s.get('description') or s.get('snippet',''))[:300]}"
+        for s in snippets
+    )
+    system = (
+        "You extract the direct URL of a hospital's CMS price transparency machine-readable file. "
+        "Look for URLs ending in .json, .csv, .xlsx, or .zip that are hospital chargemaster/price files. "
+        'Return JSON: {"url": "direct file URL or null"}. '
+        "Return null if no direct file URL is found."
+    )
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": f"Hospital: {hospital_name}\nSearch results:\n{body}"},
+            ],
+            response_format={"type": "json_object"},
+            timeout=15,
+        )
+        data = json.loads(resp.choices[0].message.content or "{}")
+        url = data.get("url")
+        return url if url and url != "null" and url.startswith("http") else None
+    except Exception as e:
+        logger.warning("LLM transparency URL extraction failed: %s", e)
+        return None
+
+
+def _parse_transparency_csv_rows(
+    content: bytes, hospital_id: int, hospital_name: str
+) -> List[Dict[str, Any]]:
+    """
+    Parse CMS-standard hospital price transparency CSV.
+    Extracts rows with CPT codes and prices.
+    Returns list of dicts ready for stg_hospital_rates insert.
+    """
+    import io
+    import csv
+
+    rows: List[Dict[str, Any]] = []
+    try:
+        text = content.decode("utf-8", errors="replace")
+        reader = csv.DictReader(io.StringIO(text))
+        headers = [h.lower().strip() for h in (reader.fieldnames or [])]
+
+        # Map common column name variants
+        def find_col(candidates):
+            for c in candidates:
+                for h in headers:
+                    if c in h:
+                        return h
+            return None
+
+        col_code = find_col(["cpt", "hcpcs", "code", "procedure_code", "billing_code"])
+        col_desc = find_col(["description", "service", "item", "procedure"])
+        col_cash = find_col(["cash", "discounted_cash", "self_pay", "selfpay"])
+        col_gross = find_col(["gross", "chargemaster", "list_price", "standard_charge"])
+        col_payer = find_col(["payer", "insurer", "insurance"])
+        col_neg = find_col(["negotiated", "contracted", "allowed"])
+
+        if not col_code:
+            return rows
+
+        for row in reader:
+            code = (row.get(col_code) or "").strip()
+            if not code or not any(c.isdigit() for c in code):
+                continue
+            # Only CPT codes (5-digit numeric or alphanumeric starting with digit)
+            if len(code) > 10:
+                continue
+
+            def safe_float(val):
+                if not val:
+                    return None
+                try:
+                    return float(str(val).replace("$", "").replace(",", "").strip())
+                except Exception:
+                    return None
+
+            cash = safe_float(row.get(col_cash)) if col_cash else None
+            gross = safe_float(row.get(col_gross)) if col_gross else None
+            neg = safe_float(row.get(col_neg)) if col_neg else None
+            desc = (row.get(col_desc) or "")[:500] if col_desc else ""
+            payer = (row.get(col_payer) or "")[:200] if col_payer else None
+
+            if cash is None and gross is None and neg is None:
+                continue
+
+            rows.append({
+                "hospital_id": hospital_id,
+                "hospital_name": hospital_name,
+                "code": code,
+                "code_type": "CPT",
+                "service_description": desc,
+                "standard_charge_discounted_cash": cash,
+                "standard_charge_gross": gross,
+                "standard_charge_negotiated_dollar": neg,
+                "payer_name": payer,
+            })
+
+            if len(rows) >= 50000:  # cap per file
+                break
+    except Exception as e:
+        logger.warning("CSV transparency parse error: %s", e)
+    return rows
+
+
+async def _download_and_parse_transparency_file(
+    url: str, hospital_id: int, hospital_name: str
+) -> List[Dict[str, Any]]:
+    """
+    Download a price transparency file (CSV or JSON) with size and timeout limits.
+    Returns parsed rows for stg_hospital_rates.
+    """
+    size_limit = TRANSPARENCY_FILE_SIZE_LIMIT_MB * 1024 * 1024
+    rows: List[Dict[str, Any]] = []
+    try:
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as hc:
+            async with hc.stream("GET", url) as resp:
+                if resp.status_code != 200:
+                    logger.warning("Transparency file download failed: HTTP %s for %s", resp.status_code, url)
+                    return []
+                content_type = resp.headers.get("content-type", "").lower()
+                chunks: List[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes(chunk_size=65536):
+                    total += len(chunk)
+                    if total > size_limit:
+                        logger.info("Transparency file for %s exceeds %dMB limit, truncating", hospital_name, TRANSPARENCY_FILE_SIZE_LIMIT_MB)
+                        chunks.append(chunk)
+                        break
+                    chunks.append(chunk)
+                content = b"".join(chunks)
+
+        url_lower = url.lower()
+        if url_lower.endswith(".csv") or "csv" in content_type:
+            rows = _parse_transparency_csv_rows(content, hospital_id, hospital_name)
+        elif url_lower.endswith(".json") or "json" in content_type:
+            try:
+                data = json.loads(content.decode("utf-8", errors="replace"))
+                # CMS standard JSON schema has a "standard_charge_information" array
+                charges = []
+                if isinstance(data, dict):
+                    charges = data.get("standard_charge_information", []) or data.get("items", []) or []
+                elif isinstance(data, list):
+                    charges = data
+
+                for item in charges[:50000]:
+                    if not isinstance(item, dict):
+                        continue
+                    code = str(item.get("code") or item.get("cpt_code") or item.get("billing_code") or "").strip()
+                    if not code or len(code) > 10:
+                        continue
+                    desc = str(item.get("description") or item.get("service_description") or "")[:500]
+
+                    def _sf(k):
+                        v = item.get(k)
+                        try:
+                            return float(v) if v is not None else None
+                        except Exception:
+                            return None
+
+                    cash = _sf("discounted_cash") or _sf("cash_price") or _sf("self_pay_price")
+                    gross = _sf("gross_charge") or _sf("standard_charge_gross")
+                    neg = _sf("negotiated_dollar") or _sf("negotiated_rate")
+                    if cash is None and gross is None and neg is None:
+                        continue
+                    rows.append({
+                        "hospital_id": hospital_id,
+                        "hospital_name": hospital_name,
+                        "code": code,
+                        "code_type": "CPT",
+                        "service_description": desc,
+                        "standard_charge_discounted_cash": cash,
+                        "standard_charge_gross": gross,
+                        "standard_charge_negotiated_dollar": neg,
+                        "payer_name": None,
+                    })
+            except Exception as e:
+                logger.warning("JSON transparency parse error for %s: %s", hospital_name, e)
+
+        logger.info("Parsed %d price rows from transparency file for %s", len(rows), hospital_name)
+    except Exception as e:
+        logger.warning("Transparency file download/parse failed for %s (%s): %s", hospital_name, url, e)
+    return rows
+
+
+async def _bulk_insert_stg_rates(conn: asyncpg.Connection, rows: List[Dict[str, Any]]) -> int:
+    """Bulk upsert parsed transparency prices into stg_hospital_rates."""
+    if not rows:
+        return 0
+    inserted = 0
+    # Insert in batches of 500
+    for i in range(0, len(rows), 500):
+        batch = rows[i:i+500]
+        try:
+            await conn.executemany(
+                """
+                INSERT INTO public.stg_hospital_rates
+                    (hospital_id, hospital_name, code, code_type, service_description,
+                     standard_charge_discounted_cash, standard_charge_gross,
+                     standard_charge_negotiated_dollar, payer_name)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                ON CONFLICT DO NOTHING
+                """,
+                [
+                    (
+                        r["hospital_id"], r["hospital_name"], r["code"], r["code_type"],
+                        r.get("service_description"), r.get("standard_charge_discounted_cash"),
+                        r.get("standard_charge_gross"), r.get("standard_charge_negotiated_dollar"),
+                        r.get("payer_name"),
+                    )
+                    for r in batch
+                ],
+            )
+            inserted += len(batch)
+        except Exception as e:
+            logger.warning("Batch stg_rates insert failed: %s", e)
+    return inserted
+
+
+async def run_nightly_hospital_enrichment() -> Dict[str, Any]:
+    """
+    Nightly job: process pending_hospital_enrichment queue.
+    For each pending hospital:
+      1. Enrich address/phone via web search
+      2. Geocode via Nominatim
+      3. Upsert into hospital_details
+      4. Find + parse CMS price transparency file
+      5. Bulk insert prices into stg_hospital_rates
+    """
+    if not pool:
+        logger.warning("Enrichment job: DB pool not ready, skipping")
+        return {"skipped": True}
+
+    summary = {"processed": 0, "enriched": 0, "geocoded": 0, "prices_loaded": 0, "errors": 0}
+
+    async with pool.acquire() as conn:
+        await _ensure_enrichment_table(conn)
+
+        pending = await conn.fetch(
+            """
+            SELECT id, hospital_name, address, zipcode, discovered_zip
+            FROM public.pending_hospital_enrichment
+            WHERE status = 'pending'
+            ORDER BY discovered_at ASC
+            LIMIT $1
+            """,
+            ENRICHMENT_BATCH_SIZE,
+        )
+
+        if not pending:
+            logger.info("Nightly enrichment: no pending hospitals")
+            return summary
+
+        logger.info("Nightly enrichment: processing %d hospitals", len(pending))
+
+        for row in pending:
+            row_id = row["id"]
+            name = row["hospital_name"]
+            address = row["address"] or ""
+            zipcode = row["zipcode"] or row["discovered_zip"] or ""
+
+            try:
+                await conn.execute(
+                    "UPDATE public.pending_hospital_enrichment SET status='processing' WHERE id=$1", row_id
+                )
+
+                # Step 1: enrich details from web
+                details = await _enrich_hospital_details_from_web(name, address, zipcode)
+                full_address = details.get("address") or address
+                city = details.get("city") or ""
+                state = details.get("state") or ""
+                zip_enriched = details.get("zipcode") or zipcode
+                phone = details.get("phone")
+
+                # Build geocodable address string
+                geo_str = ", ".join(filter(None, [full_address, city, state, zip_enriched]))
+                if not geo_str:
+                    geo_str = f"{name} hospital"
+
+                # Step 2: geocode
+                import asyncio as _asyncio
+                await _asyncio.sleep(1.1)  # Nominatim 1 req/s limit
+                coords = await _geocode_nominatim(geo_str)
+                lat = coords[0] if coords else None
+                lon = coords[1] if coords else None
+                if lat:
+                    summary["geocoded"] += 1
+
+                # Step 3: upsert into hospital_details
+                hospital_id = await conn.fetchval(
+                    """
+                    INSERT INTO public.hospital_details
+                        (hospital_name, address, state, zipcode, phone, latitude, longitude)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (hospital_name, COALESCE(zipcode, ''))
+                    DO UPDATE SET
+                        address    = COALESCE(EXCLUDED.address, hospital_details.address),
+                        state      = COALESCE(EXCLUDED.state, hospital_details.state),
+                        zipcode    = COALESCE(EXCLUDED.zipcode, hospital_details.zipcode),
+                        phone      = COALESCE(EXCLUDED.phone, hospital_details.phone),
+                        latitude   = COALESCE(EXCLUDED.latitude, hospital_details.latitude),
+                        longitude  = COALESCE(EXCLUDED.longitude, hospital_details.longitude)
+                    RETURNING hospital_id
+                    """,
+                    name,
+                    full_address or None,
+                    state or None,
+                    zip_enriched or None,
+                    phone or None,
+                    lat,
+                    lon,
+                )
+                summary["enriched"] += 1
+
+                # Step 4: find price transparency file
+                prices_loaded = 0
+                if hospital_id and WEB_SEARCH_ENABLED and (BRAVE_API_KEY or TAVILY_API_KEY):
+                    transparency_url = await _find_price_transparency_url(name, state)
+                    if transparency_url:
+                        price_rows = await _download_and_parse_transparency_file(
+                            transparency_url, hospital_id, name
+                        )
+                        prices_loaded = await _bulk_insert_stg_rates(conn, price_rows)
+                        summary["prices_loaded"] += prices_loaded
+
+                await conn.execute(
+                    """
+                    UPDATE public.pending_hospital_enrichment
+                    SET status='done', hospital_id=$2, processed_at=NOW(), error_message=NULL
+                    WHERE id=$1
+                    """,
+                    row_id, hospital_id,
+                )
+                summary["processed"] += 1
+                logger.info(
+                    "Enriched hospital '%s': geocoded=%s, prices=%d",
+                    name, coords is not None, prices_loaded,
+                )
+
+            except Exception as e:
+                summary["errors"] += 1
+                logger.error("Enrichment failed for '%s': %s", name, e)
+                try:
+                    await conn.execute(
+                        "UPDATE public.pending_hospital_enrichment SET status='failed', error_message=$2 WHERE id=$1",
+                        row_id, str(e)[:500],
+                    )
+                except Exception:
+                    pass
+
+    logger.info("Nightly enrichment complete: %s", summary)
+    return summary
+
+# ----------------------------
 # Startup / Shutdown
 # ----------------------------
 @app.on_event("startup")
 async def startup():
-    global pool
+    global pool, _scheduler
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    async with pool.acquire() as conn:
+        await _ensure_enrichment_table(conn)
+    # Schedule nightly hospital enrichment
+    _scheduler = AsyncIOScheduler(timezone="UTC")
+    _scheduler.add_job(
+        run_nightly_hospital_enrichment,
+        "cron",
+        hour=ENRICHMENT_SCHEDULE_HOUR,
+        minute=0,
+        id="nightly_hospital_enrichment",
+        replace_existing=True,
+    )
+    _scheduler.start()
+    logger.info("Nightly hospital enrichment scheduler started (runs at %02d:00 UTC)", ENRICHMENT_SCHEDULE_HOUR)
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    global _scheduler
+    if _scheduler and _scheduler.running:
+        _scheduler.shutdown(wait=False)
     if pool:
         await pool.close()
 
@@ -201,6 +751,16 @@ async def shutdown():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.post("/admin/run-enrichment")
+async def admin_run_enrichment(x_admin_key: str = Header(default="")):
+    """Manually trigger the nightly hospital enrichment job."""
+    api_key = os.getenv("APP_API_KEY", "")
+    if api_key and x_admin_key != api_key:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+    result = await run_nightly_hospital_enrichment()
+    return {"status": "ok", "result": result}
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -4216,6 +4776,14 @@ async def chat_stream(req: ChatRequest, request: Request):
                                     len(web_only),
                                     merged.get('zipcode'),
                                 )
+                                # Queue new web-discovered hospitals for nightly enrichment
+                                if web_only:
+                                    try:
+                                        await queue_hospitals_for_enrichment(
+                                            conn, web_only, str(merged.get("zipcode") or "")
+                                        )
+                                    except Exception as _qe:
+                                        logger.warning("Failed to queue hospitals for enrichment: %s", _qe)
                         except Exception as e:
                             logger.warning("Synthetic nearby from web failed: %s", e)
 
