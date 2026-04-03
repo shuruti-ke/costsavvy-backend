@@ -647,11 +647,13 @@
         function renderFacilityList(facilities) {
             displayedFacilities = facilities; // Store for selection
             facilityList.innerHTML = '';
+            const priceVals = facilities.map(x => x.price).filter(p => p != null && Number.isFinite(Number(p)));
+            const minListPrice = priceVals.length ? Math.min(...priceVals) : 0;
             facilities.forEach((f, i) => {
                 const card = document.createElement('div');
                 card.className = 'facility-card';
                 const priceText = f.price ? `$${f.price.toLocaleString()}` : (f.estimated_range || 'Contact');
-                const priceClass = f.price ? (f.price <= (sorted[0]?.price || 0) * 1.2 ? 'low' : '') : 'estimate';
+                const priceClass = f.price ? (f.price <= minListPrice * 1.2 ? 'low' : '') : 'estimate';
                 const showWeb = f.web_price != null && Number(f.web_price) > 0;
                 let noteText = 'Estimate';
                 if (f.price) {
