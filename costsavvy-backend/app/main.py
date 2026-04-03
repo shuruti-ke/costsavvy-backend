@@ -4188,22 +4188,34 @@ async def chat_stream(req: ChatRequest, request: Request):
                         logger.warning(f"Nearby hospitals lookup failed: {e}")
                         nearby_hospitals = []
 
-                    # Supplement with web-discovered hospitals when DB is sparse or empty
-                    # (covers regions like Nevada, Wyoming where hospital_details may have few rows)
-                    if len(nearby_hospitals) < MIN_FACILITIES_TO_DISPLAY and WEB_SEARCH_ENABLED and (BRAVE_API_KEY or TAVILY_API_KEY):
+                    # Always run web hospital discovery regardless of DB results.
+                    # Web results represent current, real-world facilities; DB may be stale or regionally sparse.
+                    # We merge both: DB rows first (they have coordinates for map), web fills gaps and confirms.
+                    if WEB_SEARCH_ENABLED and (BRAVE_API_KEY or TAVILY_API_KEY):
                         try:
                             web_discovered = await synthetic_nearby_hospitals_from_web(
                                 str(merged.get("zipcode") or "")
                             )
-                            # Merge: dedupe by name, avoid replacing DB rows
-                            existing_keys = {_normalize_hospital_key(h.get('hospital_name', '')) for h in nearby_hospitals}
-                            for wh in web_discovered:
-                                if len(nearby_hospitals) >= NEARBY_COORD_LOOKUP_LIMIT:
-                                    break
-                                wkey = _normalize_hospital_key(wh.get('hospital_name', ''))
-                                if wkey and wkey not in existing_keys:
-                                    nearby_hospitals.append(wh)
-                                    existing_keys.add(wkey)
+                            if web_discovered:
+                                existing_keys = {_normalize_hospital_key(h.get('hospital_name', '')) for h in nearby_hospitals}
+                                web_only: List[Dict[str, Any]] = []
+                                for wh in web_discovered:
+                                    wkey = _normalize_hospital_key(wh.get('hospital_name', ''))
+                                    if not wkey:
+                                        continue
+                                    if wkey not in existing_keys:
+                                        # Net-new facility from web — append after DB rows
+                                        web_only.append(wh)
+                                        existing_keys.add(wkey)
+                                    # (DB row already present — web search confirmed it exists; keep DB version for coords)
+                                nearby_hospitals = nearby_hospitals + web_only
+                                nearby_hospitals = nearby_hospitals[:NEARBY_COORD_LOOKUP_LIMIT]
+                                logger.info(
+                                    "Hospital list: %d from DB, %d net-new from web (ZIP %s)",
+                                    len(nearby_hospitals) - len(web_only),
+                                    len(web_only),
+                                    merged.get('zipcode'),
+                                )
                         except Exception as e:
                             logger.warning("Synthetic nearby from web failed: %s", e)
 
