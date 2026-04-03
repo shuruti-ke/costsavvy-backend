@@ -569,7 +569,8 @@ async def _web_search_facilities_near_zip(zipcode: str, num_results: int = 14) -
     z = (zipcode or "").strip()
     if not z:
         return []
-    q = f'hospitals medical centers near ZIP code {z} outpatient surgery facility'
+    # Use multiple targeted queries for better regional coverage
+    q = f'hospitals medical centers near ZIP {z} acute care emergency health system surgery'
     out: List[Dict[str, Any]] = []
     if BRAVE_API_KEY:
         try:
@@ -594,6 +595,29 @@ async def _web_search_facilities_near_zip(zipcode: str, num_results: int = 14) -
             logger.warning("Brave ZIP facility directory search failed: %s", e)
     if not out and TAVILY_API_KEY:
         out.extend(await _tavily_search(q, num_results=num_results))
+    # If still sparse, try a second broader query (catches regional health systems)
+    if len(out) < 5:
+        q2 = f'major hospital health system serving {z} ZIP code United States'
+        if BRAVE_API_KEY:
+            try:
+                async with httpx.AsyncClient(timeout=WEB_SEARCH_TIMEOUT) as http:
+                    resp = await http.get(
+                        'https://api.search.brave.com/res/v1/web/search',
+                        headers={'X-Subscription-Token': BRAVE_API_KEY},
+                        params={'q': q2, 'count': max(1, min(num_results, 20))},
+                    )
+                    if resp.status_code == 200:
+                        for item in resp.json().get('web', {}).get('results', [])[:num_results]:
+                            out.append({
+                                'title': item.get('title', '')[:500],
+                                'snippet': item.get('description', '')[:2000],
+                                'url': item.get('url', ''),
+                                'source': 'brave',
+                            })
+            except Exception as e:
+                logger.warning('Brave broad facility search failed: %s', e)
+        elif TAVILY_API_KEY:
+            out.extend(await _tavily_search(q2, num_results=num_results))
     return out
 
 
@@ -2270,7 +2294,8 @@ async def price_lookup_progressive(
     payment_mode: str,
 ) -> Tuple[List[Dict[str, Any]], Optional[int]]:
     """Geo-first nearest-facility pricing lookup with expanding radius."""
-    radius_array = [10, 25, 50, 100]
+    # Extend to 300 miles for sparse regions (e.g. Nevada, rural states)
+    radius_array = [10, 25, 50, 100, 200, 300]
 
     rows = await price_lookup_nearest_facilities(
         conn,
@@ -2543,7 +2568,8 @@ async def get_nearby_hospitals(conn: asyncpg.Connection, zipcode: str, limit: in
     if zlat is not None and zlon is not None:
         # Expand radius until we find facilities; cap each step so we prefer truly local rows.
         # Stop at 300 mi: beyond that, "nearby" is misleading (e.g. CT vs PA); prefer empty + web enrichment.
-        radius_steps = (50, 100, 150, 200, 300)
+        # Extend to 500 miles so rural/sparse states (Nevada, Wyoming, etc.) always get results
+        radius_steps = (50, 100, 200, 300, 500)
         for max_miles in radius_steps:
             q = f"""
             SELECT
@@ -4162,13 +4188,22 @@ async def chat_stream(req: ChatRequest, request: Request):
                         logger.warning(f"Nearby hospitals lookup failed: {e}")
                         nearby_hospitals = []
 
-                    # DB directory may omit a region (e.g. sparse hospital_details). Web-discovered names
-                    # still allow price search + UI list independent of local SQL rows.
-                    if not nearby_hospitals and WEB_SEARCH_ENABLED and (BRAVE_API_KEY or TAVILY_API_KEY):
+                    # Supplement with web-discovered hospitals when DB is sparse or empty
+                    # (covers regions like Nevada, Wyoming where hospital_details may have few rows)
+                    if len(nearby_hospitals) < MIN_FACILITIES_TO_DISPLAY and WEB_SEARCH_ENABLED and (BRAVE_API_KEY or TAVILY_API_KEY):
                         try:
-                            nearby_hospitals = await synthetic_nearby_hospitals_from_web(
+                            web_discovered = await synthetic_nearby_hospitals_from_web(
                                 str(merged.get("zipcode") or "")
                             )
+                            # Merge: dedupe by name, avoid replacing DB rows
+                            existing_keys = {_normalize_hospital_key(h.get('hospital_name', '')) for h in nearby_hospitals}
+                            for wh in web_discovered:
+                                if len(nearby_hospitals) >= NEARBY_COORD_LOOKUP_LIMIT:
+                                    break
+                                wkey = _normalize_hospital_key(wh.get('hospital_name', ''))
+                                if wkey and wkey not in existing_keys:
+                                    nearby_hospitals.append(wh)
+                                    existing_keys.add(wkey)
                         except Exception as e:
                             logger.warning("Synthetic nearby from web failed: %s", e)
 
