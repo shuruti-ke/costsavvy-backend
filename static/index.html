@@ -216,7 +216,7 @@
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.35-4.35"></path></svg>
                 Quick Price Search
             </h2>
-            <form class="search-form" id="quickSearchForm">
+            <form class="search-form" id="quickSearchForm" novalidate>
                 <div class="form-group">
                     <label for="service">Service</label>
                     <select id="service">
@@ -242,11 +242,11 @@
                         </optgroup>
                     </select>
                     <div class="cpt-or"><span>or CPT code</span></div>
-                    <input type="text" id="cptCode" placeholder="e.g. 71046" maxlength="5" pattern="[0-9]{5}" style="margin-top:0;">
+                    <input type="text" id="cptCode" placeholder="e.g. 71046" maxlength="5" inputmode="numeric" autocomplete="off" style="margin-top:0;">
                 </div>
                 <div class="form-group">
                     <label for="zipcode">ZIP Code</label>
-                    <input type="text" id="zipcode" placeholder="e.g., 06119" maxlength="5" pattern="[0-9]{5}" required>
+                    <input type="text" id="zipcode" placeholder="e.g., 06119" maxlength="5" inputmode="numeric" autocomplete="postal-code" required>
                 </div>
                 <div class="form-group">
                     <label for="payment">Payment Type</label>
@@ -437,11 +437,21 @@
         
         async function handleQuickSearch(e) {
             e.preventDefault();
-            const service = $('service').value, zipcode = $('zipcode').value, payment = $('payment').value;
+            const service = $('service').value, zipcode = $('zipcode').value.trim(), payment = $('payment').value;
             const cptCode = $('cptCode').value.trim();
             const insuranceProvider = $('insuranceProvider').value;
             if (!service && !cptCode) { showError('Please select a service or enter a CPT code'); return; }
             if (!zipcode) { showError('Please enter your ZIP code'); return; }
+            if (!/^\d{5}$/.test(zipcode)) {
+                showError('ZIP code must be exactly 5 digits (numbers only).');
+                $('zipcode').focus();
+                return;
+            }
+            if (cptCode && !/^\d{5}$/.test(cptCode)) {
+                showError('CPT code must be exactly 5 digits, or leave the CPT field blank.');
+                $('cptCode').focus();
+                return;
+            }
 
             quickSearchBtn.disabled = true;
             quickSearchBtn.innerHTML = '<div class="spinner"></div> Searching...';
@@ -544,7 +554,11 @@
             return { text: fullText, mapData, facilities, resultState, webFacilityPrices };
         }
         
-        function showError(msg) { errorMessage.textContent = msg; errorMessage.classList.add('active'); }
+        function showError(msg) {
+            errorMessage.textContent = msg;
+            errorMessage.classList.add('active');
+            try { errorMessage.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } catch (_) {}
+        }
         function hideError() { errorMessage.classList.remove('active'); }
         
         function addMessage(text, role) {
