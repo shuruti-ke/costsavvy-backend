@@ -153,6 +153,8 @@ else:
 class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     message: str
+    # Quick Search: ignore stored session_state so any option change gets a clean pricing context
+    fresh_context: bool = False
 
 
 # ----------------------------
@@ -3407,6 +3409,8 @@ async def chat_stream(req: ChatRequest, request: Request):
         try:
             async with pool.acquire() as conn:
                 session_id, state = await get_or_create_session(conn, req.session_id)
+                if req.fresh_context:
+                    state = {}
                 yield sse({"type": "session", "session_id": session_id})
                 await save_message(conn, session_id, "user", req.message)
 
