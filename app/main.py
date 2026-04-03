@@ -564,6 +564,159 @@ def _web_facility_catalog_from_targets(targets: List[Dict[str, Any]]) -> List[Di
     return out
 
 
+async def _web_search_facilities_near_zip(zipcode: str, num_results: int = 14) -> List[Dict[str, Any]]:
+    """Broad web search for hospitals serving a ZIP (when local DB directory has no rows)."""
+    z = (zipcode or "").strip()
+    if not z:
+        return []
+    q = f'hospitals medical centers near ZIP code {z} outpatient surgery facility'
+    out: List[Dict[str, Any]] = []
+    if BRAVE_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=WEB_SEARCH_TIMEOUT) as http:
+                resp = await http.get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    headers={"X-Subscription-Token": BRAVE_API_KEY},
+                    params={"q": q, "count": max(1, min(num_results, 20))},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for item in data.get("web", {}).get("results", [])[:num_results]:
+                        out.append(
+                            {
+                                "title": item.get("title", "")[:500],
+                                "snippet": item.get("description", "")[:2000],
+                                "url": item.get("url", ""),
+                                "source": "brave",
+                            }
+                        )
+        except Exception as e:
+            logger.warning("Brave ZIP facility directory search failed: %s", e)
+    if not out and TAVILY_API_KEY:
+        out.extend(await _tavily_search(q, num_results=num_results))
+    return out
+
+
+def _fallback_hospital_names_from_zip_snippets(
+    snippets: List[Dict[str, Any]], max_h: int
+) -> List[Dict[str, Any]]:
+    """Heuristic names from result titles when LLM parse is unavailable."""
+    out: List[Dict[str, Any]] = []
+    for s in snippets or []:
+        t = (s.get("title") or "").strip()
+        if not t or len(t) < 8:
+            continue
+        tl = t.lower()
+        if not any(
+            k in tl
+            for k in (
+                "hospital",
+                "medical center",
+                "health system",
+                "clinic",
+                "upmc",
+                "mayo",
+                "cleveland clinic",
+            )
+        ):
+            continue
+        name = t.split(" - ")[0].split(" | ")[0].split(" – ")[0].strip()[:200]
+        if len(name) < 5:
+            continue
+        out.append({"hospital_name": name, "address": ""})
+        if len(out) >= max_h:
+            break
+    return out
+
+
+def _parse_hospital_list_near_zip_llm(
+    zipcode: str, snippets: List[Dict[str, Any]], limit: int
+) -> List[Dict[str, Any]]:
+    if not snippets:
+        return []
+    body = "\n".join(
+        f"- {s.get('title', '')}: {(s.get('snippet') or '')[:450]}" for s in snippets[:20]
+    )
+    system = (
+        "You extract real U.S. hospital or major medical center names that plausibly serve patients near the ZIP, "
+        "using only the web snippets (do not invent). "
+        f'Return JSON only: {{"hospitals":[{{"hospital_name":"string","address":"string"}}]}} '
+        f"with at most {limit} distinct facilities; omit chains of only primary-care clinics if acute hospitals exist."
+    )
+    user = f"ZIP: {zipcode}\n\nSnippets:\n{body}"
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            temperature=0,
+            timeout=30,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
+        raw = re.sub(r"\s*```\s*$", "", raw)
+        data = json.loads(raw)
+        arr = data.get("hospitals") if isinstance(data, dict) else None
+        if not isinstance(arr, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for item in arr:
+            if not isinstance(item, dict):
+                continue
+            name = (item.get("hospital_name") or item.get("name") or "").strip()
+            addr = (item.get("address") or "").strip()
+            if len(name) < 4:
+                continue
+            out.append({"hospital_name": name, "address": addr})
+            if len(out) >= limit:
+                break
+        return out
+    except Exception as e:
+        logger.warning("LLM hospital list parse near ZIP failed: %s", e)
+        return []
+
+
+async def synthetic_nearby_hospitals_from_web(zipcode: str) -> List[Dict[str, Any]]:
+    """
+    Build a facility list from web search when public.hospital_details has nothing near this ZIP.
+    Rows match the shape expected by attach_web_prices_to_facility_results / build_facility_block.
+    """
+    z = (zipcode or "").strip()
+    if len(z) != 5 or not z.isdigit():
+        return []
+    if not WEB_SEARCH_ENABLED or not (BRAVE_API_KEY or TAVILY_API_KEY):
+        return []
+
+    snips = await _web_search_facilities_near_zip(z)
+    lim = max(MIN_FACILITIES_TO_DISPLAY, 5)
+    rows = _parse_hospital_list_near_zip_llm(z, snips, limit=lim)
+    if not rows:
+        rows = _fallback_hospital_names_from_zip_snippets(snips, lim)
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        name = (r.get("hospital_name") or "").strip()
+        if not name:
+            continue
+        out.append(
+            {
+                "hospital_id": None,
+                "hospital_name": name,
+                "address": (r.get("address") or "").strip(),
+                "state": None,
+                "zipcode": None,
+                "phone": None,
+                "latitude": None,
+                "longitude": None,
+                "distance_miles": None,
+                "_web_discovered": True,
+            }
+        )
+        if len(out) >= NEARBY_COORD_LOOKUP_LIMIT:
+            break
+    if out:
+        logger.info("Web-synthesized %d hospitals near ZIP %s (no DB directory match)", len(out), z)
+    return out
+
+
 async def attach_web_prices_to_facility_results(
     results: List[Dict[str, Any]],
     service_query: str,
@@ -2932,11 +3085,12 @@ def build_facility_block(
         _enrich_facilities_with_coordinates(facilities, priced_results, fallback_hospitals)
         _backfill_facilities_missing_coordinates(facilities, fallback_hospitals)
 
-    # If still empty, return a graceful message (should be rare if hospitals are loaded)
+    # If still empty after DB + web top-up, explain options (directory gap vs missing web keys)
     if not facilities:
         return (
-            "I couldn’t find hospitals near that ZIP code in my database yet. "
-            "Try another nearby ZIP, or expand the search radius.",
+            "I couldn’t assemble a facility list for that ZIP from the data available on this run. "
+            "If **Brave** or **Tavily** search is configured, try again—results can use web-discovered hospitals "
+            "even when our local facility table has no rows near that ZIP. You can also try a nearby ZIP in the same metro.",
             [],
             None,
         )
@@ -3996,6 +4150,16 @@ async def chat_stream(req: ChatRequest, request: Request):
                     except Exception as e:
                         logger.warning(f"Nearby hospitals lookup failed: {e}")
                         nearby_hospitals = []
+
+                    # DB directory may omit a region (e.g. sparse hospital_details). Web-discovered names
+                    # still allow price search + UI list independent of local SQL rows.
+                    if not nearby_hospitals and WEB_SEARCH_ENABLED and (BRAVE_API_KEY or TAVILY_API_KEY):
+                        try:
+                            nearby_hospitals = await synthetic_nearby_hospitals_from_web(
+                                str(merged.get("zipcode") or "")
+                            )
+                        except Exception as e:
+                            logger.warning("Synthetic nearby from web failed: %s", e)
 
                     web_price_attempted = False
                     web_vals_all: List[float] = []
