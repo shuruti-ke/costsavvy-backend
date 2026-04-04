@@ -41,6 +41,9 @@ interface MapData {
     website_url: string | null;
   }>;
   google_maps_url?: string;
+  procedure_code?: string;
+  procedure_display_name?: string;
+  service_query?: string;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
