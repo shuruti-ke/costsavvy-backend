@@ -6,7 +6,7 @@ services:
     region: oregon               # or frankfurt/singapore if better for your users
     pythonVersion: "3.11"        # matches modern asyncpg + FastAPI
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       # 🔐 DATABASE_URL — manually paste your *existing* DB URL in Render dashboard

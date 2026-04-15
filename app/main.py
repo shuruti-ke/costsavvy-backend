@@ -6,6 +6,8 @@ import uuid
 import time
 import logging
 import asyncio
+import pathlib
+from contextlib import asynccontextmanager
 import httpx
 import statistics
 from typing import Optional, Any, Dict, List, Tuple
@@ -87,6 +89,24 @@ SYMPTOM_KEYWORDS = [
     "need to see", "should i go to"
 ]
 
+PRICING_KEYWORDS = [
+    "cost",
+    "price",
+    "pricing",
+    "how much",
+    "fee",
+    "fees",
+    "estimate",
+    "estimated",
+    "charge",
+    "charges",
+    "cash price",
+    "self pay",
+    "self-pay",
+    "out of pocket",
+    "insurance",
+]
+
 # Health education keywords that trigger web search for explanations
 HEALTH_EDUCATION_KEYWORDS = [
     "what is", "what's", "explain", "tell me about", "how does", "why do",
@@ -124,7 +144,23 @@ PRICE_RADIUS_ATTEMPTS = [
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI()
+client = OpenAI(api_key=OPENAI_API_KEY)
+pool: asyncpg.Pool | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global pool
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    try:
+        yield
+    finally:
+        if pool:
+            await pool.close()
+            pool = None
+
+
+app = FastAPI(lifespan=lifespan)
 
 # CORS middleware - allow requests from any origin
 app.add_middleware(
@@ -135,11 +171,7 @@ app.add_middleware(
     allow_headers=["*"],  # Allow all headers
 )
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-pool: asyncpg.Pool | None = None
-
 # Mount static files if directory exists
-import pathlib
 static_dir = pathlib.Path("static")
 if static_dir.exists():
     app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -186,18 +218,6 @@ def require_auth(request: Request):
 # ----------------------------
 # Startup / Shutdown
 # ----------------------------
-@app.on_event("startup")
-async def startup():
-    global pool
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    if pool:
-        await pool.close()
-
-
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -1022,7 +1042,9 @@ def is_symptom_query(message: str) -> bool:
 def is_health_education_query(message: str) -> bool:
     """Check if the user is asking for health education/explanation."""
     msg = (message or "").lower()
-    return any(kw in msg for kw in HEALTH_EDUCATION_KEYWORDS)
+    return any(kw in msg for kw in HEALTH_EDUCATION_KEYWORDS) and not any(
+        kw in msg for kw in PRICING_KEYWORDS
+    )
 
 
 def extract_health_topic(message: str) -> str:
@@ -1039,9 +1061,40 @@ def extract_health_topic(message: str) -> str:
         if msg_lower.startswith(prefix):
             msg = msg[len(prefix):].strip()
             break
-    # Remove trailing question marks and clean up
-    msg = msg.rstrip("?").strip()
+    # Remove trailing punctuation and leading articles so we search for the topic itself.
+    msg = msg.rstrip("?.!").strip()
+    msg = re.sub(r"^(?:a|an|the)\s+", "", msg, flags=re.IGNORECASE)
     return msg
+
+
+def clear_topic_switch_context(merged: Dict[str, Any], clear_zip: bool = False) -> None:
+    """
+    Clear stale routing state when the user switches away from pricing into care/education.
+
+    This keeps old price-flow gates from bleeding into non-price branches while still
+    preserving any unrelated session metadata.
+    """
+    for key in (
+        "service_query",
+        "code_type",
+        "code",
+        "payment_mode",
+        "payer_like",
+        "plan_like",
+        "cash_only",
+        "radius_miles",
+        "refiner_choice",
+        "refiner_id",
+        "variant_confirmed",
+        "variant_id",
+        "variant_name",
+        "_variant_candidates",
+        "_variant_single",
+        "_awaiting",
+    ):
+        merged.pop(key, None)
+    if clear_zip:
+        merged.pop("zipcode", None)
 
 
 async def lookup_service_explanation(conn: asyncpg.Connection, topic: str) -> Optional[Dict[str, Any]]:
@@ -1437,6 +1490,30 @@ _CARRIER_KEYWORDS: Dict[str, str] = {
     "medicare": "Medicare",
 }
 
+_PLAN_KEYWORDS: Dict[str, str] = {
+    "ppo": "PPO",
+    "hmo": "HMO",
+    "epo": "EPO",
+    "pos": "POS",
+    "hdhp": "HDHP",
+    "high deductible": "HDHP",
+    "high-deductible": "HDHP",
+    "medigap": "Medigap",
+    "pdp": "PDP",
+}
+
+
+def extract_plan_like_from_text(message: str) -> Optional[str]:
+    """Resolve a common plan type from free text."""
+    m = (message or "").strip()
+    if not m:
+        return None
+    ml = m.lower()
+    for k, v in _PLAN_KEYWORDS.items():
+        if k in ml:
+            return v
+    return None
+
 
 def extract_carrier_from_text(message: str) -> Optional[str]:
     """Resolve a payer/carrier name from free text (Quick Search + chat templates)."""
@@ -1447,12 +1524,14 @@ def extract_carrier_from_text(message: str) -> Optional[str]:
     for k, v in _CARRIER_KEYWORDS.items():
         if k in ml:
             return v
+    if extract_plan_like_from_text(m):
+        return None
     clean = m
     for stop in ["i have", "i use", "use", "with", "insurance", "my", "have", "paying"]:
         clean = re.sub(r"\b" + re.escape(stop) + r"\b", "", clean, flags=re.IGNORECASE)
     clean = clean.strip()
     tokens = re.findall(r"[a-zA-Z]+", clean)
-    if len(tokens) == 1 and len(tokens[0]) >= 3:
+    if len(tokens) == 1 and len(tokens[0]) >= 3 and tokens[0].lower() not in _PLAN_KEYWORDS:
         return tokens[0].title()
     if 2 <= len(tokens) <= 3:
         return " ".join([t.title() for t in tokens])
@@ -1493,14 +1572,22 @@ def apply_payment_hints_from_message(message: str, merged: Dict[str, Any], inten
     }
     insurance_terms = {"insurance", "insured", "use insurance", "with insurance"}
     carrier = extract_carrier_from_text(msg)
+    plan_like = extract_plan_like_from_text(msg)
     has_ins = any(t in msg_l for t in insurance_terms)
     has_cash = any(t in msg_l for t in cash_terms)
 
-    if has_ins or carrier:
+    if has_ins or carrier or plan_like:
         merged["payment_mode"] = "insurance"
         merged["cash_only"] = False
         if carrier:
             merged["payer_like"] = carrier
+            if not plan_like:
+                merged["plan_like"] = None
+        elif plan_like:
+            merged["payer_like"] = None
+            merged["plan_like"] = plan_like
+        if plan_like:
+            merged["plan_like"] = plan_like
         merged.pop("_awaiting", None)
         return
     if has_cash:
@@ -1564,9 +1651,10 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
     # ALWAYS trigger for symptoms - this overrides any pricing flow
     # Symptoms indicate a NEW concern that needs care navigation, not pricing
     if is_symptom_query(msg):
+        z = resolve_zip_digit_groups(msg)
         return {
             "mode": "care",
-            "zipcode": None,  # Always ask for ZIP fresh for care queries
+            "zipcode": z,
             "symptom_description": msg,
             "clarifying_question": None,
             "_reset_session": True,  # Signal to reset pricing state
@@ -1656,6 +1744,8 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
         for k, v in carrier_map.items():
             if k in ml:
                 return v
+        if extract_plan_like_from_text(m):
+            return None
 
         # Filter out common filler words so we don't accidentally treat
         # "I have insurance" or "use insurance" as the carrier name "I Have Insurance".
@@ -1668,7 +1758,7 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
         tokens = re.findall(r"[a-zA-Z]+", clean)
 
         # if the user replies with just a single word, treat it as a carrier candidate
-        if len(tokens) == 1 and len(tokens[0]) >= 3:
+        if len(tokens) == 1 and len(tokens[0]) >= 3 and tokens[0].lower() not in _PLAN_KEYWORDS:
             return tokens[0].title()
         
         # two-word carrier (e.g., "Harvard Pilgrim")
@@ -1691,40 +1781,7 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
 
     # 2) If we are awaiting payment, accept cash/insurance quickly.
     if awaiting == "payment":
-        if any(t in msg_l for t in cash_terms):
-            return {
-                "mode": "price",
-                "zipcode": st.get("zipcode"),
-                "service_query": st.get("service_query"),
-                "code_type": st.get("code_type"),
-                "code": st.get("code"),
-                "payment_mode": "cash",
-                "payer_like": None,
-                "plan_like": None,
-                "clarifying_question": None,
-                "cash_only": True,
-            }
-
-        if any(t in msg_l for t in insurance_terms) or extract_carrier(msg):
-            payer_like = extract_carrier(msg)
-            return {
-                "mode": "price",
-                "zipcode": st.get("zipcode"),
-                "service_query": st.get("service_query"),
-                "code_type": st.get("code_type"),
-                "code": st.get("code"),
-                "payment_mode": "insurance",
-                "payer_like": payer_like,
-                "plan_like": None,
-                "clarifying_question": None,
-                "cash_only": False,
-            }
-
-        return {"mode": "clarify", "clarifying_question": "Are you paying cash (self-pay) or using insurance? If insurance, what carrier (e.g., Aetna)?"}
-
-    # 3) Session-aware continuation even when not awaiting:
-    # If the session already has service + zip, treat "cash"/"insurance"/carrier-only as updates and rerun pricing.
-    if have_service and have_zip:
+        plan_like = extract_plan_like_from_text(msg)
         if any(t in msg_l for t in cash_terms):
             return {
                 "mode": "price",
@@ -1740,7 +1797,42 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
             }
 
         carrier = extract_carrier(msg)
-        if any(t in msg_l for t in insurance_terms) or carrier:
+        if any(t in msg_l for t in insurance_terms) or carrier or plan_like:
+            return {
+                "mode": "price",
+                "zipcode": st.get("zipcode"),
+                "service_query": st.get("service_query"),
+                "code_type": st.get("code_type"),
+                "code": st.get("code"),
+                "payment_mode": "insurance",
+                "payer_like": carrier,
+                "plan_like": plan_like,
+                "clarifying_question": None,
+                "cash_only": False,
+            }
+
+        return {"mode": "clarify", "clarifying_question": "Are you paying cash (self-pay) or using insurance? If insurance, what carrier (e.g., Aetna)?"}
+
+    # 3) Session-aware continuation even when not awaiting:
+    # If the session already has service + zip, treat "cash"/"insurance"/carrier-only as updates and rerun pricing.
+    if have_service and have_zip:
+        plan_like = extract_plan_like_from_text(msg)
+        if any(t in msg_l for t in cash_terms):
+            return {
+                "mode": "price",
+                "zipcode": st.get("zipcode"),
+                "service_query": st.get("service_query"),
+                "code_type": st.get("code_type"),
+                "code": st.get("code"),
+                "payment_mode": "cash",
+                "payer_like": None,
+                "plan_like": None,
+                "clarifying_question": None,
+                "cash_only": True,
+            }
+
+        carrier = extract_carrier(msg)
+        if any(t in msg_l for t in insurance_terms) or carrier or plan_like:
             return {
                 "mode": "price",
                 "zipcode": st.get("zipcode"),
@@ -1749,7 +1841,7 @@ async def extract_intent(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
                 "code": st.get("code"),
                 "payment_mode": "insurance",
                 "payer_like": carrier or st.get("payer_like"),
-                "plan_like": None,
+                "plan_like": plan_like or st.get("plan_like"),
                 "clarifying_question": None,
                 "cash_only": False,
             }
@@ -1825,20 +1917,27 @@ def should_force_price_mode(message: str, merged: Dict[str, Any]) -> bool:
     if not INTENT_OVERRIDE_FORCE_PRICE_ENABLED:
         return False
 
-    # If we already have a pricing context (service + ZIP) and are still collecting
-    # payment details, keep the conversation in price mode even if the user's reply
-    # doesn't include explicit cost keywords (e.g., "I have Aetna insurance").
-    if (merged or {}).get("service_query") and (merged or {}).get("zipcode") and not (merged or {}).get("payment_mode"):
-        return True
-    if (merged or {}).get("_awaiting") in {"zip", "payment"}:
+    merged = merged or {}
+    service_context = bool((merged.get("service_query") or "").strip() or (merged.get("code") or "").strip())
+    has_zip = bool(merged.get("zipcode"))
+    msg = (message or "").lower()
+    has_keyword = any(kw in msg for kw in INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS)
+
+    # If we are already collecting payment details for a priced service, stay in price mode.
+    if (merged.get("_awaiting") or "") in {"zip", "payment"}:
         return True
 
-    msg = (message or "").lower()
-    return any(kw in msg for kw in INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS)
+    # If we have a service and ZIP, keep the flow in price mode while we finish payment details.
+    if service_context and has_zip and not (merged.get("payment_mode") or "").strip():
+        return True
+
+    # Only keyword-based overrides are allowed when the user has already named a service.
+    return service_context and has_keyword
 
 
 def apply_intent_override_if_needed(intent: Dict[str, Any], message: str, merged: Dict[str, Any], session_id: str) -> Dict[str, Any]:
     if should_force_price_mode(message, merged):
+        merged = merged or {}
         prev = intent.get("mode")
         if prev != "price":
             logger.info(
@@ -1847,7 +1946,17 @@ def apply_intent_override_if_needed(intent: Dict[str, Any], message: str, merged
             )
         intent["mode"] = "price"
         intent["intent_overridden"] = True
-        intent["override_reason"] = "cost_keyword"
+        has_keyword = any(kw in (message or "").lower() for kw in INTENT_OVERRIDE_FORCE_PRICE_KEYWORDS)
+        service_query = (merged.get("service_query") or "").strip()
+        code = (merged.get("code") or "").strip()
+        if has_keyword and (service_query or code):
+            intent["override_reason"] = "cost_keyword_plus_service_query" if service_query else "cost_keyword_plus_service_code"
+        elif (merged.get("_awaiting") or "") in {"zip", "payment"}:
+            intent["override_reason"] = "awaiting_followup"
+        elif service_query or code:
+            intent["override_reason"] = "pricing_context_continuation"
+        else:
+            intent["override_reason"] = "cost_keyword"
 
         if not (merged.get("service_query") or "").strip():
             inferred = infer_service_query_from_message(message)
@@ -1861,16 +1970,21 @@ def apply_intent_override_if_needed(intent: Dict[str, Any], message: str, merged
 
 
 def message_contains_zip(message: str) -> bool:
-    msg = (message or "").strip()
-    tokens = [t.strip(",.()[]{}") for t in msg.split()]
-    return any(len(t) == 5 and t.isdigit() for t in tokens)
+    # Treat explicit ZIP phrasing as a ZIP, plus bare ZIPs that are anchored by a
+    # location cue ("in 06119", "near 06119"). Bare 5-digit tokens can be CPT codes.
+    if extract_zip_from_price_message(message) is not None:
+        return True
+    msg = (message or "").lower()
+    if _is_zip_only_message(msg):
+        return True
+    return bool(re.search(r"\b(?:in|near|around|zip|zipcode|zip code|area|local to)\s+\d{5}\b", msg))
 
 
 def message_contains_payment_info(message: str) -> bool:
     msg = (message or "").lower()
     cash_terms = ["cash", "self pay", "self-pay", "out of pocket", "out-of-pocket", "uninsured", "no insurance"]
     ins_terms = ["insurance", "insured", "copay", "coinsurance", "deductible"]
-    return any(t in msg for t in cash_terms) or any(t in msg for t in ins_terms)
+    return any(t in msg for t in cash_terms) or any(t in msg for t in ins_terms) or extract_plan_like_from_text(message) is not None
 
 
 def reset_gating_fields_for_new_price_question(message: str, merged: Dict[str, Any]) -> None:
@@ -3772,17 +3886,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                     # User described symptoms - help them find care, NOT price services
                     # IMPORTANT: Reset any pricing session state - this is a NEW concern
                     if intent.get("_reset_session"):
-                        # Clear pricing-related state
-                        merged.pop("service_query", None)
-                        merged.pop("code_type", None)
-                        merged.pop("code", None)
-                        merged.pop("payment_mode", None)
-                        merged.pop("payer_like", None)
-                        merged.pop("plan_like", None)
-                        merged.pop("_variant_candidates", None)
-                        merged.pop("_variant_single", None)
-                        merged.pop("variant_confirmed", None)
-                        merged.pop("zipcode", None)  # Ask for ZIP fresh for care
+                        # Clear pricing-related state and stale gate bookkeeping.
+                        clear_topic_switch_context(merged, clear_zip=True)
                     
                     zipcode = intent.get("zipcode")  # Only use ZIP from current intent, not merged
                     
@@ -3860,6 +3965,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                 if mode == "education":
                     health_topic = intent.get("health_topic") or extract_health_topic(req.message)
                     original_question = intent.get("original_question") or req.message
+                    clear_topic_switch_context(merged, clear_zip=False)
                     
                     # First, check if we have info in our database
                     yield sse({"type": "status", "message": "Looking up health information..."})
