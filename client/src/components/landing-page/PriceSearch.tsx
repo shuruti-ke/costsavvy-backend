@@ -45,7 +45,9 @@ interface MapData {
   google_maps_url?: string;
   procedure_code?: string;
   procedure_display_name?: string;
+  procedure_explanation?: string;
   service_query?: string;
+  ai_powered?: boolean;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -57,6 +59,23 @@ function escapeHtml(str: string): string {
 
 function normalizeAddress(s: string): string {
   return (s || "").replace(/\u00a0/g, " ").replace(/Â+/g, "").replace(/\s+/g, " ").trim();
+}
+
+function getCptPlainLanguageExplanation(code: string, fallback?: string) {
+  const normalizedCode = code.trim();
+  if (normalizedCode === "77385") {
+    return "a focused radiation treatment that shapes the beam to the tumor while trying to spare healthy tissue";
+  }
+  if (fallback) {
+    return fallback
+      .replace(/intensity modulated radiation treatment delivery \(imrt\)/i, "a focused radiation treatment")
+      .replace(/includes guidance and tracking, when performed/i, "with guidance and tracking when needed")
+      .replace(/;?\s*simple/i, "")
+      .replace(/delivery/i, "treatment")
+      .replace(/therapy/i, "treatment")
+      .trim();
+  }
+  return "";
 }
 
 const SERVICES = [
@@ -203,6 +222,10 @@ export default function PriceSearch() {
     setSelectedIdx(null);
     const cpt = String(state.code || md.procedure_code || "").trim();
     const proc = String(state.procedure_display_name || md.procedure_display_name || "").trim();
+    const explanationSource = String(
+      state.procedure_explanation || md.procedure_explanation || ""
+    ).trim();
+    const explanation = getCptPlainLanguageExplanation(cpt, explanationSource);
     const parts: string[] = [];
     const addPart = (value: string) => {
       const normalized = value.trim().replace(/\s+/g, " ");
@@ -219,7 +242,7 @@ export default function PriceSearch() {
       addPart(`CPT code ${cpt}`);
     }
 
-    const title = parts.join(", ");
+    const title = explanation ? `${parts.join(", ")} (${explanation})` : parts.join(", ");
     setResultsTitle(title);
     const prices = fs.map(f => f.price).filter((p): p is number => p != null);
     if (prices.length > 0) { setPriceRange({ min: Math.min(...prices), max: Math.max(...prices) }); setEstimatesOnly(false); }
@@ -325,7 +348,17 @@ export default function PriceSearch() {
         <div ref={resultsRef} className="w-full bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden mb-6">
           {/* Header */}
           <div className="px-5 py-4 border-b border-gray-100 flex flex-wrap justify-between items-center gap-3">
-            <h2 className="text-lg font-semibold text-gray-800">Results for {resultsTitle}</h2>
+            <div className="space-y-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="text-lg font-semibold text-gray-800">Results for {resultsTitle}</h2>
+                <span className="inline-flex items-center rounded-full border border-[#f5d0e6] bg-[#fdf2f8] px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#6b2458]">
+                  AI-powered web search
+                </span>
+              </div>
+              <p className="text-xs text-gray-500">
+                Results are pulled from Brave-powered web search pages and ranked with AI. The database is only a fallback when no web price can be verified.
+              </p>
+            </div>
             <div className="flex items-center gap-4 text-sm text-gray-500">
               {priceRange ? (
                 <span>Price range: <span className="font-semibold text-green-600">${priceRange.min.toLocaleString()}</span> – <span className="font-semibold text-red-500">${priceRange.max.toLocaleString()}</span></span>

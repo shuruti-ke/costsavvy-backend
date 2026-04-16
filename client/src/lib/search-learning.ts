@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { query } from "@/lib/postgres";
-
+import { callNemotron } from "@/lib/nemotron";
 const learningSchema = z.object({
   normalizedServiceName: z.string().nullable().default(null),
   normalizedHospitalName: z.string().nullable().default(null),
@@ -20,11 +20,10 @@ type LearningInput = {
   zip?: string;
   insurance?: string;
   rows: Array<Record<string, unknown>>;
+  persistToDatabase?: boolean;
 };
 
 type LearningResult = z.infer<typeof learningSchema>;
-type ModelMessage = { role: "system" | "user" | "assistant"; content: string };
-
 let schemaReady: Promise<void> | null = null;
 
 function normalizeText(value: unknown) {
@@ -33,48 +32,6 @@ function normalizeText(value: unknown) {
 
 function inferCodeType(code: string) {
   return /^\d{5}$/.test(code) ? "CPT" : "CUSTOM";
-}
-
-function getNvidiaApiKey() {
-  return process.env.NVIDIA_API_KEY || process.env.NEMOTRON_API_KEY || "";
-}
-
-function getNvidiaModel() {
-  return (
-    process.env.NVIDIA_MODEL ||
-    process.env.COSTSAVVY_AI_MODEL ||
-    "nvidia/nemotron-3-super-120b-a12b"
-  );
-}
-
-async function callNemotron(messages: ModelMessage[]) {
-  const apiKey = getNvidiaApiKey();
-  if (!apiKey) return null;
-
-  const response = await fetch(
-    process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: getNvidiaModel(),
-        temperature: 0.2,
-        messages,
-      }),
-    }
-  );
-
-  if (!response.ok) {
-    throw new Error(`Nemotron request failed with status ${response.status}`);
-  }
-
-  const data = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string | null } }>;
-  };
-  return data.choices?.[0]?.message?.content?.trim() || null;
 }
 
 function parseLearningResponse(raw: string | null): LearningResult | null {
@@ -328,6 +285,7 @@ async function upsertNegotiatedRate(args: {
 export async function recordSearchLearning(input: LearningInput) {
   const message = normalizeText(input.message);
   if (!message) return { learned: false, ai: null as LearningResult | null };
+  const persistToDatabase = input.persistToDatabase !== false;
 
   const rows = input.rows.slice(0, 5).map((row) => ({
     providerName: normalizeText(row.provider_name),
@@ -421,7 +379,7 @@ export async function recordSearchLearning(input: LearningInput) {
     serviceQuery ||
     message;
 
-  if (cptCode) {
+  if (persistToDatabase && cptCode) {
     serviceId = await upsertServiceRow({
       code: cptCode,
       codeType,
@@ -434,7 +392,7 @@ export async function recordSearchLearning(input: LearningInput) {
 
   if (cptCode && shouldLearn) {
     const aliasText = normalizedServiceName || serviceQuery || message;
-    if (aliasText && serviceId) {
+    if (aliasText && (serviceId || !persistToDatabase)) {
       await query(
         `
           INSERT INTO service_search_aliases (
@@ -516,7 +474,8 @@ export async function recordSearchLearning(input: LearningInput) {
     );
   }
 
-  for (const row of rows) {
+  if (persistToDatabase) {
+    for (const row of rows) {
     if (!row.providerName) continue;
     const hospitalId = await upsertHospitalRow({
       name: row.providerName,
@@ -541,6 +500,7 @@ export async function recordSearchLearning(input: LearningInput) {
         notes: ai?.rationale || null,
       });
     }
+  }
   }
 
   return {

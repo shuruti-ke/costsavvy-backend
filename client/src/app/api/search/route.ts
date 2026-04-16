@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { query } from "@/lib/postgres";
 import { parseZipRange } from "@/lib/search-utils";
 import { ensureSearchLearningSchema, recordSearchLearning } from "@/lib/search-learning";
+import { searchWebPricing, type WebPriceCandidate } from "@/lib/web-pricing-search";
 
 export const runtime = "nodejs";
 
@@ -29,6 +30,69 @@ const HEALTHCARE_LABEL = `
   )
 `;
 
+async function lookupHospital(name: string) {
+  if (!name) return null;
+  const result = await query<{
+    name: string;
+    address: string | null;
+    state: string | null;
+    zipcode: string | null;
+    latitude: number | null;
+    longitude: number | null;
+  }>(
+    `
+      SELECT name, address, state, zipcode, latitude, longitude
+      FROM hospitals
+      WHERE LOWER(name) = LOWER($1)
+      LIMIT 1
+    `,
+    [name]
+  );
+  return result.rows[0] || null;
+}
+
+async function buildWebRows(
+  candidates: WebPriceCandidate[],
+  searchCare: string,
+  zipCode: string,
+  cptCode: string
+) {
+  const rows = await Promise.all(
+    candidates.map(async (candidate, index) => {
+      const hospital = await lookupHospital(candidate.hospitalName);
+      return {
+        _id: `web-${index}`,
+        billing_code_name: cptCode ? `CPT code ${cptCode}` : searchCare,
+        billing_code_type: cptCode ? "CPT" : "",
+        reporting_entity_name_in_network_files: candidate.websiteUrl
+          ? (() => {
+              try {
+                return new URL(candidate.websiteUrl).hostname.replace(/^www\./, "");
+              } catch {
+                return candidate.hospitalName;
+              }
+            })()
+          : candidate.hospitalName,
+        provider_zip_code: candidate.zipcode || hospital?.zipcode || zipCode,
+        provider_name: candidate.hospitalName,
+        provider_address: candidate.address || hospital?.address || null,
+        provider_city: candidate.city || "",
+        provider_state: candidate.state || hospital?.state || "",
+        negotiated_rate: candidate.price,
+        "Description of Service": candidate.sourceSnippet || candidate.sourceTitle || searchCare,
+        price_source: "web_search",
+        web_price: candidate.price,
+        insurance_match: candidate.insuranceMatch,
+        website_url: candidate.websiteUrl,
+        latitude: hospital?.latitude ?? null,
+        longitude: hospital?.longitude ?? null,
+      };
+    })
+  );
+
+  return rows;
+}
+
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const searchCare = searchParams.get("searchCare")?.trim() || "";
@@ -38,6 +102,39 @@ export async function GET(request: Request) {
   const limit = Math.max(parseInt(searchParams.get("limit") || "10", 10), 1);
 
   await ensureSearchLearningSchema();
+
+  const cptCode = searchParams.get("cptCode")?.trim() || "";
+  const webSearch = await searchWebPricing({
+    serviceQuery: searchCare,
+    cptCode,
+    zip: zipCode,
+    insurance,
+  });
+
+  if (webSearch.results.length > 0) {
+    const webRows = await buildWebRows(webSearch.results, searchCare, zipCode, cptCode);
+    await recordSearchLearning({
+      source: "search",
+      message: [searchCare, zipCode, insurance, "web"].filter(Boolean).join(" | "),
+      serviceQuery: searchCare,
+      cptCode,
+      zip: zipCode,
+      insurance,
+      rows: webRows,
+      persistToDatabase: false,
+    });
+
+    return NextResponse.json({
+      success: true,
+      data: webRows.slice((page - 1) * limit, (page - 1) * limit + limit),
+      pagination: {
+        total: webRows.length,
+        page,
+        limit,
+        source: "web",
+      },
+    });
+  }
 
   const buildQuery = (relaxed: boolean) => {
     const clauses: string[] = [];

@@ -9,6 +9,7 @@ import {
 } from "@/lib/search-utils";
 import { geocodeZip } from "@/lib/geocode";
 import { ensureSearchLearningSchema, recordSearchLearning } from "@/lib/search-learning";
+import { searchWebPricing, type WebPriceCandidate } from "@/lib/web-pricing-search";
 
 export const runtime = "nodejs";
 
@@ -67,6 +68,61 @@ async function geocodeProviderZip(zip: unknown) {
   if (!value) return null;
   const coords = await geocodeZip(value);
   return coords ? { latitude: coords.latitude, longitude: coords.longitude } : null;
+}
+
+async function lookupHospital(name: string) {
+  if (!name) return null;
+  const result = await query<{
+    name: string;
+    address: string | null;
+    state: string | null;
+    zipcode: string | null;
+    latitude: number | null;
+    longitude: number | null;
+  }>(
+    `
+      SELECT name, address, state, zipcode, latitude, longitude
+      FROM hospitals
+      WHERE LOWER(name) = LOWER($1)
+      LIMIT 1
+    `,
+    [name]
+  );
+  return result.rows[0] || null;
+}
+
+async function buildWebFacilities(candidates: WebPriceCandidate[], nextState: SessionState) {
+  const userCoords =
+    (await geocodeZip(nextState.zip)) || { latitude: 39.8283, longitude: -98.5795 };
+
+  return Promise.all(
+    candidates.map(async (candidate, index) => {
+      const hospital = await lookupHospital(candidate.hospitalName);
+      const providerZip = candidate.zipcode || hospital?.zipcode || nextState.zip;
+      const providerCoords = providerZip ? await geocodeProviderZip(providerZip) : null;
+      const name = candidate.hospitalName;
+      return {
+        list_index: index + 1,
+        facility_key: `web-${index}-${name}`,
+        name,
+        latitude: providerCoords?.latitude ?? hospital?.latitude ?? userCoords.latitude,
+        longitude: providerCoords?.longitude ?? hospital?.longitude ?? userCoords.longitude,
+        address: candidate.address || hospital?.address || "",
+        price: candidate.price,
+        estimated_range: null,
+        website_url: candidate.websiteUrl,
+        distance_miles: providerCoords
+          ? Number(haversineMiles(userCoords, providerCoords).toFixed(1))
+          : null,
+        phone: null,
+        web_price: candidate.price,
+        price_is_estimate: false,
+        price_source: "web_search",
+        hospital_name: name,
+        insurance_match: candidate.insuranceMatch,
+      };
+    })
+  );
 }
 
 const HEALTHCARE_FROM = `
@@ -225,6 +281,115 @@ export async function POST(request: Request) {
     });
   }
 
+  const webSearch = await searchWebPricing({
+    serviceQuery: nextState.serviceQuery,
+    cptCode: nextState.cptCode,
+    zip: nextState.zip,
+    insurance: nextState.insurance,
+  });
+
+  if (webSearch.results.length > 0) {
+    const facilities = await buildWebFacilities(webSearch.results, nextState);
+    const insuranceMatches = facilities.filter((f) => f.insurance_match).length;
+    const searchLabel = nextState.cptCode ? `CPT code ${nextState.cptCode}` : nextState.serviceQuery;
+    const text =
+      nextState.insurance && insuranceMatches > 0
+        ? `Found ${facilities.length} web-sourced price option${facilities.length === 1 ? "" : "s"} for ${searchLabel}. ${insuranceMatches} result${insuranceMatches === 1 ? "" : "s"} appear to match ${nextState.insurance}.`
+        : nextState.insurance
+          ? `Found ${facilities.length} web-sourced price option${facilities.length === 1 ? "" : "s"} for ${searchLabel}. I didn't find a clear ${nextState.insurance} match, so I'm showing the web search results that list a price.`
+          : `Found ${facilities.length} web-sourced price option${facilities.length === 1 ? "" : "s"} for ${searchLabel}.`;
+
+    await recordSearchLearning({
+      source: "chat",
+      message: `${message} | web`,
+      cptCode: nextState.cptCode,
+      serviceQuery: nextState.serviceQuery,
+      zip: nextState.zip,
+      insurance: nextState.insurance,
+      rows: webSearch.results.map((candidate) => ({
+        provider_name: candidate.hospitalName,
+        provider_address: candidate.address || "",
+        provider_city: candidate.city || "",
+        provider_state: candidate.state || "",
+        provider_zip_code: candidate.zipcode || nextState.zip,
+        billing_code_name: searchLabel,
+        billing_code_type: nextState.cptCode ? "CPT" : "",
+        reporting_entity_name_in_network_files: candidate.websiteUrl
+          ? (() => {
+              try {
+                return new URL(candidate.websiteUrl).hostname.replace(/^www\./, "");
+              } catch {
+                return candidate.hospitalName;
+              }
+            })()
+          : candidate.hospitalName,
+        negotiated_rate: candidate.price ?? null,
+        "Description of Service": candidate.sourceSnippet || candidate.sourceTitle || searchLabel,
+      })),
+      persistToDatabase: false,
+    });
+
+    const userCoords = (await geocodeZip(nextState.zip)) || { latitude: 39.8283, longitude: -98.5795 };
+    const mapData = {
+      center: userCoords,
+      user_location: {
+        ...userCoords,
+        zipcode: nextState.zip,
+      },
+      facilities: facilities.slice(0, 5).map((facility) => ({
+        list_index: facility.list_index,
+        facility_key: facility.facility_key,
+        name: facility.name,
+        latitude: facility.latitude,
+        longitude: facility.longitude,
+        address: facility.address,
+        price: facility.price,
+        estimated_range: facility.estimated_range,
+        website_url: facility.website_url,
+        insurance_match: facility.insurance_match,
+      })),
+      google_maps_url: `https://www.google.com/maps/search/${encodeURIComponent(nextState.zip)}`,
+      procedure_code: nextState.cptCode || undefined,
+      procedure_display_name: nextState.serviceQuery,
+      procedure_explanation:
+        webSearch.results[0]?.sourceSnippet || webSearch.results[0]?.sourceTitle || undefined,
+      service_query: nextState.serviceQuery,
+      ai_powered: true,
+      web_sourced: true,
+    };
+
+    const transcript = [
+      `data: ${JSON.stringify({ type: "session", session_id: sessionId })}`,
+      `data: ${JSON.stringify({ type: "delta", text })}`,
+      `data: ${JSON.stringify({
+        type: "results",
+        map_data: mapData,
+        facilities,
+        state: {
+          code: nextState.cptCode || undefined,
+          procedure_display_name: nextState.serviceQuery,
+          procedure_explanation:
+            webSearch.results[0]?.sourceSnippet || webSearch.results[0]?.sourceTitle || undefined,
+          service_query: nextState.serviceQuery,
+          zip: nextState.zip,
+          insurance: nextState.insurance || undefined,
+          ai_powered: true,
+          web_sourced: true,
+        },
+      })}`,
+      `data: ${JSON.stringify({ type: "final", text })}`,
+      "",
+    ].join("\n");
+
+    return new NextResponse(transcript, {
+      headers: {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+      },
+    });
+  }
+
   let searchResult = await runSearch(nextState, false);
   let usedFallback = false;
   let docs = searchResult.docs;
@@ -313,7 +478,11 @@ export async function POST(request: Request) {
     google_maps_url: `https://www.google.com/maps/search/${encodeURIComponent(nextState.zip)}`,
     procedure_code: nextState.cptCode || undefined,
     procedure_display_name: nextState.serviceQuery,
+    procedure_explanation:
+      String(docs.rows[0]?.["Description of Service"] || docs.rows[0]?.billing_code_name || "").trim() ||
+      undefined,
     service_query: nextState.serviceQuery,
+    ai_powered: true,
   };
 
   const transcript = [
@@ -326,9 +495,13 @@ export async function POST(request: Request) {
       state: {
         code: nextState.cptCode || undefined,
         procedure_display_name: nextState.serviceQuery,
+        procedure_explanation:
+          String(docs.rows[0]?.["Description of Service"] || docs.rows[0]?.billing_code_name || "").trim() ||
+          undefined,
         service_query: nextState.serviceQuery,
         zip: nextState.zip,
         insurance: nextState.insurance || undefined,
+        ai_powered: true,
       },
     })}`,
     `data: ${JSON.stringify({ type: "final", text })}`,
