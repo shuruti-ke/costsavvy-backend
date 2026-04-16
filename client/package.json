@@ -22,6 +22,7 @@
     "@sanity/image-url": "^1.1.0",
     "@sanity/vision": "^3.85.1",
     "@tanstack/react-virtual": "^3.13.6",
+    "ai": "^6.0.164",
     "bcryptjs": "^3.0.2",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { query } from "@/lib/postgres";
 import { parseZipRange } from "@/lib/search-utils";
+import { ensureSearchLearningSchema, recordSearchLearning } from "@/lib/search-learning";
 
 export const runtime = "nodejs";
 
@@ -12,6 +13,10 @@ const HEALTHCARE_FROM = `
   FROM negotiated_rates nr
   JOIN services s ON s.id = nr.service_id
   JOIN hospitals h ON h.id = nr.hospital_id
+  LEFT JOIN service_search_aliases sa
+    ON sa.code_type = s.code_type AND sa.code = s.code
+  LEFT JOIN hospital_search_aliases ha
+    ON ha.hospital_name = h.name
   LEFT JOIN insurance_plans ip ON ip.id = nr.plan_id
   LEFT JOIN zip_locations z ON z.zipcode = h.zipcode
 `;
@@ -32,34 +37,44 @@ export async function GET(request: Request) {
   const page = Math.max(parseInt(searchParams.get("page") || "1", 10), 1);
   const limit = Math.max(parseInt(searchParams.get("limit") || "10", 10), 1);
 
-  const clauses: string[] = [];
-  const params: unknown[] = [];
-  if (searchCare) {
-    params.push(`%${escapeLike(searchCare)}%`);
-    clauses.push(`
-      (
-        ${HEALTHCARE_LABEL} ILIKE $${params.length} ESCAPE '\\'
-        OR COALESCE(s.cpt_explanation, '') ILIKE $${params.length} ESCAPE '\\'
-        OR COALESCE(s.patient_summary, '') ILIKE $${params.length} ESCAPE '\\'
-        OR COALESCE(s.code, '') ILIKE $${params.length} ESCAPE '\\'
-      )
-    `);
-  }
-  if (zipCode) {
-    const range = parseZipRange(zipCode);
-    if (range) {
-      params.push(range.lower, range.upper);
-      clauses.push(`CAST(h.zipcode AS INT) BETWEEN $${params.length - 1} AND $${params.length}`);
+  await ensureSearchLearningSchema();
+
+  const buildQuery = (relaxed: boolean) => {
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (!relaxed && searchCare) {
+      params.push(`%${escapeLike(searchCare)}%`);
+      clauses.push(`
+        (
+          ${HEALTHCARE_LABEL} ILIKE $${params.length} ESCAPE '\\'
+          OR COALESCE(s.cpt_explanation, '') ILIKE $${params.length} ESCAPE '\\'
+          OR COALESCE(s.patient_summary, '') ILIKE $${params.length} ESCAPE '\\'
+          OR COALESCE(s.code, '') ILIKE $${params.length} ESCAPE '\\'
+          OR COALESCE(sa.alias_text, '') ILIKE $${params.length} ESCAPE '\\'
+          OR COALESCE(ha.alias_text, '') ILIKE $${params.length} ESCAPE '\\'
+          OR COALESCE(h.name, '') ILIKE $${params.length} ESCAPE '\\'
+        )
+      `);
     }
-  }
-  if (insurance) {
-    params.push(`%${escapeLike(insurance)}%`);
-    clauses.push(`COALESCE(ip.payer_name, ip.plan_name, '') ILIKE $${params.length} ESCAPE '\\'`);
-  }
+    if (zipCode) {
+      const range = parseZipRange(zipCode);
+      if (range) {
+        params.push(range.lower, range.upper);
+        clauses.push(`CAST(h.zipcode AS INT) BETWEEN $${params.length - 1} AND $${params.length}`);
+      }
+    }
+    if (insurance) {
+      params.push(`%${escapeLike(insurance)}%`);
+      clauses.push(`COALESCE(ip.payer_name, ip.plan_name, '') ILIKE $${params.length} ESCAPE '\\'`);
+    }
+
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    return { params, where };
+  };
 
   const skip = (page - 1) * limit;
-  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-  const totalResult = await query<{ total: string }>(
+  let { params, where } = buildQuery(false);
+  let totalResult = await query<{ total: string }>(
     `
       SELECT COUNT(*)::text AS total
       FROM (
@@ -70,7 +85,7 @@ export async function GET(request: Request) {
     `,
     params
   );
-  const dataResult = await query(
+  let dataResult = await query(
     `
       WITH ranked AS (
         SELECT
@@ -100,6 +115,62 @@ export async function GET(request: Request) {
     `,
     [...params, limit, skip]
   );
+
+  if (dataResult.rows.length === 0 && searchCare && zipCode) {
+    const fallback = buildQuery(true);
+    params = fallback.params;
+    where = fallback.where;
+    totalResult = await query<{ total: string }>(
+      `
+        SELECT COUNT(*)::text AS total
+        FROM (
+          SELECT DISTINCT h.id, s.id
+          ${HEALTHCARE_FROM}
+          ${where}
+        ) deduped
+      `,
+      params
+    );
+    dataResult = await query(
+      `
+        WITH ranked AS (
+          SELECT
+            nr.id::text AS _id,
+            ${HEALTHCARE_LABEL} AS billing_code_name,
+            COALESCE(s.code_type, '') AS billing_code_type,
+            COALESCE(ip.payer_name, ip.plan_name, '') AS reporting_entity_name_in_network_files,
+            h.zipcode AS provider_zip_code,
+            h.name AS provider_name,
+            h.address AS provider_address,
+            COALESCE(z.city, '') AS provider_city,
+            COALESCE(z.state, h.state, '') AS provider_state,
+            COALESCE(nr.standard_charge_cash, nr.estimated_amount, nr.standard_charge_min) AS negotiated_rate,
+            COALESCE(s.cpt_explanation, s.patient_summary, '') AS "Description of Service",
+            ROW_NUMBER() OVER (
+              PARTITION BY h.id, s.id
+              ORDER BY COALESCE(nr.standard_charge_cash, nr.estimated_amount, nr.standard_charge_min) ASC NULLS LAST, nr.last_updated DESC NULLS LAST, nr.id ASC
+            ) AS rn
+          ${HEALTHCARE_FROM}
+          ${where}
+        )
+        SELECT *
+        FROM ranked
+        WHERE rn = 1
+        ORDER BY billing_code_name NULLS LAST, provider_name NULLS LAST
+        LIMIT $${params.length + 1} OFFSET $${params.length + 2}
+      `,
+      [...params, limit, skip]
+    );
+  }
+
+  await recordSearchLearning({
+    source: "search",
+    message: [searchCare, zipCode, insurance].filter(Boolean).join(" | "),
+    serviceQuery: searchCare,
+    zip: zipCode,
+    insurance,
+    rows: dataResult.rows,
+  });
 
   return NextResponse.json({
     success: true,

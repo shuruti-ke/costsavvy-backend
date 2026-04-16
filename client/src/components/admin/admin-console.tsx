@@ -7,10 +7,12 @@ import {
   ArrowUpRight,
   Database,
   FileText,
+  CheckCircle2,
   Hospital,
   LogOut,
   MessageSquare,
   ShieldCheck,
+  XCircle,
   Users,
 } from "lucide-react";
 
@@ -18,8 +20,17 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import SignInForm from "@/components/auth/sign-in-form";
 import { useAuth } from "@/context/AuthContext";
-import { getAllUsers } from "@/api/auth/api";
+import {
+  approveSearchLearningReview,
+  getAllUsers,
+  getSearchLearningAliases,
+  getSearchLearningReviews,
+  rejectSearchLearningReview,
+  type SearchLearningAlias,
+  type SearchLearningReview,
+} from "@/api/auth/api";
 import type { User } from "@/types/context/auth-user";
+import { toast } from "sonner";
 
 const SANITY_STUDIO_URL = "https://cost-savy.sanity.studio/structure";
 
@@ -28,21 +39,34 @@ function StatCard({
   value,
   description,
   icon,
+  tone = "default",
 }: {
   title: string;
   value: string;
   description: string;
   icon: React.ReactNode;
+  tone?: "default" | "violet" | "sky" | "emerald";
 }) {
+  const toneClasses =
+    tone === "violet"
+      ? "bg-[linear-gradient(135deg,rgba(200,89,144,0.18),rgba(255,255,255,0.02))]"
+      : tone === "sky"
+        ? "bg-[linear-gradient(135deg,rgba(88,160,255,0.18),rgba(255,255,255,0.02))]"
+        : tone === "emerald"
+          ? "bg-[linear-gradient(135deg,rgba(16,185,129,0.18),rgba(255,255,255,0.02))]"
+          : "bg-[linear-gradient(135deg,rgba(255,255,255,0.08),rgba(255,255,255,0.02))]";
+
   return (
-    <Card className="border-white/10 bg-white/5 text-white shadow-xl shadow-black/20">
+    <Card className={`overflow-hidden border-white/10 bg-white/5 text-white shadow-2xl shadow-black/20 ${toneClasses}`}>
       <CardContent className="flex items-start justify-between gap-4 p-5">
-        <div>
-          <p className="text-xs uppercase tracking-[0.24em] text-white/60">{title}</p>
-          <p className="mt-3 text-3xl font-semibold">{value}</p>
-          <p className="mt-2 text-sm text-white/70">{description}</p>
+        <div className="space-y-3">
+          <div className="inline-flex rounded-full border border-white/10 bg-black/20 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.22em] text-white/70">
+            {title}
+          </div>
+          <div className="text-3xl font-semibold tracking-tight">{value}</div>
+          <p className="max-w-sm text-sm leading-6 text-white/70">{description}</p>
         </div>
-        <div className="rounded-full border border-white/10 bg-white/10 p-3 text-white">
+        <div className="rounded-2xl border border-white/10 bg-black/20 p-3 text-white shadow-lg shadow-black/20">
           {icon}
         </div>
       </CardContent>
@@ -56,30 +80,44 @@ function ActionCard({
   href,
   icon,
   external = false,
+  badge,
+  tone = "default",
 }: {
   title: string;
   description: string;
   href: string;
   icon: React.ReactNode;
   external?: boolean;
+  badge: string;
+  tone?: "default" | "violet" | "sky";
 }) {
+  const toneClasses =
+    tone === "violet"
+      ? "bg-[linear-gradient(135deg,rgba(200,89,144,0.2),rgba(255,255,255,0.02))]"
+      : tone === "sky"
+        ? "bg-[linear-gradient(135deg,rgba(88,160,255,0.18),rgba(255,255,255,0.02))]"
+        : "bg-[linear-gradient(135deg,rgba(255,255,255,0.08),rgba(255,255,255,0.02))]";
+
   return (
-    <Card className="border-white/10 bg-white/5 text-white shadow-xl shadow-black/20">
-      <CardContent className="p-5">
+    <Card className={`overflow-hidden border-white/10 bg-white/5 text-white shadow-2xl shadow-black/20 ${toneClasses}`}>
+      <CardContent className="space-y-4 p-5">
         <div className="flex items-start justify-between gap-4">
           <div className="space-y-3">
-            <div className="inline-flex rounded-full border border-white/10 bg-white/10 p-2 text-white">
+            <div className="inline-flex rounded-2xl border border-white/10 bg-black/20 p-3 text-white">
               {icon}
             </div>
-            <div>
+            <div className="space-y-2">
+              <div className="inline-flex rounded-full border border-white/10 bg-white/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.22em] text-white/70">
+                {badge}
+              </div>
               <p className="text-lg font-semibold">{title}</p>
-              <p className="mt-1 max-w-sm text-sm text-white/70">{description}</p>
+              <p className="max-w-sm text-sm leading-6 text-white/70">{description}</p>
             </div>
           </div>
           <Button
             asChild
             variant="outline"
-            className="shrink-0 border-white/15 bg-white/10 text-white hover:bg-white/15"
+            className="shrink-0 rounded-full border-white/15 bg-white/10 text-white hover:bg-white/15"
           >
             {external ? (
               <a href={href} target="_blank" rel="noreferrer">
@@ -93,6 +131,15 @@ function ActionCard({
               </Link>
             )}
           </Button>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 border-t border-white/10 pt-4 text-xs text-white/60">
+          <span className="inline-flex rounded-full border border-white/10 bg-white/5 px-3 py-1">
+            {badge}
+          </span>
+          <span className="inline-flex rounded-full border border-white/10 bg-white/5 px-3 py-1">
+            {external ? "External" : "Internal"}
+          </span>
         </div>
       </CardContent>
     </Card>
@@ -120,6 +167,10 @@ export default function AdminConsole() {
   const [users, setUsers] = useState<User[]>([]);
   const [loadingUsers, setLoadingUsers] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [learningReviews, setLearningReviews] = useState<SearchLearningReview[]>([]);
+  const [learningAliases, setLearningAliases] = useState<SearchLearningAlias[]>([]);
+  const [loadingLearning, setLoadingLearning] = useState(false);
+  const [learningError, setLearningError] = useState<string | null>(null);
 
   const isAdmin = user?.role === "admin";
   const isCheckingSession = isLoading;
@@ -150,6 +201,36 @@ export default function AdminConsole() {
     loadUsers();
   }, [isAdmin]);
 
+  useEffect(() => {
+    const loadLearningQueue = async () => {
+      if (!isAdmin) return;
+
+      const token = localStorage.getItem("token");
+      if (!token) {
+        setLearningError("Admin session missing. Please sign in again.");
+        return;
+      }
+
+      setLoadingLearning(true);
+      setLearningError(null);
+
+      try {
+        const [reviewsResponse, aliasesResponse] = await Promise.all([
+          getSearchLearningReviews(token, "pending", 12),
+          getSearchLearningAliases(token, 20),
+        ]);
+        setLearningReviews(reviewsResponse.data);
+        setLearningAliases(aliasesResponse.data);
+      } catch (err) {
+        setLearningError(err instanceof Error ? err.message : "Failed to load learning queue.");
+      } finally {
+        setLoadingLearning(false);
+      }
+    };
+
+    loadLearningQueue();
+  }, [isAdmin]);
+
   const summary = useMemo(
     () => ({
       users: users.length,
@@ -159,9 +240,65 @@ export default function AdminConsole() {
     [users]
   );
 
+  const learningSummary = useMemo(
+    () => ({
+      pendingReviews: learningReviews.length,
+      learnedAliases: learningAliases.length,
+      avgConfidence:
+        learningReviews.length > 0
+          ? Math.round(
+              (learningReviews.reduce((total, review) => total + review.confidence, 0) /
+                learningReviews.length) *
+                100
+            )
+          : 0,
+    }),
+    [learningAliases.length, learningReviews]
+  );
+
   const handleLogout = async () => {
     await logout();
     router.push("/");
+  };
+
+  const refreshLearningQueue = async () => {
+    const token = localStorage.getItem("token");
+    if (!token) return;
+
+    const [reviewsResponse, aliasesResponse] = await Promise.all([
+      getSearchLearningReviews(token, "pending", 12),
+      getSearchLearningAliases(token, 20),
+    ]);
+    setLearningReviews(reviewsResponse.data);
+    setLearningAliases(aliasesResponse.data);
+  };
+
+  const handleReviewAction = async (reviewId: number, action: "approve" | "reject") => {
+    const token = localStorage.getItem("token");
+    if (!token) {
+      setLearningError("Admin session missing. Please sign in again.");
+      return;
+    }
+
+    setLoadingLearning(true);
+    setLearningError(null);
+
+    try {
+      if (action === "approve") {
+        await approveSearchLearningReview(token, reviewId);
+        toast.success("Review approved and saved to the learning queue");
+      } else {
+        await rejectSearchLearningReview(token, reviewId);
+        toast.success("Review rejected");
+      }
+      await refreshLearningQueue();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unable to update learning review.";
+      setLearningError(message);
+      toast.error(message);
+    } finally {
+      setLoadingLearning(false);
+    }
   };
 
   if (isCheckingSession) {
@@ -215,8 +352,8 @@ export default function AdminConsole() {
               />
             </div>
 
-            <Card className="border-white/10 bg-white/5 text-white shadow-2xl shadow-black/20">
-              <CardContent className="p-6">
+          <Card className="border-white/10 bg-white/5 text-white shadow-2xl shadow-black/20">
+            <CardContent className="p-6">
                 <div className="flex flex-wrap items-center gap-3 text-sm text-white/70">
                   <ShieldCheck className="h-5 w-5 text-[#FFD6E9]" />
                   <span>
@@ -318,24 +455,28 @@ export default function AdminConsole() {
             value={loadingUsers ? "..." : String(summary.users)}
             description="Registered accounts in the platform."
             icon={<Users className="h-5 w-5" />}
+            tone="violet"
           />
           <StatCard
             title="Admins"
             value={loadingUsers ? "..." : String(summary.admins)}
             description="Accounts with elevated access."
             icon={<ShieldCheck className="h-5 w-5" />}
+            tone="emerald"
           />
           <StatCard
             title="Content"
             value="Sanity"
             description="Edit homepage, blog, and page content."
             icon={<FileText className="h-5 w-5" />}
+            tone="sky"
           />
           <StatCard
             title="Data"
             value="Postgres"
             description="Healthcare search and rate tables live here."
             icon={<Database className="h-5 w-5" />}
+            tone="default"
           />
         </div>
 
@@ -423,12 +564,16 @@ export default function AdminConsole() {
               href={SANITY_STUDIO_URL}
               icon={<FileText className="h-5 w-5" />}
               external
+              badge="Sanity studio"
+              tone="violet"
             />
             <ActionCard
               title="CPT and hospital data"
               description="Review the public search and pricing flows that read from the Postgres-backed healthcare tables."
               href="/quote"
               icon={<Hospital className="h-5 w-5" />}
+              badge="Data tools"
+              tone="sky"
             />
             <ActionCard
               title="Correspondence"
@@ -436,8 +581,250 @@ export default function AdminConsole() {
               href="mailto:Chat@costsavvy.health"
               icon={<MessageSquare className="h-5 w-5" />}
               external
+              badge="Inbox"
+              tone="default"
             />
           </div>
+        </div>
+
+        <div className="grid gap-6 xl:grid-cols-2">
+          <Card id="learning-queue" className="overflow-hidden border-white/10 bg-white/5 text-white shadow-2xl shadow-black/20">
+            <div className="border-b border-white/10 bg-[linear-gradient(135deg,rgba(200,89,144,0.2),rgba(255,255,255,0.02))] px-6 py-5">
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <div className="space-y-2">
+                  <div className="inline-flex items-center rounded-full border border-white/10 bg-white/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.24em] text-white/70">
+                    Learning queue
+                  </div>
+                  <CardTitle className="text-2xl">Review suggestions before they become live aliases</CardTitle>
+                  <CardDescription className="max-w-2xl text-white/70">
+                    Low-confidence search learnings are routed here so you can approve only the good matches and keep the data set clean.
+                  </CardDescription>
+                </div>
+                <div className="grid grid-cols-3 gap-2 text-center">
+                  <div className="rounded-2xl border border-white/10 bg-black/20 px-4 py-3">
+                    <div className="text-xs uppercase tracking-[0.18em] text-white/50">Pending</div>
+                    <div className="mt-1 text-2xl font-semibold">{learningSummary.pendingReviews}</div>
+                  </div>
+                  <div className="rounded-2xl border border-white/10 bg-black/20 px-4 py-3">
+                    <div className="text-xs uppercase tracking-[0.18em] text-white/50">Aliases</div>
+                    <div className="mt-1 text-2xl font-semibold">{learningSummary.learnedAliases}</div>
+                  </div>
+                  <div className="rounded-2xl border border-white/10 bg-black/20 px-4 py-3">
+                    <div className="text-xs uppercase tracking-[0.18em] text-white/50">Avg</div>
+                    <div className="mt-1 text-2xl font-semibold">{learningSummary.avgConfidence}%</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <CardContent className="space-y-4 p-6">
+              {learningError && (
+                <div className="rounded-2xl border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
+                  {learningError}
+                </div>
+              )}
+
+              {loadingLearning ? (
+                <div className="rounded-2xl border border-white/10 bg-white/5 p-6 text-sm text-white/70">
+                  Loading learning queue...
+                </div>
+              ) : learningReviews.length === 0 ? (
+                <div className="rounded-3xl border border-dashed border-white/15 bg-white/5 px-5 py-8 text-sm text-white/70">
+                  <div className="flex items-center gap-3">
+                    <div className="rounded-full border border-white/10 bg-white/10 p-2">
+                      <CheckCircle2 className="h-4 w-4 text-emerald-300" />
+                    </div>
+                    <div>
+                      <p className="font-medium text-white">Nothing waiting for review</p>
+                      <p className="mt-1 text-white/60">
+                        Low-confidence suggestions will appear here when the learning model is unsure.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  {learningReviews.map((review) => {
+                    const suggestion =
+                      review.suggestedAlias ||
+                      review.suggestedHospitalName ||
+                      "Needs review";
+                    const confidence = Math.round(review.confidence * 100);
+                    const confidenceTone =
+                      confidence >= 80
+                        ? "bg-emerald-500/15 text-emerald-200 border-emerald-400/20"
+                        : confidence >= 60
+                          ? "bg-amber-500/15 text-amber-200 border-amber-400/20"
+                          : "bg-rose-500/15 text-rose-200 border-rose-400/20";
+
+                    return (
+                      <div
+                        key={review.id}
+                        className="rounded-3xl border border-white/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.06),rgba(255,255,255,0.02))] p-5 shadow-lg shadow-black/20"
+                      >
+                        <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+                          <div className="space-y-4">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="inline-flex rounded-full border border-white/10 bg-white/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-white/70">
+                                {review.source}
+                              </span>
+                              <span className={`inline-flex rounded-full border px-3 py-1 text-xs font-semibold ${confidenceTone}`}>
+                                {confidence}% confidence
+                              </span>
+                              <span className="inline-flex rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-medium text-white/70">
+                                {review.resultCount} result{review.resultCount === 1 ? "" : "s"}
+                              </span>
+                            </div>
+
+                            <div>
+                              <p className="text-base font-semibold leading-6 text-white">
+                                {review.queryText}
+                              </p>
+                              <p className="mt-2 text-sm leading-6 text-white/60">
+                                {review.rationale || "No rationale provided by the model."}
+                              </p>
+                            </div>
+
+                            <div className="flex flex-wrap gap-2 text-xs">
+                              {review.cptCode && (
+                                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-white/75">
+                                  CPT {review.cptCode}
+                                </span>
+                              )}
+                              {review.zipCode && (
+                                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-white/75">
+                                  ZIP {review.zipCode}
+                                </span>
+                              )}
+                              {review.insurer && (
+                                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-white/75">
+                                  {review.insurer}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="min-w-[20rem] space-y-3 rounded-3xl border border-white/10 bg-black/20 p-4">
+                            <div className="text-xs uppercase tracking-[0.2em] text-white/50">Suggested learning</div>
+                            <div className="space-y-2">
+                              <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
+                                <div className="text-[11px] uppercase tracking-[0.18em] text-white/50">
+                                  Alias
+                                </div>
+                                <div className="mt-1 text-sm font-medium text-white">
+                                  {review.suggestedAlias || "Not provided"}
+                                </div>
+                              </div>
+                              <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
+                                <div className="text-[11px] uppercase tracking-[0.18em] text-white/50">
+                                  Hospital
+                                </div>
+                                <div className="mt-1 text-sm font-medium text-white">
+                                  {review.suggestedHospitalName || review.hospitalName || "Not provided"}
+                                </div>
+                              </div>
+                            </div>
+
+                            <div className="flex flex-wrap gap-2 pt-1">
+                              <Button
+                                type="button"
+                                size="sm"
+                                className="rounded-full bg-emerald-500/90 px-4 text-white hover:bg-emerald-500"
+                                onClick={() => handleReviewAction(review.id, "approve")}
+                              >
+                                <CheckCircle2 className="h-4 w-4" />
+                                Approve
+                              </Button>
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                className="rounded-full border-white/15 bg-white/10 px-4 text-white hover:bg-white/15"
+                                onClick={() => handleReviewAction(review.id, "reject")}
+                              >
+                                <XCircle className="h-4 w-4" />
+                                Reject
+                              </Button>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
+          <Card id="learned-aliases" className="overflow-hidden border-white/10 bg-white/5 text-white shadow-2xl shadow-black/20">
+            <div className="border-b border-white/10 bg-[linear-gradient(135deg,rgba(88,160,255,0.18),rgba(255,255,255,0.02))] px-6 py-5">
+              <div className="space-y-2">
+                <div className="inline-flex items-center rounded-full border border-white/10 bg-white/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.24em] text-white/70">
+                  Learned aliases
+                </div>
+                <CardTitle className="text-2xl">Approved matches that now improve search results</CardTitle>
+                <CardDescription className="max-w-2xl text-white/70">
+                  These are the aliases that have been approved and are now available to the live search path.
+                </CardDescription>
+              </div>
+            </div>
+            <CardContent className="space-y-4 p-6">
+              {loadingLearning ? (
+                <div className="rounded-2xl border border-white/10 bg-white/5 p-6 text-sm text-white/70">
+                  Loading learned aliases...
+                </div>
+              ) : learningAliases.length === 0 ? (
+                <div className="rounded-3xl border border-dashed border-white/15 bg-white/5 px-5 py-8 text-sm text-white/70">
+                  <div className="flex items-center gap-3">
+                    <div className="rounded-full border border-white/10 bg-white/10 p-2">
+                      <FileText className="h-4 w-4 text-sky-300" />
+                    </div>
+                    <div>
+                      <p className="font-medium text-white">No aliases approved yet</p>
+                      <p className="mt-1 text-white/60">
+                        Once you approve a review, it will appear here and immediately help future searches.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {learningAliases.map((alias) => {
+                    const target =
+                      alias.aliasType === "service"
+                        ? `${alias.codeType || "CPT"} ${alias.code || ""}`.trim()
+                        : alias.hospitalName || "Hospital";
+                    return (
+                      <div
+                        key={`${alias.aliasType}-${alias.id}`}
+                        className="flex flex-col gap-4 rounded-3xl border border-white/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.06),rgba(255,255,255,0.02))] p-4 md:flex-row md:items-center md:justify-between"
+                      >
+                        <div className="space-y-2">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="inline-flex rounded-full border border-white/10 bg-white/10 px-3 py-1 text-xs font-semibold text-white/80">
+                              {alias.aliasType}
+                            </span>
+                            <span className="inline-flex rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-white/60">
+                              {target}
+                            </span>
+                          </div>
+                          <div className="text-base font-medium text-white">{alias.aliasText}</div>
+                          <div className="text-sm text-white/55">{alias.sourceQuery}</div>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="inline-flex rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-semibold text-white/75">
+                            {(alias.confidence * 100).toFixed(0)}%
+                          </span>
+                          <span className="inline-flex rounded-full border border-emerald-400/20 bg-emerald-500/10 px-3 py-1 text-xs font-semibold text-emerald-200">
+                            Live
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </CardContent>
+          </Card>
         </div>
       </div>
     </div>

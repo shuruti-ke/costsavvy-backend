@@ -8,6 +8,7 @@ import {
   parseZipRange,
 } from "@/lib/search-utils";
 import { geocodeZip } from "@/lib/geocode";
+import { ensureSearchLearningSchema, recordSearchLearning } from "@/lib/search-learning";
 
 export const runtime = "nodejs";
 
@@ -72,6 +73,10 @@ const HEALTHCARE_FROM = `
   FROM negotiated_rates nr
   JOIN services s ON s.id = nr.service_id
   JOIN hospitals h ON h.id = nr.hospital_id
+  LEFT JOIN service_search_aliases sa
+    ON sa.code_type = s.code_type AND sa.code = s.code
+  LEFT JOIN hospital_search_aliases ha
+    ON ha.hospital_name = h.name
   LEFT JOIN insurance_plans ip ON ip.id = nr.plan_id
   LEFT JOIN zip_locations z ON z.zipcode = h.zipcode
 `;
@@ -84,72 +89,37 @@ const HEALTHCARE_LABEL = `
   )
 `;
 
-export async function POST(request: Request) {
-  const body = (await request.json().catch(() => ({}))) as {
-    session_id?: string;
-    message?: string;
-    fresh_context?: boolean;
-  };
-
-  const sessionId = getSessionId(body);
-  const current = body.fresh_context ? null : sessions.get(sessionId) || null;
-  const message = String(body.message || "").trim();
-
-  const serviceQuery = extractServiceQuery(message);
-  const cptCode = extractExplicitCptCode(message) || current?.cptCode || "";
-  const zip = extractZip(message) || current?.zip || "";
-  const insuranceRaw = extractInsurance(message) || current?.insurance || "";
-  const insurance = insuranceRaw === "insurance" ? "" : insuranceRaw;
-
-  const nextState: SessionState = {
-    serviceQuery: serviceQuery || current?.serviceQuery || "",
-    zip,
-    insurance,
-    cptCode,
-  };
-  sessions.set(sessionId, nextState);
-
-  if (!nextState.serviceQuery || !nextState.zip) {
-    const clarification = !nextState.serviceQuery
-      ? "Tell me the procedure or service you want to price."
-      : "Tell me your ZIP code so I can find nearby prices.";
-
-    const transcript = [
-      `data: ${JSON.stringify({ type: "session", session_id: sessionId })}`,
-      `data: ${JSON.stringify({ type: "delta", text: clarification })}`,
-      `data: ${JSON.stringify({ type: "final", text: clarification })}`,
-      "",
-    ].join("\n");
-
-    return new NextResponse(transcript, {
-      headers: {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache, no-transform",
-        Connection: "keep-alive",
-      },
-    });
-  }
-
+async function runSearch(
+  nextState: SessionState,
+  relaxed: boolean
+) {
   const clauses: string[] = [];
   const params: unknown[] = [];
-  const serviceSearch = nextState.cptCode || nextState.serviceQuery;
-  params.push(`%${escapeLike(serviceSearch)}%`);
-  const serviceParam = `$${params.length}`;
-  clauses.push(`
-    (
-      ${HEALTHCARE_LABEL} ILIKE ${serviceParam} ESCAPE '\\'
-      OR COALESCE(s.cpt_explanation, '') ILIKE ${serviceParam} ESCAPE '\\'
-      OR COALESCE(s.patient_summary, '') ILIKE ${serviceParam} ESCAPE '\\'
-      OR COALESCE(s.code, '') ILIKE ${serviceParam} ESCAPE '\\'
-    )
-  `);
-  if (nextState.cptCode) {
-    params.push(nextState.cptCode);
-    const codeParam = `$${params.length}`;
-    clauses.push(`(
-      COALESCE(s.code, '') = ${codeParam}
-      OR COALESCE(s.code, '') ILIKE ${codeParam} ESCAPE '\\'
-    )`);
+
+  if (!relaxed) {
+    const serviceSearch = nextState.cptCode || nextState.serviceQuery;
+    params.push(`%${escapeLike(serviceSearch)}%`);
+    const serviceParam = `$${params.length}`;
+    clauses.push(`
+      (
+        ${HEALTHCARE_LABEL} ILIKE ${serviceParam} ESCAPE '\\'
+        OR COALESCE(s.cpt_explanation, '') ILIKE ${serviceParam} ESCAPE '\\'
+        OR COALESCE(s.patient_summary, '') ILIKE ${serviceParam} ESCAPE '\\'
+        OR COALESCE(s.code, '') ILIKE ${serviceParam} ESCAPE '\\'
+        OR COALESCE(sa.alias_text, '') ILIKE ${serviceParam} ESCAPE '\\'
+        OR COALESCE(ha.alias_text, '') ILIKE ${serviceParam} ESCAPE '\\'
+        OR COALESCE(h.name, '') ILIKE ${serviceParam} ESCAPE '\\'
+      )
+    `);
+
+    if (nextState.cptCode) {
+      params.push(nextState.cptCode);
+      const codeParam = `$${params.length}`;
+      clauses.push(`(
+        COALESCE(s.code, '') = ${codeParam}
+        OR COALESCE(s.code, '') ILIKE ${codeParam} ESCAPE '\\'
+      )`);
+    }
   }
 
   const zipRange = parseZipRange(nextState.zip);
@@ -163,6 +133,7 @@ export async function POST(request: Request) {
     params.push(`%${escapeLike(nextState.insurance)}%`);
     insuranceMatchExpr = `COALESCE(ip.payer_name, ip.plan_name, '') ILIKE $${params.length} ESCAPE '\\'`;
   }
+
   const rowChoiceOrderExpr = `
     CASE WHEN ${insuranceMatchExpr} THEN 0 ELSE 1 END,
     COALESCE(nr.standard_charge_cash, nr.estimated_amount, nr.standard_charge_min) ASC NULLS LAST,
@@ -170,7 +141,7 @@ export async function POST(request: Request) {
     nr.id ASC
   `;
 
-  const where = `WHERE ${clauses.join(" AND ")}`;
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   const docs = await query<Record<string, unknown>>(
     `
       WITH ranked AS (
@@ -203,6 +174,78 @@ export async function POST(request: Request) {
     params
   );
 
+  return { docs, relaxed };
+}
+
+export async function POST(request: Request) {
+  const body = (await request.json().catch(() => ({}))) as {
+    session_id?: string;
+    message?: string;
+    fresh_context?: boolean;
+  };
+
+  const sessionId = getSessionId(body);
+  const current = body.fresh_context ? null : sessions.get(sessionId) || null;
+  const message = String(body.message || "").trim();
+
+  const serviceQuery = extractServiceQuery(message);
+  const cptCode = extractExplicitCptCode(message) || current?.cptCode || "";
+  const zip = extractZip(message) || current?.zip || "";
+  const insuranceRaw = extractInsurance(message) || current?.insurance || "";
+  const insurance = insuranceRaw === "insurance" ? "" : insuranceRaw;
+
+  const nextState: SessionState = {
+    serviceQuery: serviceQuery || current?.serviceQuery || "",
+    zip,
+    insurance,
+    cptCode,
+  };
+  sessions.set(sessionId, nextState);
+
+  await ensureSearchLearningSchema();
+
+  if (!nextState.serviceQuery || !nextState.zip) {
+    const clarification = !nextState.serviceQuery
+      ? "Tell me the procedure or service you want to price."
+      : "Tell me your ZIP code so I can find nearby prices.";
+
+    const transcript = [
+      `data: ${JSON.stringify({ type: "session", session_id: sessionId })}`,
+      `data: ${JSON.stringify({ type: "delta", text: clarification })}`,
+      `data: ${JSON.stringify({ type: "final", text: clarification })}`,
+      "",
+    ].join("\n");
+
+    return new NextResponse(transcript, {
+      headers: {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+      },
+    });
+  }
+
+  let searchResult = await runSearch(nextState, false);
+  let usedFallback = false;
+  let docs = searchResult.docs;
+  if (!docs.rows.length && nextState.zip && (nextState.cptCode || nextState.serviceQuery)) {
+    const fallback = await runSearch(nextState, true);
+    if (fallback.docs.rows.length > 0) {
+      docs = fallback.docs;
+      usedFallback = true;
+    }
+  }
+
+  await recordSearchLearning({
+    source: "chat",
+    message,
+    cptCode: nextState.cptCode,
+    serviceQuery: nextState.serviceQuery,
+    zip: nextState.zip,
+    insurance: nextState.insurance,
+    rows: docs.rows,
+  });
+
   const userCoords = (await geocodeZip(nextState.zip)) || { latitude: 39.8283, longitude: -98.5795 };
   const facilities = [];
 
@@ -233,14 +276,21 @@ export async function POST(request: Request) {
 
   const prices = facilities.map((f) => f.price).filter((p): p is number => p != null);
   const insuranceMatches = facilities.filter((f) => f.insurance_match).length;
+  const hasFacilities = facilities.length > 0;
+  const facilityLabel = facilities.length === 1 ? "facility" : "facilities";
+  const searchLabel = nextState.cptCode ? `CPT code ${nextState.cptCode}` : nextState.serviceQuery;
   const text =
-    prices.length > 0
-      ? nextState.insurance && insuranceMatches > 0
-        ? `Found ${facilities.length} nearby price option${facilities.length === 1 ? "" : "s"} for ${nextState.serviceQuery}. ${insuranceMatches} result${insuranceMatches === 1 ? "" : "s"} appear to match ${nextState.insurance}.`
-        : nextState.insurance
-          ? `Found ${facilities.length} nearby price option${facilities.length === 1 ? "" : "s"} for ${nextState.serviceQuery}. I didn't find a clear ${nextState.insurance} match, so I'm showing the nearby facilities for the procedure.`
-          : `Found ${facilities.length} nearby price option${facilities.length === 1 ? "" : "s"} for ${nextState.serviceQuery}.`
-      : `I found ${facilities.length} possible matches for ${nextState.serviceQuery}, but pricing is estimated or unavailable.`;
+    hasFacilities
+      ? usedFallback
+        ? `I couldn't find a direct match for ${searchLabel}. I'm showing ${facilities.length} nearby ${facilityLabel} near ZIP ${nextState.zip} instead.`
+        : nextState.insurance && insuranceMatches > 0
+          ? `Found ${facilities.length} nearby price option${facilities.length === 1 ? "" : "s"} for ${nextState.serviceQuery}. ${insuranceMatches} result${insuranceMatches === 1 ? "" : "s"} appear to match ${nextState.insurance}.`
+          : nextState.insurance
+            ? `Found ${facilities.length} nearby price option${facilities.length === 1 ? "" : "s"} for ${nextState.serviceQuery}. I didn't find a clear ${nextState.insurance} match, so I'm showing the nearby facilities for the procedure.`
+            : prices.length > 0
+              ? `Found ${facilities.length} nearby price option${facilities.length === 1 ? "" : "s"} for ${nextState.serviceQuery}.`
+              : `I found ${facilities.length} possible match${facilities.length === 1 ? "" : "es"} for ${nextState.serviceQuery}, but pricing is estimated or unavailable.`
+      : `I found 0 possible matches for ${nextState.serviceQuery}, but pricing is estimated or unavailable.`;
 
   const mapData = {
     center: userCoords,

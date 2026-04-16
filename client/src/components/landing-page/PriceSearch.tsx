@@ -98,6 +98,20 @@ export default function PriceSearch() {
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chatMessages]);
 
+  const handleServiceChange = (value: string) => {
+    setService(value);
+    if (value) {
+      setCptCode("");
+    }
+  };
+
+  const handleCptChange = (value: string) => {
+    setCptCode(value);
+    if (value.trim()) {
+      setService("");
+    }
+  };
+
   // ── SSE fetch ──────────────────────────────────────────────────────────
   const fetchPrices = useCallback(async (message: string, freshContext = false) => {
     const body: Record<string, unknown> = { session_id: sessionIdRef.current, message };
@@ -167,7 +181,8 @@ export default function PriceSearch() {
     setChatInput(""); setChatLoading(true);
     addChatMessage("user", msg);
     try {
-      const { text, mapData: md, facilities: fs, state } = await fetchPrices(msg);
+      const freshContext = /\b(?:cpt|zip|price|cost|how much|insurance)\b/i.test(msg) || /\b\d{5}\b/.test(msg);
+      const { text, mapData: md, facilities: fs, state } = await fetchPrices(msg, freshContext);
       setChatLoading(false);
       if (text) addChatMessage("assistant", text);
       if (md && fs.length > 0) applyResults(md, fs, state, null);
@@ -239,7 +254,7 @@ export default function PriceSearch() {
                 <Search className="w-4 h-4 text-[#6b2458] flex-shrink-0" />
                 <select
                   value={service}
-                  onChange={e => setService(e.target.value)}
+                  onChange={e => handleServiceChange(e.target.value)}
                   className="flex-1 text-sm text-gray-700 bg-transparent outline-none cursor-pointer"
                 >
                   <option value="">Select a service…</option>
@@ -252,7 +267,9 @@ export default function PriceSearch() {
               </div>
               <div className="flex items-center my-1 text-xs text-gray-400 gap-2"><hr className="flex-1 border-gray-200" /><span>or CPT code</span><hr className="flex-1 border-gray-200" /></div>
               <input
-                type="text" value={cptCode} onChange={e => setCptCode(e.target.value)}
+                type="text"
+                value={cptCode}
+                onChange={e => handleCptChange(e.target.value.replace(/\D/g, "").slice(0, 5))}
                 placeholder="e.g. 71046" maxLength={5} inputMode="numeric"
                 className="w-full text-sm px-2 py-1.5 border border-gray-200 rounded-lg outline-none focus:border-[#6b2458]"
               />
