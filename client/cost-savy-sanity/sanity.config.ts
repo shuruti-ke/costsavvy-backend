@@ -5,7 +5,7 @@ import {schemaTypes} from './schemaTypes'
 
 export default defineConfig({
   name: 'default',
-  title: 'cost-savy-health',
+  title: 'cost-savvy-health',
   projectId: 'loof1pb6',
   dataset: 'production',
   plugins: [

@@ -11,18 +11,20 @@ const Footer = () => {
         <div className="flex flex-col  space-x-2 mb-8 gap-3 ">
           <Image src={Logo} alt="Logo of the company" />
           <div className="flex space-x-4">
-            <Link
-              href="#"
+            <a
+              href="mailto:Chat@costsavvy.health"
               className="text-gray-600 bg-[#F3E8EF] p-2 rounded-md"
+              aria-label="Email Cost Savvy Health"
             >
               <Linkedin size={24} />
-            </Link>
-            <Link
-              href="#"
+            </a>
+            <a
+              href="/contact-us"
               className="text-gray-600 bg-[#F3E8EF] p-2  rounded-md"
+              aria-label="Contact Cost Savvy Health"
             >
               <Twitter size={24} />
-            </Link>
+            </a>
           </div>
         </div>
 
@@ -33,12 +35,12 @@ const Footer = () => {
             </h3>
             <ul className="space-y-3 text-lg">
               <li>
-                <Link href="#" className="text-gray-600 hover:text-[#A34E78]">
+                <Link href="/" className="text-gray-600 hover:text-[#A34E78]">
                   Search Care
                 </Link>
               </li>
               <li>
-                <Link href="#" className="text-gray-600 hover:text-[#A34E78]">
+                <Link href="/quote" className="text-gray-600 hover:text-[#A34E78]">
                   Services
                 </Link>
               </li>
@@ -82,7 +84,7 @@ const Footer = () => {
                 </Link>
               </li>
               <li>
-                <Link href="#" className="text-gray-600 hover:text-[#A34E78]">
+                <Link href="/contact-us" className="text-gray-600 hover:text-[#A34E78]">
                   Careers
                 </Link>
               </li>
@@ -121,22 +123,10 @@ const Footer = () => {
               Contact Us
             </Link>
             <Link
-              href="#"
+              href="mailto:Chat@costsavvy.health"
               className="text-sm text-gray-600 hover:text-[#A34E78]"
             >
               Email Us
-            </Link>
-            <Link
-              href="#"
-              className="text-sm text-gray-600 hover:text-[#A34E78]"
-            >
-              Privacy Policy
-            </Link>
-            <Link
-              href="#"
-              className="text-sm text-gray-600 hover:text-[#A34E78]"
-            >
-              Terms of Use
             </Link>
           </div>
         </div>

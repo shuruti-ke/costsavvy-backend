@@ -17,6 +17,7 @@ interface MapFacility {
   price: number | null;
   estimated_range: string | null;
   website_url: string | null;
+  insurance_match?: boolean;
 }
 
 interface MapData {
@@ -50,12 +51,14 @@ const userIcon = L.divIcon({
   iconAnchor: [9, 9],
 });
 
-function facilityIcon(num: number) {
+function facilityIcon(num: number, insuranceMatch = false, selected = false) {
+  const bg = insuranceMatch ? "#15803d" : "#6b2458";
+  const ring = selected ? "0 0 0 4px rgba(255,255,255,0.75), 0 0 0 7px rgba(107,36,88,0.18)" : "0 2px 6px rgba(0,0,0,0.3)";
   return L.divIcon({
     className: "",
-    html: `<div style="width:28px;height:28px;border-radius:50%;background:#6b2458;color:white;border:2px solid white;box-shadow:0 2px 6px rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px;">${num}</div>`,
-    iconSize: [28, 28],
-    iconAnchor: [14, 14],
+    html: `<div style="width:${selected ? 34 : 28}px;height:${selected ? 34 : 28}px;border-radius:50%;background:${bg};color:white;border:2px solid white;box-shadow:${ring};display:flex;align-items:center;justify-content:center;font-weight:700;font-size:${selected ? 13 : 12}px;">${num}</div>`,
+    iconSize: [selected ? 34 : 28, selected ? 34 : 28],
+    iconAnchor: [selected ? 17 : 14, selected ? 17 : 14],
   });
 }
 
@@ -82,7 +85,7 @@ export default function PriceSearchMap({ mapData, selectedIdx, onSelectFacility 
         <Marker
           key={f.facility_key || i}
           position={[f.latitude, f.longitude]}
-          icon={facilityIcon(f.list_index)}
+          icon={facilityIcon(f.list_index, Boolean(f.insurance_match), selectedIdx === i)}
           eventHandlers={{ click: () => onSelectFacility(i) }}
         >
           <Popup>
@@ -91,6 +94,18 @@ export default function PriceSearchMap({ mapData, selectedIdx, onSelectFacility 
               {f.address && <p style={{ fontSize: 12, color: "#666", marginBottom: 6 }}>{f.address}</p>}
               <p style={{ fontWeight: 700, fontSize: 15, color: f.price ? "#059669" : "#888" }}>
                 {f.price ? `$${f.price.toLocaleString()}` : f.estimated_range ? `${f.estimated_range} (est.)` : "Contact for pricing"}
+              </p>
+              <p style={{
+                display: "inline-flex",
+                marginTop: 8,
+                padding: "2px 8px",
+                borderRadius: 9999,
+                background: f.insurance_match ? "#ecfdf5" : "#fdf2f8",
+                color: f.insurance_match ? "#047857" : "#6b2458",
+                fontSize: 11,
+                fontWeight: 700,
+              }}>
+                {f.insurance_match ? "Insurance match" : "Nearby match"}
               </p>
               {f.website_url && (
                 <a href={f.website_url} target="_blank" rel="noopener noreferrer" style={{ fontSize: 12, color: "#2563eb", display: "block", marginTop: 8 }}>

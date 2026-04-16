@@ -34,7 +34,7 @@ export default function PriceTransparency({
           </p>
           <a
             href={ctaLink}
-            className="inline-block bg-[#8C2F5D] text-white px-6 py-3 rounded-full hover:bg-[#C85990] transition-colors duration-300"
+            className="inline-flex h-11 items-center justify-center rounded-full bg-[#8C2F5D] px-7 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-[#A34E78]"
           >
             {ctaText}
           </a>

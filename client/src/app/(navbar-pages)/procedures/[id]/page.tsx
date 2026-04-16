@@ -4,6 +4,9 @@ import { groq } from "next-sanity";
 import { PortableText } from "@portabletext/react";
 import { generateMetadataTemplate } from "@/lib/metadata";
 import { Metadata } from "next";
+
+export const dynamic = "force-dynamic";
+
 export async function generateMetadata({
   params,
   searchParams,
@@ -52,13 +55,6 @@ type Procedure = {
   sections: { heading: string; content: any[] }[];
   conclusion: any[];
 };
-
-export async function generateStaticParams() {
-  const allIds = await client.fetch<string[]>(
-    groq`*[_type == "procedure"]._id`
-  );
-  return allIds.map((id) => ({ id }));
-}
 
 export default async function ProcedurePage(props: {
   params: Promise<{ id: string }>;

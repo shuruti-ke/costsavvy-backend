@@ -3,10 +3,21 @@
 import { ContactFormValues } from "@/components/quote/quote";
 
 // Types
-interface UserData {
+export interface RegisterUserData {
   name: string;
   email: string;
   password: string;
+  phoneNumber?: string;
+  companyName?: string;
+  jobTitle?: string;
+  organizationType?: string;
+  zipCode?: string;
+  useCase?: string;
+  organizationSize?: string;
+  specialty?: string;
+  primaryGoal?: string;
+  accountType?: "business" | "consumer";
+  dashboardPath?: string;
 }
 
 interface Credentials {
@@ -20,12 +31,29 @@ interface User {
   email: string;
   role: string;
   avatar: string | null;
+  phoneNumber?: string | null;
+  companyName?: string | null;
+  jobTitle?: string | null;
+  organizationType?: string | null;
+  zipCode?: string | null;
+  useCase?: string | null;
+  organizationSize?: string | null;
+  specialty?: string | null;
+  primaryGoal?: string | null;
+  accountType?: string | null;
 }
 
 interface AuthResponse {
   success: boolean;
   token: string;
   user: User;
+}
+
+interface RegisterResponse {
+  success: boolean;
+  message: string;
+  confirmationRequired?: boolean;
+  dashboardPath?: string;
 }
 
 interface UserResponse {
@@ -58,7 +86,7 @@ export interface ContactMessageValues {
 }
 
 // API URL
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "/api";
 
 // Global fetch options for authentication requests
 const authFetchOptions = {
@@ -108,8 +136,8 @@ const withAuth = (token: string, options: RequestInit = {}): RequestInit => {
 };
 
 // Register a new user
-export const register = async (userData: UserData): Promise<AuthResponse> => {
-  return apiRequest<AuthResponse>(
+export const register = async (userData: RegisterUserData): Promise<RegisterResponse> => {
+  return apiRequest<RegisterResponse>(
     `${API_URL}/auth/register`,
     {
       ...authFetchOptions,
@@ -191,7 +219,7 @@ export const getUserById = async (
 export const updateUser = async (
   token: string,
   userId: string,
-  userData: Partial<UserData>
+  userData: Partial<RegisterUserData>
 ): Promise<UserResponse> => {
   return apiRequest<UserResponse>(
     `${API_URL}/users/${userId}`,

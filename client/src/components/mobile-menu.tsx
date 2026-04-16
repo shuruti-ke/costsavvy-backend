@@ -1,6 +1,7 @@
 import React from "react";
 import NavLinks from "./nav-links";
 import { X } from "lucide-react";
+import Link from "next/link";
 
 interface MobileMenuProps {
   isMenuOpen: boolean;
@@ -25,12 +26,18 @@ export default function MobileMenu({
       </button>
       <div className="flex flex-col items-center justify-center h-full text-white space-y-6">
         <NavLinks onLinkClick={toggleMenu} isMobileMenuOpen={isMenuOpen} />
-        <button className="text-white hover:text-[#C85990] transition-colors font-medium">
+        <Link
+          href="/auth?type=consumer"
+          className="text-white hover:text-[#C85990] transition-colors font-medium"
+        >
           Sign Up
-        </button>
-        <button className="hover:bg-[#8C2F5D] bg-[#C85990] text-[#0A2533] px-5 py-2 rounded-full transition-colors cursor-pointer">
+        </Link>
+        <Link
+          href="/admin"
+          className="hover:bg-[#8C2F5D] bg-[#C85990] text-[#0A2533] px-5 py-2 rounded-full transition-colors cursor-pointer"
+        >
           Platform Sign In
-        </button>
+        </Link>
       </div>
     </div>
   );

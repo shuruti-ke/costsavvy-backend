@@ -4,7 +4,7 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 import dynamic from "next/dynamic";
 import { Search, Loader2 } from "lucide-react";
 
-const API_BASE = "https://costsavvy-backend.onrender.com";
+const API_BASE = "/api";
 
 // Leaflet map loaded client-side only
 const FacilityMap = dynamic(() => import("./PriceSearchMap"), { ssr: false, loading: () => <div className="h-[400px] bg-gray-100 rounded-lg flex items-center justify-center text-gray-400">Loading map…</div> });
@@ -24,6 +24,7 @@ interface Facility {
   longitude: number | null;
   facility_key: string;
   website_url: string | null;
+  insurance_match?: boolean;
 }
 
 interface MapData {
@@ -39,6 +40,7 @@ interface MapData {
     price: number | null;
     estimated_range: string | null;
     website_url: string | null;
+    insurance_match?: boolean;
   }>;
   google_maps_url?: string;
   procedure_code?: string;
@@ -186,9 +188,23 @@ export default function PriceSearch() {
     setSelectedIdx(null);
     const cpt = String(state.code || md.procedure_code || "").trim();
     const proc = String(state.procedure_display_name || md.procedure_display_name || "").trim();
-    let title = (serviceQuery || "").trim();
-    if (proc && cpt) title = `${proc}, CPT code ${cpt}`;
-    else if (!title && md.service_query) title = String(md.service_query).charAt(0).toUpperCase() + String(md.service_query).slice(1);
+    const parts: string[] = [];
+    const addPart = (value: string) => {
+      const normalized = value.trim().replace(/\s+/g, " ");
+      if (!normalized) return;
+      if (!parts.some((part) => part.toLowerCase() === normalized.toLowerCase())) {
+        parts.push(normalized);
+      }
+    };
+
+    addPart(proc);
+    if (!proc) addPart(serviceQuery || "");
+    if (!parts.length && md.service_query) addPart(String(md.service_query));
+    if (cpt && !parts.some((part) => part.includes(cpt))) {
+      addPart(`CPT code ${cpt}`);
+    }
+
+    const title = parts.join(", ");
     setResultsTitle(title);
     const prices = fs.map(f => f.price).filter((p): p is number => p != null);
     if (prices.length > 0) { setPriceRange({ min: Math.min(...prices), max: Math.max(...prices) }); setEstimatesOnly(false); }
@@ -206,7 +222,7 @@ export default function PriceSearch() {
   const minPrice = sorted.filter(f => f.price).map(f => f.price as number).reduce((m, p) => Math.min(m, p), Infinity);
 
   // ── Map markers synced to sorted list ─────────────────────────────────
-  const mapFacilities = mapData ? { ...mapData, facilities: sorted.slice(0, 5).filter(f => f.latitude && f.longitude).map((f, i) => ({ list_index: i + 1, facility_key: f.facility_key, name: f.hospital_name, latitude: f.latitude!, longitude: f.longitude!, address: normalizeAddress(f.address || ""), price: f.price, estimated_range: f.estimated_range, website_url: f.website_url })) } : null;
+  const mapFacilities = mapData ? { ...mapData, facilities: sorted.slice(0, 5).filter(f => f.latitude && f.longitude).map((f, i) => ({ list_index: i + 1, facility_key: f.facility_key, name: f.hospital_name, latitude: f.latitude!, longitude: f.longitude!, address: normalizeAddress(f.address || ""), price: f.price, estimated_range: f.estimated_range, website_url: f.website_url, insurance_match: f.insurance_match })) } : null;
 
   const QUICK_ACTIONS = ["How much does an MRI cost?", "Find X-ray prices near 10001", "How much does a CT scan cost?", "Colonoscopy prices near me"];
 
@@ -274,13 +290,13 @@ export default function PriceSearch() {
 
           {/* Submit */}
           <div className="px-4 py-3 flex items-end">
-            <button
-              type="submit" disabled={loading}
-              className="flex items-center justify-center gap-2 bg-[#8C2F5D] hover:bg-[#A34E78] disabled:bg-gray-300 text-white px-6 py-3 rounded-xl font-semibold text-sm transition-colors w-full lg:w-auto cursor-pointer"
-            >
-              {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
-              Search Prices
-            </button>
+              <button
+                type="submit" disabled={loading}
+                className="inline-flex h-11 items-center justify-center gap-2 rounded-full bg-[#8C2F5D] px-7 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-[#A34E78] disabled:cursor-not-allowed disabled:bg-gray-300 w-full lg:w-auto cursor-pointer"
+              >
+                {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+                Search Prices
+              </button>
           </div>
         </div>
 
@@ -321,6 +337,9 @@ export default function PriceSearch() {
                   const isEst = !f.price;
                   const showWeb = f.web_price != null && Number(f.web_price) > 0;
                   const note = f.price ? (f.price_source === "web_search" ? "Web search" : f.price_source === "db" ? "Verified" : "Verified") : "Estimate";
+                  const insuranceBadge = f.insurance_match
+                    ? "Insurance match"
+                    : "Nearby match";
                   let siteHtml: React.ReactNode = null;
                   try {
                     if (f.website_url) {
@@ -346,6 +365,9 @@ export default function PriceSearch() {
                           <p className="text-xs text-gray-500">
                             {f.distance_miles != null && <span>📍 {f.distance_miles.toFixed(1)} mi · </span>}
                             {normalizeAddress(f.address || "")}
+                          </p>
+                          <p className={`mt-2 inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold ${f.insurance_match ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-[#6b2458]"}`}>
+                            {insuranceBadge}
                           </p>
                           {siteHtml}
                         </div>
@@ -420,17 +442,17 @@ export default function PriceSearch() {
               placeholder="Ask about healthcare prices…"
               className="flex-1 px-4 py-2.5 border border-gray-200 rounded-full text-sm outline-none focus:border-[#6b2458] focus:ring-2 focus:ring-[#6b2458]/10"
             />
-            <button onClick={handleSend} disabled={chatLoading} className="w-10 h-10 rounded-full bg-[#6b2458] hover:bg-[#8C2F5D] disabled:bg-gray-300 text-white flex items-center justify-center transition-colors cursor-pointer">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-            </button>
-          </div>
-          <div className="flex flex-wrap gap-2 mt-3">
-            {QUICK_ACTIONS.map(q => (
-              <button key={q} onClick={() => { setChatInput(q); }} className="px-3 py-1.5 bg-[#fdf2f8] text-[#6b2458] border border-[#f5d0e6] rounded-full text-xs hover:bg-[#6b2458] hover:text-white transition-colors cursor-pointer">
-                {q}
+              <button onClick={handleSend} disabled={chatLoading} className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-[#6b2458] text-white transition-colors hover:bg-[#8C2F5D] disabled:cursor-not-allowed disabled:bg-gray-300 cursor-pointer">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
               </button>
-            ))}
-          </div>
+            </div>
+            <div className="flex flex-wrap gap-2 mt-3">
+              {QUICK_ACTIONS.map(q => (
+                <button key={q} onClick={() => { setChatInput(q); }} className="rounded-full border border-[#f5d0e6] bg-[#fdf2f8] px-3 py-1.5 text-xs font-medium text-[#6b2458] transition-colors hover:bg-[#6b2458] hover:text-white cursor-pointer">
+                  {q}
+                </button>
+              ))}
+            </div>
         </div>
       </div>
     </div>

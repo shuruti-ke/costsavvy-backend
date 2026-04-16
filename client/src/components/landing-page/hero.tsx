@@ -11,6 +11,7 @@ interface HeroProps {
 export default function Hero({ tagline, rotatingWords, commonProcedures }: HeroProps) {
   const [index, setIndex] = useState(0);
   const [isFading, setIsFading] = useState(false);
+  const headline = tagline.replace(/\s+for$/i, "").trim();
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -27,7 +28,7 @@ export default function Hero({ tagline, rotatingWords, commonProcedures }: HeroP
     <main className="px-6 sm:px-12 py-10 sm:py-16">
       {/* Headline */}
       <h1 className="text-[#403B3D] text-3xl md:text-5xl lg:text-6xl font-bold font-serif leading-tight mb-4">
-        {tagline} <span className="md:hidden">for</span>
+        {headline} <span className="md:hidden">for</span>
         <br />
         <span className="flex items-center space-x-4">
           <span className="hidden sm:inline-block">for</span>
