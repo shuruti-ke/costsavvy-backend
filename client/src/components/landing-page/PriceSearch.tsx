@@ -25,6 +25,7 @@ interface Facility {
   facility_key: string;
   website_url: string | null;
   insurance_match?: boolean;
+  matching_insurers?: string[];
 }
 
 interface MapData {
@@ -41,6 +42,7 @@ interface MapData {
     estimated_range: string | null;
     website_url: string | null;
     insurance_match?: boolean;
+    matching_insurers?: string[];
   }>;
   google_maps_url?: string;
   procedure_code?: string;
@@ -269,7 +271,7 @@ export default function PriceSearch() {
         : "AI-assisted search";
 
   // ── Map markers synced to sorted list ─────────────────────────────────
-  const mapFacilities = mapData ? { ...mapData, facilities: sorted.slice(0, 5).filter(f => f.latitude && f.longitude).map((f, i) => ({ list_index: i + 1, facility_key: f.facility_key, name: f.hospital_name, latitude: f.latitude!, longitude: f.longitude!, address: normalizeAddress(f.address || ""), price: f.price, estimated_range: f.estimated_range, website_url: f.website_url, insurance_match: f.insurance_match })) } : null;
+  const mapFacilities = mapData ? { ...mapData, facilities: sorted.slice(0, 5).filter(f => f.latitude && f.longitude).map((f, i) => ({ list_index: i + 1, facility_key: f.facility_key, name: f.hospital_name, latitude: f.latitude!, longitude: f.longitude!, address: normalizeAddress(f.address || ""), price: f.price, estimated_range: f.estimated_range, website_url: f.website_url, insurance_match: f.insurance_match, matching_insurers: f.matching_insurers })) } : null;
 
   const QUICK_ACTIONS = ["How much does an MRI cost?", "Find X-ray prices near 10001", "How much does a CT scan cost?", "Colonoscopy prices near me"];
 
@@ -402,6 +404,12 @@ export default function PriceSearch() {
                   const insuranceBadge = f.insurance_match
                     ? "Insurance match"
                     : "Nearby match";
+                  const matchingInsurers = Array.from(new Set((f.matching_insurers || []).map((insurer) => insurer.trim()).filter(Boolean)));
+                  const insurerLabel = matchingInsurers.length > 0
+                    ? matchingInsurers.length === 1
+                      ? matchingInsurers[0]
+                      : matchingInsurers.join(", ")
+                    : "";
                   let siteHtml: React.ReactNode = null;
                   try {
                     if (f.website_url) {
@@ -431,6 +439,11 @@ export default function PriceSearch() {
                           <p className={`mt-2 inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold ${f.insurance_match ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-[#6b2458]"}`}>
                             {insuranceBadge}
                           </p>
+                          {insurerLabel && (
+                            <p className="mt-1 text-[11px] text-gray-500">
+                              Found insurer: <span className="font-semibold text-gray-700">{insurerLabel}</span>
+                            </p>
+                          )}
                           {siteHtml}
                         </div>
                       </div>

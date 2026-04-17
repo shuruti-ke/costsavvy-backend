@@ -120,6 +120,8 @@ async function buildWebFacilities(candidates: WebPriceCandidate[], nextState: Se
         price_source: "web_search",
         hospital_name: name,
         insurance_match: candidate.insuranceMatch,
+        matching_insurers:
+          candidate.insuranceMatch && nextState.insurance ? [nextState.insurance] : [],
       };
     })
   );
@@ -347,6 +349,7 @@ export async function POST(request: Request) {
         estimated_range: facility.estimated_range,
         website_url: facility.website_url,
         insurance_match: facility.insurance_match,
+        matching_insurers: facility.matching_insurers,
       })),
       google_maps_url: `https://www.google.com/maps/search/${encodeURIComponent(nextState.zip)}`,
       procedure_code: nextState.cptCode || undefined,
@@ -438,6 +441,10 @@ export async function POST(request: Request) {
       price_source: rate != null ? "db" : "estimate",
       hospital_name: name,
       insurance_match: Boolean(doc.insurance_match),
+      matching_insurers:
+        doc.insurance_match && doc.reporting_entity_name_in_network_files
+          ? [String(doc.reporting_entity_name_in_network_files)]
+          : [],
     });
   }
 
@@ -476,6 +483,7 @@ export async function POST(request: Request) {
       estimated_range: facility.estimated_range,
       website_url: facility.website_url,
       insurance_match: facility.insurance_match,
+      matching_insurers: facility.matching_insurers,
     })),
     google_maps_url: `https://www.google.com/maps/search/${encodeURIComponent(nextState.zip)}`,
     procedure_code: nextState.cptCode || undefined,
