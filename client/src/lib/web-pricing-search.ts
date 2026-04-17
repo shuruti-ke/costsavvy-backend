@@ -5,6 +5,7 @@ import { callNemotron } from "@/lib/nemotron";
 type WebSearchInput = {
   serviceQuery: string;
   cptCode?: string;
+  serviceDescription?: string;
   zip?: string;
   insurance?: string;
 };
@@ -227,6 +228,65 @@ function extractPrice(value: string) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function scorePatientPortalSignals(value: string) {
+  const text = value.toLowerCase();
+  let score = 0;
+
+  const weightedSignals: Array<[RegExp, number]> = [
+    [/mychartplus|my chart plus/i, 6],
+    [/mychart/i, 5],
+    [/patient estimate|guest estimate|get estimate|estimate details/i, 5],
+    [/estimate for|your estimate|service estimate/i, 4],
+    [/you pay|total fees|insurance covers|coverage information/i, 4],
+    [/patient portal|guest estimates?|estimate details/i, 3],
+    [/start over|select a different service/i, 2],
+    [/hartford health|hhc|hartford healthcare/i, 2],
+    [/patient|guests?|consumer/i, 1],
+  ];
+
+  for (const [pattern, weight] of weightedSignals) {
+    if (pattern.test(text)) score += weight;
+  }
+
+  return score;
+}
+
+function isHospitalLinkedDocument(result: BravePageDocument) {
+  const combined = [result.title, result.sourceName, result.description, result.pageText, result.finalUrl || result.url]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  return (
+    /\bhospital\b/.test(combined) ||
+    /\bhealth\s*care\b/.test(combined) ||
+    /\bhealthcare\b/.test(combined) ||
+    /\bhealth system\b/.test(combined) ||
+    /\bmedical center\b/.test(combined) ||
+    /\bmedical centre\b/.test(combined) ||
+    /\bpatient portal\b/.test(combined) ||
+    /\bguest estimate\b/.test(combined) ||
+    /\bmychartplus\b/.test(combined) ||
+    /\bmychart\b/.test(combined) ||
+    /\bhartford health\b/.test(combined) ||
+    /\bhhc\b/.test(combined) ||
+    /\bclinic\b/.test(combined) ||
+    /\bphysician\b/.test(combined) ||
+    /\bprovider\b/.test(combined)
+  );
+}
+
+function scoreWebDocument(result: BravePageDocument) {
+  const combined = [result.title, result.description, result.pageText, result.finalUrl, ...result.extraSnippets]
+    .filter(Boolean)
+    .join(" ");
+  const portalScore = scorePatientPortalSignals(combined);
+  const priceScore = extractPrice(combined) != null ? 4 : 0;
+  const tableScore = /table|fee schedule|estimate|you pay|coverage/i.test(combined) ? 2 : 0;
+  const payerScore = /aetna|blue cross|bcbs|uhc|unitedhealthcare|humana|cigna|medicare|medicaid/i.test(combined) ? 2 : 0;
+  return portalScore + priceScore + tableScore + payerScore;
+}
+
 function collectBraveResults(payload: BraveResponse) {
   const rawResults =
     (payload.web && typeof payload.web === "object" && Array.isArray((payload.web as Record<string, unknown>).results)
@@ -264,7 +324,7 @@ async function searchBrave(query: string) {
 
   const url = new URL("https://api.search.brave.com/res/v1/web/search");
   url.searchParams.set("q", query);
-  url.searchParams.set("count", "10");
+  url.searchParams.set("count", "20");
   url.searchParams.set("search_lang", "en");
   url.searchParams.set("country", "us");
   url.searchParams.set("spellcheck", "1");
@@ -285,18 +345,30 @@ async function searchBrave(query: string) {
 }
 
 function buildQueries(input: WebSearchInput) {
-  const base = input.cptCode ? `${input.cptCode} ${input.serviceQuery}`.trim() : input.serviceQuery;
+  const serviceText = input.serviceDescription || input.serviceQuery;
+  const base = input.cptCode ? `${input.cptCode} ${serviceText}`.trim() : serviceText;
   const zipPart = input.zip ? ` ${input.zip}` : "";
   const insurerPart = input.insurance ? ` ${input.insurance}` : "";
 
   const queries = [
+    `${base} mychartplus estimate${zipPart}${insurerPart}`,
+    `${base} mychartplus patient estimate${zipPart}${insurerPart}`,
+    `${base} mychartplus guest estimate${zipPart}${insurerPart}`,
+    `${base} mychart estimate${zipPart}${insurerPart}`,
+    `${base} patient estimate${zipPart}${insurerPart}`,
+    `${base} guest estimate${zipPart}${insurerPart}`,
+    `${base} estimate details${zipPart}${insurerPart}`,
+    `${base} get estimate${zipPart}${insurerPart}`,
+    `${base} hartford health estimate${zipPart}${insurerPart}`,
+    `${base} estimate${zipPart}${insurerPart}`,
+    `${base} patient estimates${zipPart}${insurerPart}`,
     `${base} price transparency${zipPart}${insurerPart}`,
     `${base} fee schedule${zipPart}${insurerPart}`,
     `${base} chargemaster${zipPart}${insurerPart}`,
     `${base} shoppable services${zipPart}${insurerPart}`,
     `${base} hospital price${zipPart}${insurerPart}`,
-    `${base} PDF${zipPart}${insurerPart}`,
     `${base} standard charges${zipPart}${insurerPart}`,
+    `${base} PDF${zipPart}${insurerPart}`,
   ];
 
   if (input.insurance) {
@@ -364,26 +436,37 @@ export async function searchWebPricing(input: WebSearchInput) {
     return { results: [] as WebPriceCandidate[], sources: [] as BraveResult[] };
   }
 
+  const uniqueBraveResults = Array.from(
+    new Map(braveResults.map((result) => [result.url || result.title, result])).values()
+  );
+
   const bravePageDocuments = (
     await Promise.all(
-      braveResults.slice(0, 8).map(async (result) => fetchBravePageDocument(result))
+      uniqueBraveResults.map(async (result) => fetchBravePageDocument(result))
     )
   ).filter(Boolean) as BravePageDocument[];
 
   if (!bravePageDocuments.length) {
-    return { results: [] as WebPriceCandidate[], sources: braveResults };
+    return { results: [] as WebPriceCandidate[], sources: uniqueBraveResults };
   }
 
-  const rawCandidates = toCandidateMap(bravePageDocuments, input).slice(0, 10);
+  bravePageDocuments.sort((a, b) => scoreWebDocument(b) - scoreWebDocument(a));
+  const hospitalLinkedDocuments = bravePageDocuments.filter((page) => isHospitalLinkedDocument(page));
+
+  if (!hospitalLinkedDocuments.length) {
+    return { results: [] as WebPriceCandidate[], sources: uniqueBraveResults };
+  }
+
+  const rawCandidates = toCandidateMap(hospitalLinkedDocuments, input);
   if (!rawCandidates.length) {
-    const fallbackCandidates = toCandidateMap(bravePageDocuments, input, { allowNoPrice: true }).slice(0, 10);
+    const fallbackCandidates = toCandidateMap(hospitalLinkedDocuments, input, { allowNoPrice: true });
     return {
       results: fallbackCandidates.map((candidate) => ({
         ...candidate,
         price: candidate.price,
         confidence: 0.35,
       })) as WebPriceCandidate[],
-      sources: braveResults,
+      sources: uniqueBraveResults,
     };
   }
 
@@ -394,7 +477,7 @@ export async function searchWebPricing(input: WebSearchInput) {
     insurance: input.insurance || "",
     instructions:
       "Only return items that explicitly show a price in the opened page content, PDF text, or table rows. Do not invent hospitals, prices, or addresses. Prefer the strongest direct match to the service and ZIP.",
-    pages: bravePageDocuments.map((page) => ({
+    pages: hospitalLinkedDocuments.map((page) => ({
       title: page.title,
       url: page.finalUrl || page.url,
       sourceName: page.sourceName,
@@ -439,7 +522,7 @@ export async function searchWebPricing(input: WebSearchInput) {
           insuranceMatch: entry.insuranceMatch,
           confidence: entry.confidence,
         })) as WebPriceCandidate[],
-        sources: braveResults,
+        sources: uniqueBraveResults,
       };
     }
   } catch (error) {
@@ -448,6 +531,6 @@ export async function searchWebPricing(input: WebSearchInput) {
 
   return {
     results: rawCandidates,
-    sources: braveResults,
+    sources: uniqueBraveResults,
   };
 }

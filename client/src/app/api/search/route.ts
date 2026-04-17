@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { query } from "@/lib/postgres";
 import { parseZipRange } from "@/lib/search-utils";
 import { ensureSearchLearningSchema, recordSearchLearning } from "@/lib/search-learning";
+import { lookupServiceSearchHint } from "@/lib/service-lookup";
 import { searchWebPricing, type WebPriceCandidate } from "@/lib/web-pricing-search";
 
 export const runtime = "nodejs";
@@ -104,9 +105,11 @@ export async function GET(request: Request) {
   await ensureSearchLearningSchema();
 
   const cptCode = searchParams.get("cptCode")?.trim() || "";
+  const serviceHint = cptCode ? await lookupServiceSearchHint(cptCode) : null;
   const webSearch = await searchWebPricing({
     serviceQuery: searchCare,
     cptCode,
+    serviceDescription: serviceHint?.searchHint || serviceHint?.serviceDescription || undefined,
     zip: zipCode,
     insurance,
   });

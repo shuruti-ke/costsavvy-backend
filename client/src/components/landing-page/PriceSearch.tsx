@@ -42,6 +42,7 @@ interface MapData {
     price: number | null;
     estimated_range: string | null;
     website_url: string | null;
+    price_source?: string | null;
     insurance_match?: boolean;
     matching_insurers?: string[];
     insurance_provider_name?: string | null;
@@ -270,7 +271,7 @@ export default function PriceSearch() {
         : "AI-assisted search";
 
   // ── Map markers synced to sorted list ─────────────────────────────────
-  const mapFacilities = mapData ? { ...mapData, facilities: sorted.slice(0, 5).filter(f => f.latitude && f.longitude).map((f, i) => ({ list_index: i + 1, facility_key: f.facility_key, name: f.hospital_name, latitude: f.latitude!, longitude: f.longitude!, address: normalizeAddress(f.address || ""), price: f.price, estimated_range: f.estimated_range, website_url: f.website_url, insurance_match: f.insurance_match, matching_insurers: f.matching_insurers, insurance_provider_name: f.insurance_provider_name })) } : null;
+  const mapFacilities = mapData ? { ...mapData, facilities: sorted.slice(0, 5).filter(f => f.latitude && f.longitude).map((f, i) => ({ list_index: i + 1, facility_key: f.facility_key, name: f.hospital_name, latitude: f.latitude!, longitude: f.longitude!, address: normalizeAddress(f.address || ""), price: f.price, estimated_range: f.estimated_range, website_url: f.website_url, price_source: f.price_source, insurance_match: f.insurance_match, matching_insurers: f.matching_insurers, insurance_provider_name: f.insurance_provider_name })) } : null;
 
   const QUICK_ACTIONS = ["How much does an MRI cost?", "Find X-ray prices near 10001", "How much does a CT scan cost?", "Colonoscopy prices near me"];
 
@@ -396,6 +397,8 @@ export default function PriceSearch() {
                   const isLow = f.price && f.price <= minPrice * 1.2;
                   const isEst = !f.price;
                   const showWeb = f.web_price != null && Number(f.web_price) > 0;
+                  const isWebSource = f.price_source === "web_search" || f.price_source === "web_candidate";
+                  const sourceLabel = isWebSource ? "Hospital-linked estimate page" : "Healthcare facility";
                   const note = f.price
                     ? (f.price_source === "web_search"
                         ? "Web search"
@@ -449,8 +452,8 @@ export default function PriceSearch() {
                       <div className="flex gap-3 flex-1 min-w-0">
                         <div className="w-6 h-6 rounded-full bg-[#6b2458] text-white text-xs font-bold flex items-center justify-center flex-shrink-0 mt-0.5">{i + 1}</div>
                         <div className="min-w-0">
-                          <p className="font-semibold text-[#6b2458] text-sm truncate">{f.hospital_name || "Healthcare Facility"}</p>
-                          <p className="text-xs text-gray-400 mb-1">Healthcare Facility</p>
+                          <p className="font-semibold text-[#6b2458] text-sm truncate">{f.hospital_name || (isWebSource ? "Hospital estimate page" : "Healthcare facility")}</p>
+                          <p className="text-xs text-gray-400 mb-1">{sourceLabel}</p>
                           <p className="text-xs text-gray-500">
                             {f.distance_miles != null && <span>📍 {f.distance_miles.toFixed(1)} mi · </span>}
                             {normalizeAddress(f.address || "")}

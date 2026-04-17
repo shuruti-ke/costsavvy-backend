@@ -9,6 +9,7 @@ import {
 } from "@/lib/search-utils";
 import { geocodeZip } from "@/lib/geocode";
 import { ensureSearchLearningSchema, recordSearchLearning } from "@/lib/search-learning";
+import { lookupServiceSearchHint } from "@/lib/service-lookup";
 import { searchWebPricing, type WebPriceCandidate } from "@/lib/web-pricing-search";
 
 export const runtime = "nodejs";
@@ -263,6 +264,7 @@ export async function POST(request: Request) {
   sessions.set(sessionId, nextState);
 
   await ensureSearchLearningSchema();
+  const serviceHint = nextState.cptCode ? await lookupServiceSearchHint(nextState.cptCode) : null;
 
   if (!nextState.serviceQuery || !nextState.zip) {
     const clarification = !nextState.serviceQuery
@@ -288,6 +290,7 @@ export async function POST(request: Request) {
   const webSearch = await searchWebPricing({
     serviceQuery: nextState.serviceQuery,
     cptCode: nextState.cptCode,
+    serviceDescription: serviceHint?.searchHint || serviceHint?.serviceDescription || undefined,
     zip: nextState.zip,
     insurance: nextState.insurance,
   });
@@ -353,6 +356,7 @@ export async function POST(request: Request) {
         price: facility.price,
         estimated_range: facility.estimated_range,
         website_url: facility.website_url,
+        price_source: facility.price_source,
         insurance_match: facility.insurance_match,
         matching_insurers: facility.matching_insurers,
       })),
@@ -500,11 +504,12 @@ export async function POST(request: Request) {
         facility_key: facility.facility_key,
         name: facility.name,
         latitude: facility.latitude,
-      longitude: facility.longitude,
-      address: facility.address,
+        longitude: facility.longitude,
+        address: facility.address,
         price: facility.price,
         estimated_range: facility.estimated_range,
         website_url: facility.website_url,
+        price_source: facility.price_source,
         insurance_match: facility.insurance_match,
         insurance_provider_name: facility.insurance_provider_name,
         matching_insurers: facility.matching_insurers,

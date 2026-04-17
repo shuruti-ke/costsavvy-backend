@@ -17,6 +17,7 @@ interface MapFacility {
   price: number | null;
   estimated_range: string | null;
   website_url: string | null;
+  price_source?: string | null;
   insurance_match?: boolean;
   insurance_provider_name?: string | null;
   matching_insurers?: string[];
@@ -97,6 +98,11 @@ export default function PriceSearchMap({ mapData, selectedIdx, onSelectFacility 
               {f.address && <p style={{ fontSize: 12, color: "#666", marginBottom: 6 }}>{f.address}</p>}
               <p style={{ fontWeight: 700, fontSize: 15, color: f.price ? "#059669" : "#888" }}>
                 {f.price ? `$${f.price.toLocaleString()}` : f.estimated_range ? `${f.estimated_range} (est.)` : "Contact for pricing"}
+              </p>
+              <p style={{ fontSize: 12, color: "#666", marginTop: 4 }}>
+                {f.price_source === "web_search" || f.price_source === "web_candidate"
+                  ? "Hospital-linked estimate page"
+                  : "Healthcare facility"}
               </p>
               {(() => {
                 const matchingInsurers = Array.from(
