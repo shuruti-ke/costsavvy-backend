@@ -401,15 +401,17 @@ export default function PriceSearch() {
                   const isEst = !f.price;
                   const showWeb = f.web_price != null && Number(f.web_price) > 0;
                   const note = f.price ? (f.price_source === "web_search" ? "Web search" : f.price_source === "db" ? "Verified" : "Verified") : "Estimate";
-                  const insuranceBadge = f.insurance_match
-                    ? "Insurance match"
-                    : "Nearby match";
                   const matchingInsurers = Array.from(new Set((f.matching_insurers || []).map((insurer) => insurer.trim()).filter(Boolean)));
                   const insurerLabel = matchingInsurers.length > 0
                     ? matchingInsurers.length === 1
                       ? matchingInsurers[0]
                       : matchingInsurers.join(", ")
                     : "";
+                  const insuranceBadge = f.insurance_match
+                    ? insurerLabel
+                      ? `Insurance match: ${insurerLabel}`
+                      : "Insurance match"
+                    : "Nearby match";
                   let siteHtml: React.ReactNode = null;
                   try {
                     if (f.website_url) {
@@ -439,11 +441,6 @@ export default function PriceSearch() {
                           <p className={`mt-2 inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold ${f.insurance_match ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-[#6b2458]"}`}>
                             {insuranceBadge}
                           </p>
-                          {insurerLabel && (
-                            <p className="mt-1 text-[11px] text-gray-500">
-                              Found insurer: <span className="font-semibold text-gray-700">{insurerLabel}</span>
-                            </p>
-                          )}
                           {siteHtml}
                         </div>
                       </div>
