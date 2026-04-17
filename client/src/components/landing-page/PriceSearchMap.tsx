@@ -18,11 +18,14 @@ interface MapFacility {
   estimated_range: string | null;
   website_url: string | null;
   insurance_match?: boolean;
+  insurance_provider_name?: string | null;
+  matching_insurers?: string[];
 }
 
 interface MapData {
   center: { latitude: number; longitude: number };
   user_location: { latitude: number; longitude: number; zipcode: string };
+  searched_insurance?: string;
   facilities: MapFacility[];
   google_maps_url?: string;
 }
@@ -95,18 +98,45 @@ export default function PriceSearchMap({ mapData, selectedIdx, onSelectFacility 
               <p style={{ fontWeight: 700, fontSize: 15, color: f.price ? "#059669" : "#888" }}>
                 {f.price ? `$${f.price.toLocaleString()}` : f.estimated_range ? `${f.estimated_range} (est.)` : "Contact for pricing"}
               </p>
-              <p style={{
-                display: "inline-flex",
-                marginTop: 8,
-                padding: "2px 8px",
-                borderRadius: 9999,
-                background: f.insurance_match ? "#ecfdf5" : "#fdf2f8",
-                color: f.insurance_match ? "#047857" : "#6b2458",
-                fontSize: 11,
-                fontWeight: 700,
-              }}>
-                {f.insurance_match ? "Insurance match" : "Nearby match"}
-              </p>
+              {(() => {
+                const matchingInsurers = Array.from(
+                  new Set((f.matching_insurers || []).map((insurer) => insurer.trim()).filter(Boolean))
+                );
+                const insurerLabel = matchingInsurers.length > 0
+                  ? matchingInsurers.length === 1
+                    ? matchingInsurers[0]
+                    : matchingInsurers.join(", ")
+                  : String(f.insurance_provider_name || "").trim();
+                const displayInsurerLabel =
+                  mapData.searched_insurance && insurerLabel && insurerLabel.toLowerCase() === mapData.searched_insurance.toLowerCase()
+                    ? ""
+                    : insurerLabel;
+                const nearbyLabel = mapData.searched_insurance
+                  ? displayInsurerLabel
+                    ? `Nearby match: no ${mapData.searched_insurance} match; shown with ${displayInsurerLabel}`
+                    : `Nearby match: no ${mapData.searched_insurance} match`
+                  : displayInsurerLabel
+                    ? `Nearby match: ${displayInsurerLabel}`
+                    : "Nearby match";
+                return (
+                  <p style={{
+                    display: "inline-flex",
+                    marginTop: 8,
+                    padding: "2px 8px",
+                    borderRadius: 9999,
+                    background: f.insurance_match ? "#ecfdf5" : "#fdf2f8",
+                    color: f.insurance_match ? "#047857" : "#6b2458",
+                    fontSize: 11,
+                    fontWeight: 700,
+                  }}>
+                    {f.insurance_match
+                      ? displayInsurerLabel
+                        ? `Insurance match: ${displayInsurerLabel}`
+                        : "Insurance match"
+                      : nearbyLabel}
+                  </p>
+                );
+              })()}
               {f.website_url && (
                 <a href={f.website_url} target="_blank" rel="noopener noreferrer" style={{ fontSize: 12, color: "#2563eb", display: "block", marginTop: 8 }}>
                   {f.website_url.includes("google.com/maps") ? "View on Google Maps ↗" : "Visit website ↗"}

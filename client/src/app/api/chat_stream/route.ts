@@ -120,6 +120,8 @@ async function buildWebFacilities(candidates: WebPriceCandidate[], nextState: Se
         price_source: candidate.price != null ? "web_search" : "web_candidate",
         hospital_name: name,
         insurance_match: candidate.insuranceMatch,
+        insurance_provider_name:
+          candidate.insuranceMatch && nextState.insurance ? nextState.insurance : null,
         matching_insurers:
           candidate.insuranceMatch && nextState.insurance ? [nextState.insurance] : [],
       };
@@ -360,6 +362,7 @@ export async function POST(request: Request) {
       procedure_explanation:
         webSearch.results[0]?.sourceSnippet || webSearch.results[0]?.sourceTitle || undefined,
       service_query: nextState.serviceQuery,
+      searched_insurance: nextState.insurance || undefined,
       ai_powered: true,
       web_sourced: true,
       pricing_source: hasVerifiedWebPrices ? "web" : "web_candidate",
@@ -380,6 +383,7 @@ export async function POST(request: Request) {
           service_query: nextState.serviceQuery,
           zip: nextState.zip,
           insurance: nextState.insurance || undefined,
+          searched_insurance: nextState.insurance || undefined,
           ai_powered: true,
           web_sourced: true,
           pricing_source: hasVerifiedWebPrices ? "web" : "web_candidate",
@@ -444,6 +448,7 @@ export async function POST(request: Request) {
       price_source: rate != null ? "db" : "estimate",
       hospital_name: name,
       insurance_match: Boolean(doc.insurance_match),
+      insurance_provider_name: String(doc.reporting_entity_name_in_network_files || "").trim() || null,
       matching_insurers:
         doc.insurance_match && doc.reporting_entity_name_in_network_files
           ? [String(doc.reporting_entity_name_in_network_files)]
@@ -453,17 +458,32 @@ export async function POST(request: Request) {
 
   const prices = facilities.map((f) => f.price).filter((p): p is number => p != null);
   const insuranceMatches = facilities.filter((f) => f.insurance_match).length;
+  const availableInsurers = Array.from(
+    new Set(
+      facilities
+        .map((facility) => String(facility.insurance_provider_name || "").trim())
+        .filter(Boolean)
+    )
+  );
   const hasFacilities = facilities.length > 0;
   const facilityLabel = facilities.length === 1 ? "facility" : "facilities";
   const searchLabel = nextState.cptCode ? `CPT code ${nextState.cptCode}` : nextState.serviceQuery;
+  const normalizedSearchInsurance = nextState.insurance.trim().toLowerCase();
+  const otherAvailableInsurers = availableInsurers.filter(
+    (name) => name.toLowerCase() !== normalizedSearchInsurance
+  );
+  const otherInsurersText =
+    nextState.insurance && otherAvailableInsurers.length > 0
+      ? ` Nearby results list other insurers like ${otherAvailableInsurers.slice(0, 3).join(", ")}.`
+      : "";
   const text =
     hasFacilities
       ? usedFallback
-        ? `I couldn't find a direct match for ${searchLabel}. I'm showing ${facilities.length} nearby ${facilityLabel} near ZIP ${nextState.zip} instead.`
+        ? `I couldn't find a direct match for ${searchLabel}. I'm showing ${facilities.length} nearby ${facilityLabel} near ZIP ${nextState.zip} instead.${otherInsurersText}`
         : nextState.insurance && insuranceMatches > 0
           ? `Found ${facilities.length} nearby price option${facilities.length === 1 ? "" : "s"} for ${nextState.serviceQuery}. ${insuranceMatches} result${insuranceMatches === 1 ? "" : "s"} appear to match ${nextState.insurance}.`
           : nextState.insurance
-            ? `Found ${facilities.length} nearby price option${facilities.length === 1 ? "" : "s"} for ${nextState.serviceQuery}. I didn't find a clear ${nextState.insurance} match, so I'm showing the nearby facilities for the procedure.`
+            ? `Found ${facilities.length} nearby price option${facilities.length === 1 ? "" : "s"} for ${nextState.serviceQuery}. I didn't find a clear ${nextState.insurance} match, so I'm showing the nearby facilities for the procedure.${otherInsurersText}`
             : prices.length > 0
               ? `Found ${facilities.length} nearby price option${facilities.length === 1 ? "" : "s"} for ${nextState.serviceQuery}.`
               : `I found ${facilities.length} possible match${facilities.length === 1 ? "" : "es"} for ${nextState.serviceQuery}, but pricing is estimated or unavailable.`
@@ -475,26 +495,28 @@ export async function POST(request: Request) {
       ...userCoords,
       zipcode: nextState.zip,
     },
-    facilities: facilities.slice(0, 5).map((facility) => ({
-      list_index: facility.list_index,
-      facility_key: facility.facility_key,
-      name: facility.name,
-      latitude: facility.latitude,
+      facilities: facilities.slice(0, 5).map((facility) => ({
+        list_index: facility.list_index,
+        facility_key: facility.facility_key,
+        name: facility.name,
+        latitude: facility.latitude,
       longitude: facility.longitude,
       address: facility.address,
-      price: facility.price,
-      estimated_range: facility.estimated_range,
-      website_url: facility.website_url,
-      insurance_match: facility.insurance_match,
-      matching_insurers: facility.matching_insurers,
-    })),
-    google_maps_url: `https://www.google.com/maps/search/${encodeURIComponent(nextState.zip)}`,
-    procedure_code: nextState.cptCode || undefined,
-    procedure_display_name: nextState.serviceQuery,
+        price: facility.price,
+        estimated_range: facility.estimated_range,
+        website_url: facility.website_url,
+        insurance_match: facility.insurance_match,
+        insurance_provider_name: facility.insurance_provider_name,
+        matching_insurers: facility.matching_insurers,
+      })),
+      google_maps_url: `https://www.google.com/maps/search/${encodeURIComponent(nextState.zip)}`,
+      procedure_code: nextState.cptCode || undefined,
+      procedure_display_name: nextState.serviceQuery,
     procedure_explanation:
       String(docs.rows[0]?.["Description of Service"] || docs.rows[0]?.billing_code_name || "").trim() ||
       undefined,
     service_query: nextState.serviceQuery,
+    searched_insurance: nextState.insurance || undefined,
     ai_powered: true,
     web_sourced: false,
     pricing_source: "database",
@@ -516,6 +538,7 @@ export async function POST(request: Request) {
         service_query: nextState.serviceQuery,
         zip: nextState.zip,
         insurance: nextState.insurance || undefined,
+        searched_insurance: nextState.insurance || undefined,
         ai_powered: true,
         web_sourced: false,
         pricing_source: "database",

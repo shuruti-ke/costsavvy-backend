@@ -26,6 +26,7 @@ interface Facility {
   website_url: string | null;
   insurance_match?: boolean;
   matching_insurers?: string[];
+  insurance_provider_name?: string | null;
 }
 
 interface MapData {
@@ -43,6 +44,7 @@ interface MapData {
     website_url: string | null;
     insurance_match?: boolean;
     matching_insurers?: string[];
+    insurance_provider_name?: string | null;
   }>;
   google_maps_url?: string;
   procedure_code?: string;
@@ -52,6 +54,7 @@ interface MapData {
   ai_powered?: boolean;
   web_sourced?: boolean;
   pricing_source?: string;
+  searched_insurance?: string;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -66,7 +69,10 @@ function normalizeAddress(s: string): string {
 }
 
 function getCptPlainLanguageExplanation(code: string, fallback?: string) {
-  const normalizedCode = code.trim();
+  const normalizedCode = (code.match(/\b\d{5}\b/) || [code.trim()])[0].trim();
+  if (normalizedCode === "71046") {
+    return "a chest x-ray with two views, usually taken from different angles";
+  }
   if (normalizedCode === "77385") {
     return "a focused radiation treatment that shapes the beam to the tumor while trying to spare healthy tissue";
   }
@@ -106,6 +112,7 @@ export default function PriceSearch() {
   const [sortBy, setSortBy] = useState<"price" | "distance">("price");
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
   const [resultsTitle, setResultsTitle] = useState("");
+  const [searchedInsurance, setSearchedInsurance] = useState("");
   const [priceRange, setPriceRange] = useState<{ min: number; max: number } | null>(null);
   const [estimatesOnly, setEstimatesOnly] = useState(false);
 
@@ -224,29 +231,19 @@ export default function PriceSearch() {
     setMapData(md);
     setFacilities(fs);
     setSelectedIdx(null);
-    const cpt = String(state.code || md.procedure_code || "").trim();
-    const proc = String(state.procedure_display_name || md.procedure_display_name || "").trim();
+    setSearchedInsurance(String(state.insurance || "").trim());
+    const cptSource = String(state.code || md.procedure_code || "").trim();
+    const cpt = (cptSource.match(/\b\d{5}\b/) || [cptSource])[0].trim();
     const explanationSource = String(
       state.procedure_explanation || md.procedure_explanation || ""
     ).trim();
     const explanation = getCptPlainLanguageExplanation(cpt, explanationSource);
-    const parts: string[] = [];
-    const addPart = (value: string) => {
-      const normalized = value.trim().replace(/\s+/g, " ");
-      if (!normalized) return;
-      if (!parts.some((part) => part.toLowerCase() === normalized.toLowerCase())) {
-        parts.push(normalized);
-      }
-    };
-
-    addPart(proc);
-    if (!proc) addPart(serviceQuery || "");
-    if (!parts.length && md.service_query) addPart(String(md.service_query));
-    if (cpt && !parts.some((part) => part.includes(cpt))) {
-      addPart(`CPT code ${cpt}`);
-    }
-
-    const title = explanation ? `${parts.join(", ")} (${explanation})` : parts.join(", ");
+    const serviceLabel = String(serviceQuery || md.service_query || state.procedure_display_name || "").trim();
+    const title = cpt
+      ? explanation
+        ? `CPT code ${cpt} (${explanation})`
+        : `CPT code ${cpt}`
+      : serviceLabel || String(state.procedure_display_name || md.procedure_display_name || "").trim();
     setResultsTitle(title);
     const prices = fs.map(f => f.price).filter((p): p is number => p != null);
     if (prices.length > 0) { setPriceRange({ min: Math.min(...prices), max: Math.max(...prices) }); setEstimatesOnly(false); }
@@ -273,7 +270,7 @@ export default function PriceSearch() {
         : "AI-assisted search";
 
   // ── Map markers synced to sorted list ─────────────────────────────────
-  const mapFacilities = mapData ? { ...mapData, facilities: sorted.slice(0, 5).filter(f => f.latitude && f.longitude).map((f, i) => ({ list_index: i + 1, facility_key: f.facility_key, name: f.hospital_name, latitude: f.latitude!, longitude: f.longitude!, address: normalizeAddress(f.address || ""), price: f.price, estimated_range: f.estimated_range, website_url: f.website_url, insurance_match: f.insurance_match, matching_insurers: f.matching_insurers })) } : null;
+  const mapFacilities = mapData ? { ...mapData, facilities: sorted.slice(0, 5).filter(f => f.latitude && f.longitude).map((f, i) => ({ list_index: i + 1, facility_key: f.facility_key, name: f.hospital_name, latitude: f.latitude!, longitude: f.longitude!, address: normalizeAddress(f.address || ""), price: f.price, estimated_range: f.estimated_range, website_url: f.website_url, insurance_match: f.insurance_match, matching_insurers: f.matching_insurers, insurance_provider_name: f.insurance_provider_name })) } : null;
 
   const QUICK_ACTIONS = ["How much does an MRI cost?", "Find X-ray prices near 10001", "How much does a CT scan cost?", "Colonoscopy prices near me"];
 
@@ -371,9 +368,6 @@ export default function PriceSearch() {
                   {pricingSourceLabel}
                 </span>
               </div>
-              <p className="text-xs text-gray-500">
-                Results are pulled from Brave-powered web search pages and ranked with AI. When Brave can’t verify a price, the app falls back to the database and labels it here.
-              </p>
             </div>
             <div className="flex items-center gap-4 text-sm text-gray-500">
               {priceRange ? (
@@ -418,12 +412,23 @@ export default function PriceSearch() {
                     ? matchingInsurers.length === 1
                       ? matchingInsurers[0]
                       : matchingInsurers.join(", ")
-                    : "";
+                    : String(f.insurance_provider_name || "").trim();
+                  const displayInsurerLabel =
+                    searchedInsurance && insurerLabel && insurerLabel.toLowerCase() === searchedInsurance.toLowerCase()
+                      ? ""
+                      : insurerLabel;
+                  const nearbyInsuranceLabel = searchedInsurance
+                    ? displayInsurerLabel
+                      ? `Nearby match: no ${searchedInsurance} match; shown with ${displayInsurerLabel}`
+                      : `Nearby match: no ${searchedInsurance} match`
+                    : displayInsurerLabel
+                      ? `Nearby match: ${displayInsurerLabel}`
+                      : "Nearby match";
                   const insuranceBadge = f.insurance_match
-                    ? insurerLabel
-                      ? `Insurance match: ${insurerLabel}`
+                    ? displayInsurerLabel
+                      ? `Insurance match: ${displayInsurerLabel}`
                       : "Insurance match"
-                    : "Nearby match";
+                    : nearbyInsuranceLabel;
                   let siteHtml: React.ReactNode = null;
                   try {
                     if (f.website_url) {
