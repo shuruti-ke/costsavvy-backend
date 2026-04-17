@@ -356,6 +356,7 @@ export async function POST(request: Request) {
       service_query: nextState.serviceQuery,
       ai_powered: true,
       web_sourced: true,
+      pricing_source: "web",
     };
 
     const transcript = [
@@ -375,6 +376,7 @@ export async function POST(request: Request) {
           insurance: nextState.insurance || undefined,
           ai_powered: true,
           web_sourced: true,
+          pricing_source: "web",
         },
       })}`,
       `data: ${JSON.stringify({ type: "final", text })}`,
@@ -483,6 +485,8 @@ export async function POST(request: Request) {
       undefined,
     service_query: nextState.serviceQuery,
     ai_powered: true,
+    web_sourced: false,
+    pricing_source: "database",
   };
 
   const transcript = [
@@ -502,6 +506,8 @@ export async function POST(request: Request) {
         zip: nextState.zip,
         insurance: nextState.insurance || undefined,
         ai_powered: true,
+        web_sourced: false,
+        pricing_source: "database",
       },
     })}`,
     `data: ${JSON.stringify({ type: "final", text })}`,

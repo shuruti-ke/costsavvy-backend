@@ -48,6 +48,8 @@ interface MapData {
   procedure_explanation?: string;
   service_query?: string;
   ai_powered?: boolean;
+  web_sourced?: boolean;
+  pricing_source?: string;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -258,6 +260,13 @@ export default function PriceSearch() {
   );
 
   const minPrice = sorted.filter(f => f.price).map(f => f.price as number).reduce((m, p) => Math.min(m, p), Infinity);
+  const pricingSource = String(mapData?.pricing_source || (mapData?.web_sourced ? "web" : "database")).toLowerCase();
+  const pricingSourceLabel =
+    pricingSource === "web"
+      ? "Brave web search"
+      : pricingSource === "database"
+        ? "Database fallback"
+        : "AI-assisted search";
 
   // ── Map markers synced to sorted list ─────────────────────────────────
   const mapFacilities = mapData ? { ...mapData, facilities: sorted.slice(0, 5).filter(f => f.latitude && f.longitude).map((f, i) => ({ list_index: i + 1, facility_key: f.facility_key, name: f.hospital_name, latitude: f.latitude!, longitude: f.longitude!, address: normalizeAddress(f.address || ""), price: f.price, estimated_range: f.estimated_range, website_url: f.website_url, insurance_match: f.insurance_match })) } : null;
@@ -354,9 +363,12 @@ export default function PriceSearch() {
                 <span className="inline-flex items-center rounded-full border border-[#f5d0e6] bg-[#fdf2f8] px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#6b2458]">
                   AI-powered web search
                 </span>
+                <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] ${pricingSource === "web" ? "border border-emerald-200 bg-emerald-50 text-emerald-700" : "border border-slate-200 bg-slate-50 text-slate-700"}`}>
+                  {pricingSourceLabel}
+                </span>
               </div>
               <p className="text-xs text-gray-500">
-                Results are pulled from Brave-powered web search pages and ranked with AI. The database is only a fallback when no web price can be verified.
+                Results are pulled from Brave-powered web search pages and ranked with AI. When Brave can’t verify a price, the app falls back to the database and labels it here.
               </p>
             </div>
             <div className="flex items-center gap-4 text-sm text-gray-500">

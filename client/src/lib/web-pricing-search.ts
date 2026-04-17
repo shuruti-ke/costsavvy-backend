@@ -1,4 +1,5 @@
 import { z } from "zod";
+import * as cheerio from "cheerio";
 import { callNemotron } from "@/lib/nemotron";
 
 type WebSearchInput = {
@@ -50,8 +51,117 @@ type BraveResult = {
   extraSnippets: string[];
 };
 
+type BravePageDocument = BraveResult & {
+  finalUrl: string;
+  contentType: string | null;
+  pageText: string;
+};
+
 function normalizeText(value: unknown) {
   return String(value || "").trim();
+}
+
+function normalizeWhitespace(value: string) {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function clipText(value: string, maxLength = 12000) {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength)}\n...[truncated]`;
+}
+
+function extractPricingExcerpts(text: string) {
+  const lines = text
+    .split(/\n+/)
+    .map((line) => normalizeWhitespace(line))
+    .filter(Boolean);
+  const priceLine = /(\$[\s0-9,]+|\b(price|cost|charge|estimate|estimated|amount|cash|self-pay|negotiated|fee)\b)/i;
+  return clipText(lines.filter((line) => priceLine.test(line)).slice(0, 40).join("\n"), 6000);
+}
+
+function extractVisibleHtmlText(html: string) {
+  const $ = cheerio.load(html);
+  $("script,style,noscript,svg,iframe,header,footer,nav,form,button").remove();
+
+  const title = normalizeWhitespace($("title").first().text());
+  const description =
+    normalizeWhitespace($('meta[name="description"]').attr("content") || "") ||
+    normalizeWhitespace($('meta[property="og:description"]').attr("content") || "");
+
+  const tableRows: string[] = [];
+  $("table")
+    .slice(0, 10)
+    .each((_, table) => {
+      $(table)
+        .find("tr")
+        .slice(0, 80)
+        .each((__, tr) => {
+          const rowText = normalizeWhitespace($(tr).text());
+          if (rowText) {
+            tableRows.push(rowText);
+          }
+        });
+    });
+
+  const bodyText = normalizeWhitespace($("body").text());
+  return clipText([title, description, ...tableRows, bodyText].filter(Boolean).join("\n\n"));
+}
+
+async function fetchBravePageDocument(result: BraveResult) {
+  if (!result.url) return null;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  try {
+    const response = await fetch(result.url, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        Accept: "text/html,application/pdf;q=0.9,*/*;q=0.8",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      },
+    });
+
+    if (!response.ok) return null;
+
+    const contentType = response.headers.get("content-type") || null;
+    const finalUrl = response.url || result.url;
+
+    if (contentType?.includes("pdf") || finalUrl.toLowerCase().endsWith(".pdf")) {
+      const buffer = Buffer.from(await response.arrayBuffer());
+      const pdfParseModule = await import("pdf-parse");
+      const pdfParse =
+        (pdfParseModule as unknown as {
+          default?: (data: Buffer) => Promise<{ text: string }>;
+        }).default || (pdfParseModule as unknown as (data: Buffer) => Promise<{ text: string }>);
+      const parsed = await pdfParse(buffer);
+      const pageText = clipText(normalizeWhitespace(parsed.text || ""));
+      return {
+        ...result,
+        url: result.url,
+        finalUrl,
+        contentType,
+        pageText,
+      } satisfies BravePageDocument;
+    }
+
+    const html = await response.text();
+    const pageText = extractVisibleHtmlText(html);
+    return {
+      ...result,
+      url: result.url,
+      finalUrl,
+      contentType,
+      pageText,
+    } satisfies BravePageDocument;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function extractPrice(value: string) {
@@ -131,15 +241,15 @@ function buildQueries(input: WebSearchInput) {
   return [primary, alternate, insurerQuery].filter(Boolean);
 }
 
-function toCandidateMap(results: BraveResult[], input: WebSearchInput) {
+function toCandidateMap(results: BravePageDocument[], input: WebSearchInput) {
   const candidates = results
     .map((result) => {
-      const combinedText = [result.title, result.description, ...result.extraSnippets].filter(Boolean).join(" ");
+      const combinedText = [result.title, result.description, result.pageText, ...result.extraSnippets].filter(Boolean).join(" ");
       const price = extractPrice(combinedText);
       if (price == null) return null;
       const host = (() => {
         try {
-          return new URL(result.url).hostname.replace(/^www\./, "");
+          return new URL(result.finalUrl || result.url).hostname.replace(/^www\./, "");
         } catch {
           return "";
         }
@@ -151,9 +261,9 @@ function toCandidateMap(results: BraveResult[], input: WebSearchInput) {
         city: null,
         state: null,
         zipcode: input.zip || null,
-        websiteUrl: result.url || null,
+        websiteUrl: result.finalUrl || result.url || null,
         sourceTitle: result.title || null,
-        sourceSnippet: result.description || null,
+        sourceSnippet: result.pageText || result.description || null,
         price,
         insuranceMatch: Boolean(
           input.insurance &&
@@ -188,7 +298,17 @@ export async function searchWebPricing(input: WebSearchInput) {
     return { results: [] as WebPriceCandidate[], sources: [] as BraveResult[] };
   }
 
-  const rawCandidates = toCandidateMap(braveResults, input).slice(0, 10);
+  const bravePageDocuments = (
+    await Promise.all(
+      braveResults.slice(0, 8).map(async (result) => fetchBravePageDocument(result))
+    )
+  ).filter(Boolean) as BravePageDocument[];
+
+  if (!bravePageDocuments.length) {
+    return { results: [] as WebPriceCandidate[], sources: braveResults };
+  }
+
+  const rawCandidates = toCandidateMap(bravePageDocuments, input).slice(0, 10);
   if (!rawCandidates.length) {
     return { results: [] as WebPriceCandidate[], sources: braveResults };
   }
@@ -199,15 +319,13 @@ export async function searchWebPricing(input: WebSearchInput) {
     zip: input.zip || "",
     insurance: input.insurance || "",
     instructions:
-      "Only return items that explicitly show a price in the search result text. Do not invent hospitals, prices, or addresses. Prefer the strongest direct match to the service and ZIP.",
-    candidates: rawCandidates.map((candidate) => ({
-      hospitalName: candidate.hospitalName,
-      websiteUrl: candidate.websiteUrl,
-      sourceTitle: candidate.sourceTitle,
-      sourceSnippet: candidate.sourceSnippet,
-      price: candidate.price,
-      insuranceMatch: candidate.insuranceMatch,
-      confidence: candidate.confidence,
+      "Only return items that explicitly show a price in the opened page content, PDF text, or table rows. Do not invent hospitals, prices, or addresses. Prefer the strongest direct match to the service and ZIP.",
+    pages: bravePageDocuments.map((page) => ({
+      title: page.title,
+      url: page.finalUrl || page.url,
+      sourceName: page.sourceName,
+      description: page.description,
+      pageText: extractPricingExcerpts(page.pageText),
     })),
   };
 
@@ -233,20 +351,20 @@ export async function searchWebPricing(input: WebSearchInput) {
       const parsed = AI_RESPONSE_SCHEMA.parse(JSON.parse(cleaned));
       return {
         results: parsed.results
-          .filter((entry) => entry.price != null)
-          .map((entry) => ({
-            hospitalName: entry.hospitalName,
-            address: entry.address,
-            city: entry.city,
-            state: entry.state,
-            zipcode: entry.zipcode,
-            websiteUrl: entry.websiteUrl,
-            sourceTitle: entry.sourceTitle,
-            sourceSnippet: entry.sourceSnippet,
-            price: entry.price,
-            insuranceMatch: entry.insuranceMatch,
-            confidence: entry.confidence,
-          })) as WebPriceCandidate[],
+        .filter((entry) => entry.price != null)
+        .map((entry) => ({
+          hospitalName: entry.hospitalName,
+          address: entry.address,
+          city: entry.city,
+          state: entry.state,
+          zipcode: entry.zipcode,
+          websiteUrl: entry.websiteUrl,
+          sourceTitle: entry.sourceTitle,
+          sourceSnippet: entry.sourceSnippet,
+          price: entry.price,
+          insuranceMatch: entry.insuranceMatch,
+          confidence: entry.confidence,
+        })) as WebPriceCandidate[],
         sources: braveResults,
       };
     }
@@ -259,4 +377,3 @@ export async function searchWebPricing(input: WebSearchInput) {
     sources: braveResults,
   };
 }
-
