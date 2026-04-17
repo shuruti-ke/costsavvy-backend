@@ -70,6 +70,27 @@ function clipText(value: string, maxLength = 12000) {
   return `${value.slice(0, maxLength)}\n...[truncated]`;
 }
 
+function extractPdfLinks(html: string, baseUrl: string) {
+  try {
+    const $ = cheerio.load(html);
+    const links = new Set<string>();
+    $("a[href]").each((_, el) => {
+      const href = normalizeText($(el).attr("href"));
+      if (!href) return;
+      const isPdf = /\.pdf([?#].*)?$/i.test(href) || /pdf/i.test($(el).text());
+      if (!isPdf) return;
+      try {
+        links.add(new URL(href, baseUrl).toString());
+      } catch {
+        // ignore invalid URLs
+      }
+    });
+    return Array.from(links).slice(0, 2);
+  } catch {
+    return [];
+  }
+}
+
 function extractPricingExcerpts(text: string) {
   const lines = text
     .split(/\n+/)
@@ -103,11 +124,27 @@ function extractVisibleHtmlText(html: string) {
         });
     });
 
+  const structuredSnippets: string[] = [];
+  $("script")
+    .slice(0, 8)
+    .each((_, script) => {
+      const type = normalizeText($(script).attr("type")).toLowerCase();
+      const scriptText = normalizeWhitespace($(script).text());
+      const shouldCapture =
+        type.includes("ld+json") ||
+        type.includes("json") ||
+        scriptText.includes("price") ||
+        scriptText.includes("cost") ||
+        scriptText.includes("charge");
+      if (!shouldCapture || !scriptText) return;
+      structuredSnippets.push(clipText(scriptText, 3000));
+    });
+
   const bodyText = normalizeWhitespace($("body").text());
-  return clipText([title, description, ...tableRows, bodyText].filter(Boolean).join("\n\n"));
+  return clipText([title, description, ...tableRows, ...structuredSnippets, bodyText].filter(Boolean).join("\n\n"));
 }
 
-async function fetchBravePageDocument(result: BraveResult) {
+async function fetchBravePageDocument(result: BraveResult, depth = 0) {
   if (!result.url) return null;
 
   const controller = new AbortController();
@@ -149,13 +186,32 @@ async function fetchBravePageDocument(result: BraveResult) {
     }
 
     const html = await response.text();
+    const linkedPdfTexts: string[] = [];
+    if (depth < 1) {
+      const linkedPdfs = extractPdfLinks(html, finalUrl);
+      for (const pdfUrl of linkedPdfs) {
+        const linked = await fetchBravePageDocument(
+          {
+            title: `${result.title} PDF`,
+            url: pdfUrl,
+            description: result.description,
+            sourceName: result.sourceName,
+            extraSnippets: [],
+          },
+          depth + 1
+        );
+        if (linked?.pageText) {
+          linkedPdfTexts.push(`PDF from ${linked.finalUrl || pdfUrl}\n${linked.pageText}`);
+        }
+      }
+    }
     const pageText = extractVisibleHtmlText(html);
     return {
       ...result,
       url: result.url,
       finalUrl,
       contentType,
-      pageText,
+      pageText: clipText([pageText, ...linkedPdfTexts].filter(Boolean).join("\n\n")),
     } satisfies BravePageDocument;
   } catch {
     return null;
@@ -229,24 +285,32 @@ async function searchBrave(query: string) {
 }
 
 function buildQueries(input: WebSearchInput) {
-  const primary = input.cptCode
-    ? `${input.cptCode} ${input.serviceQuery} price transparency ${input.zip || ""} ${input.insurance || ""}`.trim()
-    : `${input.serviceQuery} price transparency ${input.zip || ""} ${input.insurance || ""}`.trim();
-  const alternate = input.cptCode
-    ? `${input.cptCode} hospital price ${input.zip || ""} ${input.insurance || ""}`.trim()
-    : `${input.serviceQuery} hospital price ${input.zip || ""} ${input.insurance || ""}`.trim();
-  const insurerQuery = input.insurance
-    ? `${input.serviceQuery} ${input.insurance} price transparency ${input.zip || ""}`.trim()
-    : "";
-  return [primary, alternate, insurerQuery].filter(Boolean);
+  const base = input.cptCode ? `${input.cptCode} ${input.serviceQuery}`.trim() : input.serviceQuery;
+  const zipPart = input.zip ? ` ${input.zip}` : "";
+  const insurerPart = input.insurance ? ` ${input.insurance}` : "";
+
+  const queries = [
+    `${base} price transparency${zipPart}${insurerPart}`,
+    `${base} fee schedule${zipPart}${insurerPart}`,
+    `${base} chargemaster${zipPart}${insurerPart}`,
+    `${base} shoppable services${zipPart}${insurerPart}`,
+    `${base} hospital price${zipPart}${insurerPart}`,
+    `${base} PDF${zipPart}${insurerPart}`,
+    `${base} standard charges${zipPart}${insurerPart}`,
+  ];
+
+  if (input.insurance) {
+    queries.push(`${base} ${input.insurance} contracted rate${zipPart}`.trim());
+  }
+
+  return Array.from(new Set(queries.map((query) => query.trim()).filter(Boolean)));
 }
 
-function toCandidateMap(results: BravePageDocument[], input: WebSearchInput) {
+function toCandidateMap(results: BravePageDocument[], input: WebSearchInput, options: { allowNoPrice?: boolean } = {}) {
   const candidates = results
     .map((result) => {
       const combinedText = [result.title, result.description, result.pageText, ...result.extraSnippets].filter(Boolean).join(" ");
       const price = extractPrice(combinedText);
-      if (price == null) return null;
       const host = (() => {
         try {
           return new URL(result.finalUrl || result.url).hostname.replace(/^www\./, "");
@@ -254,6 +318,8 @@ function toCandidateMap(results: BravePageDocument[], input: WebSearchInput) {
           return "";
         }
       })();
+      const confidence = price != null ? (result.description ? 0.72 : 0.6) : 0.35;
+      if (price == null && !options.allowNoPrice) return null;
 
       return {
         hospitalName: result.sourceName || result.title || host || input.serviceQuery,
@@ -269,7 +335,7 @@ function toCandidateMap(results: BravePageDocument[], input: WebSearchInput) {
           input.insurance &&
             combinedText.toLowerCase().includes(input.insurance.toLowerCase())
         ),
-        confidence: result.description ? 0.72 : 0.6,
+        confidence,
       } satisfies WebPriceCandidate;
     })
     .filter(Boolean) as WebPriceCandidate[];
@@ -310,7 +376,15 @@ export async function searchWebPricing(input: WebSearchInput) {
 
   const rawCandidates = toCandidateMap(bravePageDocuments, input).slice(0, 10);
   if (!rawCandidates.length) {
-    return { results: [] as WebPriceCandidate[], sources: braveResults };
+    const fallbackCandidates = toCandidateMap(bravePageDocuments, input, { allowNoPrice: true }).slice(0, 10);
+    return {
+      results: fallbackCandidates.map((candidate) => ({
+        ...candidate,
+        price: candidate.price,
+        confidence: 0.35,
+      })) as WebPriceCandidate[],
+      sources: braveResults,
+    };
   }
 
   const aiPrompt = {

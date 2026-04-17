@@ -80,7 +80,7 @@ async function buildWebRows(
         provider_state: candidate.state || hospital?.state || "",
         negotiated_rate: candidate.price,
         "Description of Service": candidate.sourceSnippet || candidate.sourceTitle || searchCare,
-        price_source: "web_search",
+        price_source: candidate.price != null ? "web_search" : "web_candidate",
         web_price: candidate.price,
         insurance_match: candidate.insuranceMatch,
         website_url: candidate.websiteUrl,
@@ -113,6 +113,7 @@ export async function GET(request: Request) {
 
   if (webSearch.results.length > 0) {
     const webRows = await buildWebRows(webSearch.results, searchCare, zipCode, cptCode);
+    const hasVerifiedWebPrices = webSearch.results.some((candidate) => candidate.price != null);
     await recordSearchLearning({
       source: "search",
       message: [searchCare, zipCode, insurance, "web"].filter(Boolean).join(" | "),
@@ -131,7 +132,7 @@ export async function GET(request: Request) {
         total: webRows.length,
         page,
         limit,
-        source: "web",
+        source: hasVerifiedWebPrices ? "web" : "web_candidate",
       },
     });
   }

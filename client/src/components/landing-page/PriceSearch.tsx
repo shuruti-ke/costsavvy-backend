@@ -266,6 +266,8 @@ export default function PriceSearch() {
   const pricingSourceLabel =
     pricingSource === "web"
       ? "Brave web search"
+      : pricingSource === "web_candidate"
+        ? "Web candidate"
       : pricingSource === "database"
         ? "Database fallback"
         : "AI-assisted search";
@@ -400,7 +402,17 @@ export default function PriceSearch() {
                   const isLow = f.price && f.price <= minPrice * 1.2;
                   const isEst = !f.price;
                   const showWeb = f.web_price != null && Number(f.web_price) > 0;
-                  const note = f.price ? (f.price_source === "web_search" ? "Web search" : f.price_source === "db" ? "Verified" : "Verified") : "Estimate";
+                  const note = f.price
+                    ? (f.price_source === "web_search"
+                        ? "Web search"
+                        : f.price_source === "web_candidate"
+                          ? "Web candidate"
+                          : f.price_source === "db"
+                            ? "Verified"
+                            : "Verified")
+                    : f.price_source === "web_candidate"
+                      ? "Web candidate"
+                      : "Estimate";
                   const matchingInsurers = Array.from(new Set((f.matching_insurers || []).map((insurer) => insurer.trim()).filter(Boolean)));
                   const insurerLabel = matchingInsurers.length > 0
                     ? matchingInsurers.length === 1

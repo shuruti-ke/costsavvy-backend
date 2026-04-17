@@ -116,8 +116,8 @@ async function buildWebFacilities(candidates: WebPriceCandidate[], nextState: Se
           : null,
         phone: null,
         web_price: candidate.price,
-        price_is_estimate: false,
-        price_source: "web_search",
+        price_is_estimate: candidate.price == null,
+        price_source: candidate.price != null ? "web_search" : "web_candidate",
         hospital_name: name,
         insurance_match: candidate.insuranceMatch,
         matching_insurers:
@@ -293,13 +293,16 @@ export async function POST(request: Request) {
   if (webSearch.results.length > 0) {
     const facilities = await buildWebFacilities(webSearch.results, nextState);
     const insuranceMatches = facilities.filter((f) => f.insurance_match).length;
+    const hasVerifiedWebPrices = webSearch.results.some((candidate) => candidate.price != null);
     const searchLabel = nextState.cptCode ? `CPT code ${nextState.cptCode}` : nextState.serviceQuery;
     const text =
-      nextState.insurance && insuranceMatches > 0
-        ? `Found ${facilities.length} web-sourced price option${facilities.length === 1 ? "" : "s"} for ${searchLabel}. ${insuranceMatches} result${insuranceMatches === 1 ? "" : "s"} appear to match ${nextState.insurance}.`
-        : nextState.insurance
-          ? `Found ${facilities.length} web-sourced price option${facilities.length === 1 ? "" : "s"} for ${searchLabel}. I didn't find a clear ${nextState.insurance} match, so I'm showing the web search results that list a price.`
-          : `Found ${facilities.length} web-sourced price option${facilities.length === 1 ? "" : "s"} for ${searchLabel}.`;
+      hasVerifiedWebPrices
+        ? nextState.insurance && insuranceMatches > 0
+          ? `Found ${facilities.length} web-sourced price option${facilities.length === 1 ? "" : "s"} for ${searchLabel}. ${insuranceMatches} result${insuranceMatches === 1 ? "" : "s"} appear to match ${nextState.insurance}.`
+          : nextState.insurance
+            ? `Found ${facilities.length} web-sourced price option${facilities.length === 1 ? "" : "s"} for ${searchLabel}. I didn't find a clear ${nextState.insurance} match, so I'm showing the web search results that list a price.`
+            : `Found ${facilities.length} web-sourced price option${facilities.length === 1 ? "" : "s"} for ${searchLabel}.`
+        : `Found ${facilities.length} web candidate page${facilities.length === 1 ? "" : "s"} for ${searchLabel}. I couldn't verify a price directly on the page${facilities.length === 1 ? "" : "s"} yet, so I'm showing the closest web matches before falling back to the database.`;
 
     await recordSearchLearning({
       source: "chat",
@@ -359,7 +362,7 @@ export async function POST(request: Request) {
       service_query: nextState.serviceQuery,
       ai_powered: true,
       web_sourced: true,
-      pricing_source: "web",
+      pricing_source: hasVerifiedWebPrices ? "web" : "web_candidate",
     };
 
     const transcript = [
@@ -379,7 +382,7 @@ export async function POST(request: Request) {
           insurance: nextState.insurance || undefined,
           ai_powered: true,
           web_sourced: true,
-          pricing_source: "web",
+          pricing_source: hasVerifiedWebPrices ? "web" : "web_candidate",
         },
       })}`,
       `data: ${JSON.stringify({ type: "final", text })}`,
