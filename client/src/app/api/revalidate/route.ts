@@ -14,6 +14,9 @@ export async function POST(request: Request) {
     )
   }
   await revalidatePath("/blog")
+  await revalidatePath("/blog/article/[slug]", "page")
+  await revalidatePath("/blog/mainCard/[slug]", "page")
+  await revalidatePath("/blog/other/[slug]", "page")
 
   return NextResponse.json({ revalidated: true })
 }

@@ -8,6 +8,8 @@ import BlogNav from "@/components/blog/blog-nav";
 import BlogHero from "@/components/blog/blog-hero";
 import { Metadata } from "next";
 
+export const revalidate = 60;
+
 interface Authors {
   name: string;
   image: string;
