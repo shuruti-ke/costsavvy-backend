@@ -1,9 +1,49 @@
 import { Metadata } from "next";
 import { generateMetadataTemplate } from "@/lib/metadata";
 import { getProviderById } from "@/api/sanity/queries";
+import { getHospitalDirectoryById } from "@/lib/hospital-directory";
 import Link from "next/link";
 import ProviderMap from "@/components/providers/provider-map";
 import ShareButton from '@/components/providers/share-button';
+
+function parseNumericId(value: string) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+async function getProviderRecord(id: string) {
+  const hospitalId = parseNumericId(id);
+  if (hospitalId) {
+    const hospital = await getHospitalDirectoryById(hospitalId);
+    if (hospital && hospital.directoryType === "provider") {
+      return {
+        id: hospital.id,
+        name: hospital.name,
+        isVerified: hospital.isVerified,
+        address: {
+          street: hospital.address || "",
+          city: hospital.city || "",
+          state: hospital.state || "",
+          zip: hospital.zipcode || "",
+        },
+        phone: hospital.phone,
+        medicareProviderId: hospital.cmsProviderId,
+        npi: hospital.npi,
+        website: hospital.website,
+        providerType: hospital.facilityType || "Healthcare provider",
+        ownership: hospital.ownership,
+        beds: hospital.bedCount,
+        nearbyProviders: hospital.nearbyHospitals || [],
+        clinicalServices: hospital.clinicalServices || [],
+        googleMapsUrl: hospital.googleMapsUrl,
+        latitude: hospital.latitude,
+        longitude: hospital.longitude,
+      };
+    }
+  }
+
+  return getProviderById(id);
+}
 
 export async function generateMetadata({
   params,
@@ -13,7 +53,7 @@ export async function generateMetadata({
   searchParams: Promise<Record<string, string | string[]>>;
 }): Promise<Metadata> {
   const resolvedParams = await params;
-  const provider = await getProviderById(resolvedParams.id);
+  const provider = await getProviderRecord(resolvedParams.id);
 
   if (!provider) {
     return generateMetadataTemplate({ title: "Provider Not Found" });
@@ -49,7 +89,9 @@ export default async function ProviderPage({
   searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
 }) {
   const { id } = await params;
-  const provider = await getProviderById(id);
+  const provider = await getProviderRecord(id);
+  const parsedZip = Number.parseInt(provider?.address?.zip || "", 10);
+  const providerZipCodes = Number.isFinite(parsedZip) ? [parsedZip] : [];
 
   if (!provider) {
     return (
@@ -112,20 +154,32 @@ export default async function ProviderPage({
                 {provider.address.city}, {provider.address.state},{" "}
                 {provider.address.zip}
               </p>
-              <button className="text-sm font-semibold text-[#6B1548]  mt-1">
-                Get Directions
-              </button>
+              {provider.googleMapsUrl ? (
+                <Link
+                  href={provider.googleMapsUrl}
+                  target="_blank"
+                  className="text-sm font-semibold text-[#6B1548] mt-1 inline-block"
+                >
+                  Get Directions
+                </Link>
+              ) : (
+                <button className="text-sm font-semibold text-[#6B1548]  mt-1">
+                  Get Directions
+                </button>
+              )}
             </div>
 
             {/* Map Component */}
             <div className="bg-gray-200 h-44 mb-4 rounded-lg flex items-center justify-center">
               <div className="w-full h-full rounded-lg overflow-hidden">
                 <ProviderMap
-                  zipCodes={[
-                    parseInt(provider.address.zip.charAt(0)) * 10000,
-                    parseInt(provider.address.zip.charAt(0)) * 10000 + 9999,
-                  ]}
+                  zipCodes={providerZipCodes}
                   names={provider.nearbyProviders}
+                  coordinates={
+                    provider.latitude != null && provider.longitude != null
+                      ? [{ lat: provider.latitude, lng: provider.longitude, name: provider.name }]
+                      : undefined
+                  }
                 />
               </div>
             </div>
@@ -243,11 +297,13 @@ export default async function ProviderPage({
               <div className="flex w-full md:w-[60%] gap-5 flex-col">
                 <div className="rounded-lg overflow-hidden">
                   <ProviderMap
-                    zipCodes={[
-                      parseInt(provider.address.zip.charAt(0)) * 10000,
-                      parseInt(provider.address.zip.charAt(0)) * 10000 + 9999,
-                    ]}
+                    zipCodes={providerZipCodes}
                     names={provider.nearbyProviders}
+                    coordinates={
+                      provider.latitude != null && provider.longitude != null
+                        ? [{ lat: provider.latitude, lng: provider.longitude, name: provider.name }]
+                        : undefined
+                    }
                   />
                 </div>
                 {provider.nearbyProviders?.length > 0 && (
