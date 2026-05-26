@@ -1,42 +1,29 @@
 const cache = new Map<string, { latitude: number; longitude: number } | null>();
 
+const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+
+async function googleGeocode(query: string): Promise<{ latitude: number; longitude: number } | null> {
+  if (!GOOGLE_API_KEY) return null;
+  try {
+    const res = await fetch(
+      `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(query)}&key=${GOOGLE_API_KEY}`
+    );
+    const data = await res.json();
+    if (data.status !== "OK" || !data.results?.length) return null;
+    const { lat, lng } = data.results[0].geometry.location;
+    return { latitude: lat, longitude: lng };
+  } catch {
+    return null;
+  }
+}
+
 export async function geocodeZip(zip: string) {
   const z = (zip || "").trim();
   if (!z) return null;
   if (cache.has(z)) return cache.get(z) || null;
-
-  try {
-    const response = await fetch(
-      `https://nominatim.openstreetmap.org/search?postalcode=${encodeURIComponent(z)}&country=US&format=json&limit=1`,
-      {
-        headers: {
-          "User-Agent": "CostSavvyHealth/1.0 (migration@costsavvy.health)",
-        },
-      }
-    );
-    if (!response.ok) {
-      cache.set(z, null);
-      return null;
-    }
-    const data = (await response.json()) as Array<{ lat: string; lon: string }>;
-    if (!Array.isArray(data) || data.length === 0) {
-      cache.set(z, null);
-      return null;
-    }
-    const coords = {
-      latitude: Number.parseFloat(data[0].lat),
-      longitude: Number.parseFloat(data[0].lon),
-    };
-    if (Number.isNaN(coords.latitude) || Number.isNaN(coords.longitude)) {
-      cache.set(z, null);
-      return null;
-    }
-    cache.set(z, coords);
-    return coords;
-  } catch {
-    cache.set(z, null);
-    return null;
-  }
+  const coords = await googleGeocode(`${z} USA`);
+  cache.set(z, coords);
+  return coords;
 }
 
 export async function geocodeAddress(parts: Array<string | null | undefined>) {
@@ -50,40 +37,7 @@ export async function geocodeAddress(parts: Array<string | null | undefined>) {
   const key = `addr:${query.toLowerCase()}`;
   if (cache.has(key)) return cache.get(key) || null;
 
-  try {
-    const response = await fetch(
-      `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&country=US&format=json&limit=1`,
-      {
-        headers: {
-          "User-Agent": "CostSavvyHealth/1.0 (migration@costsavvy.health)",
-        },
-      }
-    );
-    if (!response.ok) {
-      cache.set(key, null);
-      return null;
-    }
-
-    const data = (await response.json()) as Array<{ lat: string; lon: string }>;
-    if (!Array.isArray(data) || data.length === 0) {
-      cache.set(key, null);
-      return null;
-    }
-
-    const coords = {
-      latitude: Number.parseFloat(data[0].lat),
-      longitude: Number.parseFloat(data[0].lon),
-    };
-
-    if (Number.isNaN(coords.latitude) || Number.isNaN(coords.longitude)) {
-      cache.set(key, null);
-      return null;
-    }
-
-    cache.set(key, coords);
-    return coords;
-  } catch {
-    cache.set(key, null);
-    return null;
-  }
+  const coords = await googleGeocode(query);
+  cache.set(key, coords);
+  return coords;
 }
