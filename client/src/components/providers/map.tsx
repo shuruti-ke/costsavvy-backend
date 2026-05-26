@@ -101,7 +101,7 @@ export default function Map({ zipCodes, names = [], coordinates }: ProviderMapPr
     <GoogleMap
       mapContainerStyle={containerStyle}
       center={center}
-      zoom={15}
+      zoom={16}
       onLoad={onLoad}
       options={{
         streetViewControl: false,
