@@ -69,23 +69,23 @@ export default function Map({ zipCodes, names = [], coordinates }: ProviderMapPr
             throw new Error(`Failed to fetch location for ZIP ${zipCodes[i]}`);
           }
           const data = await res.json();
-          if (Array.isArray(data) && data.length > 0) {
-            const { lat, lon } = data[0];
+          const first = Array.isArray(data) ? data[0] : null;
+          if (first && first.lat != null && first.lon != null) {
             results.push({
-              lat: parseFloat(lat),
-              lng: parseFloat(lon),
-              name: names[i],
+              lat: parseFloat(first.lat),
+              lng: parseFloat(first.lon),
+              name: names?.[i] ?? "Provider",
             });
-          } else {
-            console.warn(`No data for ZIP ${zipCodes[i]}`);
           }
         } catch (err) {
-          console.error(`Failed to geocode ZIP ${zipCodes[i]}`, err);
-          setError(`Unable to locate some providers. Please try again later.`);
+          console.warn(`Could not geocode ZIP ${zipCodes[i]}`, err);
         }
       }
 
       setLocations(results);
+      if (results.length === 0) {
+        setError("Unable to locate this provider on the map.");
+      }
       setLoading(false);
     }
 
