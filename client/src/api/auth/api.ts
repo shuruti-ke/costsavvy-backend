@@ -3,10 +3,21 @@
 import { ContactFormValues } from "@/components/quote/quote";
 
 // Types
-interface UserData {
+export interface RegisterUserData {
   name: string;
   email: string;
   password: string;
+  phoneNumber?: string;
+  companyName?: string;
+  jobTitle?: string;
+  organizationType?: string;
+  zipCode?: string;
+  useCase?: string;
+  organizationSize?: string;
+  specialty?: string;
+  primaryGoal?: string;
+  accountType?: "business" | "consumer";
+  dashboardPath?: string;
 }
 
 interface Credentials {
@@ -20,12 +31,29 @@ interface User {
   email: string;
   role: string;
   avatar: string | null;
+  phoneNumber?: string | null;
+  companyName?: string | null;
+  jobTitle?: string | null;
+  organizationType?: string | null;
+  zipCode?: string | null;
+  useCase?: string | null;
+  organizationSize?: string | null;
+  specialty?: string | null;
+  primaryGoal?: string | null;
+  accountType?: string | null;
 }
 
 interface AuthResponse {
   success: boolean;
   token: string;
   user: User;
+}
+
+interface RegisterResponse {
+  success: boolean;
+  message: string;
+  confirmationRequired?: boolean;
+  dashboardPath?: string;
 }
 
 interface UserResponse {
@@ -37,6 +65,49 @@ interface UsersResponse {
   success: boolean;
   count: number;
   data: User[];
+}
+
+export interface SearchLearningReview {
+  id: number;
+  source: string;
+  queryText: string;
+  cptCode: string | null;
+  serviceQuery: string | null;
+  hospitalName: string | null;
+  zipCode: string | null;
+  insurer: string | null;
+  suggestedAlias: string | null;
+  suggestedHospitalName: string | null;
+  confidence: number;
+  rationale: string | null;
+  resultCount: number;
+  status: string;
+  createdAt: string;
+  reviewedAt: string | null;
+}
+
+export interface SearchLearningAlias {
+  id: number;
+  aliasType: "service" | "hospital";
+  codeType: string | null;
+  code: string | null;
+  hospitalName: string | null;
+  aliasText: string;
+  sourceQuery: string;
+  confidence: number;
+  learnedAt: string;
+}
+
+interface SearchLearningReviewsResponse {
+  success: boolean;
+  count: number;
+  data: SearchLearningReview[];
+}
+
+interface SearchLearningAliasesResponse {
+  success: boolean;
+  count: number;
+  data: SearchLearningAlias[];
 }
 
 interface ErrorResponse {
@@ -58,7 +129,7 @@ export interface ContactMessageValues {
 }
 
 // API URL
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "/api";
 
 // Global fetch options for authentication requests
 const authFetchOptions = {
@@ -108,8 +179,8 @@ const withAuth = (token: string, options: RequestInit = {}): RequestInit => {
 };
 
 // Register a new user
-export const register = async (userData: UserData): Promise<AuthResponse> => {
-  return apiRequest<AuthResponse>(
+export const register = async (userData: RegisterUserData): Promise<RegisterResponse> => {
+  return apiRequest<RegisterResponse>(
     `${API_URL}/auth/register`,
     {
       ...authFetchOptions,
@@ -191,7 +262,7 @@ export const getUserById = async (
 export const updateUser = async (
   token: string,
   userId: string,
-  userData: Partial<UserData>
+  userData: Partial<RegisterUserData>
 ): Promise<UserResponse> => {
   return apiRequest<UserResponse>(
     `${API_URL}/users/${userId}`,
@@ -263,3 +334,58 @@ export async function sendContactMessage(values: ContactMessageValues): Promise<
     return error.status || 500;
   }
 }
+
+export const getSearchLearningReviews = async (
+  token: string,
+  status: string = "pending",
+  limit = 20
+): Promise<SearchLearningReviewsResponse> => {
+  const url = `${API_URL}/search-learning/reviews?status=${encodeURIComponent(status)}&limit=${limit}`;
+  return apiRequest<SearchLearningReviewsResponse>(
+    url,
+    withAuth(token, {
+      method: "GET",
+    }),
+    "Failed to get search learning reviews"
+  );
+};
+
+export const getSearchLearningAliases = async (
+  token: string,
+  limit = 50
+): Promise<SearchLearningAliasesResponse> => {
+  const url = `${API_URL}/search-learning/aliases?limit=${limit}`;
+  return apiRequest<SearchLearningAliasesResponse>(
+    url,
+    withAuth(token, {
+      method: "GET",
+    }),
+    "Failed to get search learning aliases"
+  );
+};
+
+export const approveSearchLearningReview = async (
+  token: string,
+  reviewId: number
+): Promise<{ success: boolean; message: string }> => {
+  return apiRequest<{ success: boolean; message: string }>(
+    `${API_URL}/search-learning/reviews/${reviewId}/approve`,
+    withAuth(token, {
+      method: "POST",
+    }),
+    "Failed to approve search learning review"
+  );
+};
+
+export const rejectSearchLearningReview = async (
+  token: string,
+  reviewId: number
+): Promise<{ success: boolean; message: string }> => {
+  return apiRequest<{ success: boolean; message: string }>(
+    `${API_URL}/search-learning/reviews/${reviewId}/reject`,
+    withAuth(token, {
+      method: "POST",
+    }),
+    "Failed to reject search learning review"
+  );
+};

@@ -9,6 +9,8 @@ import BlogHero from "@/components/blog/blog-hero";
 import { Metadata } from 'next';
 import { generateMetadataTemplate } from '@/lib/metadata';
 
+export const revalidate = 60;
+
 interface Authors {
   name: string;
   image: string;

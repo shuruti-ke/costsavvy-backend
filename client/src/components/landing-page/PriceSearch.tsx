@@ -4,7 +4,7 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 import dynamic from "next/dynamic";
 import { Search, Loader2 } from "lucide-react";
 
-const API_BASE = "https://costsavvy-backend.onrender.com";
+const API_BASE = "/api";
 
 // Leaflet map loaded client-side only
 const FacilityMap = dynamic(() => import("./PriceSearchMap"), { ssr: false, loading: () => <div className="h-[400px] bg-gray-100 rounded-lg flex items-center justify-center text-gray-400">Loading map…</div> });
@@ -24,6 +24,9 @@ interface Facility {
   longitude: number | null;
   facility_key: string;
   website_url: string | null;
+  insurance_match?: boolean;
+  matching_insurers?: string[];
+  insurance_provider_name?: string | null;
 }
 
 interface MapData {
@@ -39,11 +42,20 @@ interface MapData {
     price: number | null;
     estimated_range: string | null;
     website_url: string | null;
+    price_source?: string | null;
+    insurance_match?: boolean;
+    matching_insurers?: string[];
+    insurance_provider_name?: string | null;
   }>;
   google_maps_url?: string;
   procedure_code?: string;
   procedure_display_name?: string;
+  procedure_explanation?: string;
   service_query?: string;
+  ai_powered?: boolean;
+  web_sourced?: boolean;
+  pricing_source?: string;
+  searched_insurance?: string;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -55,6 +67,26 @@ function escapeHtml(str: string): string {
 
 function normalizeAddress(s: string): string {
   return (s || "").replace(/\u00a0/g, " ").replace(/Â+/g, "").replace(/\s+/g, " ").trim();
+}
+
+function getCptPlainLanguageExplanation(code: string, fallback?: string) {
+  const normalizedCode = (code.match(/\b\d{5}\b/) || [code.trim()])[0].trim();
+  if (normalizedCode === "71046") {
+    return "a chest x-ray with two views, usually taken from different angles";
+  }
+  if (normalizedCode === "77385") {
+    return "a focused radiation treatment that shapes the beam to the tumor while trying to spare healthy tissue";
+  }
+  if (fallback) {
+    return fallback
+      .replace(/intensity modulated radiation treatment delivery \(imrt\)/i, "a focused radiation treatment")
+      .replace(/includes guidance and tracking, when performed/i, "with guidance and tracking when needed")
+      .replace(/;?\s*simple/i, "")
+      .replace(/delivery/i, "treatment")
+      .replace(/therapy/i, "treatment")
+      .trim();
+  }
+  return "";
 }
 
 const SERVICES = [
@@ -81,6 +113,7 @@ export default function PriceSearch() {
   const [sortBy, setSortBy] = useState<"price" | "distance">("price");
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
   const [resultsTitle, setResultsTitle] = useState("");
+  const [searchedInsurance, setSearchedInsurance] = useState("");
   const [priceRange, setPriceRange] = useState<{ min: number; max: number } | null>(null);
   const [estimatesOnly, setEstimatesOnly] = useState(false);
 
@@ -95,6 +128,20 @@ export default function PriceSearch() {
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chatMessages]);
+
+  const handleServiceChange = (value: string) => {
+    setService(value);
+    if (value) {
+      setCptCode("");
+    }
+  };
+
+  const handleCptChange = (value: string) => {
+    setCptCode(value);
+    if (value.trim()) {
+      setService("");
+    }
+  };
 
   // ── SSE fetch ──────────────────────────────────────────────────────────
   const fetchPrices = useCallback(async (message: string, freshContext = false) => {
@@ -165,7 +212,8 @@ export default function PriceSearch() {
     setChatInput(""); setChatLoading(true);
     addChatMessage("user", msg);
     try {
-      const { text, mapData: md, facilities: fs, state } = await fetchPrices(msg);
+      const freshContext = /\b(?:cpt|zip|price|cost|how much|insurance)\b/i.test(msg) || /\b\d{5}\b/.test(msg);
+      const { text, mapData: md, facilities: fs, state } = await fetchPrices(msg, freshContext);
       setChatLoading(false);
       if (text) addChatMessage("assistant", text);
       if (md && fs.length > 0) applyResults(md, fs, state, null);
@@ -184,11 +232,19 @@ export default function PriceSearch() {
     setMapData(md);
     setFacilities(fs);
     setSelectedIdx(null);
-    const cpt = String(state.code || md.procedure_code || "").trim();
-    const proc = String(state.procedure_display_name || md.procedure_display_name || "").trim();
-    let title = (serviceQuery || "").trim();
-    if (proc && cpt) title = `${proc}, CPT code ${cpt}`;
-    else if (!title && md.service_query) title = String(md.service_query).charAt(0).toUpperCase() + String(md.service_query).slice(1);
+    setSearchedInsurance(String(state.insurance || "").trim());
+    const cptSource = String(state.code || md.procedure_code || "").trim();
+    const cpt = (cptSource.match(/\b\d{5}\b/) || [cptSource])[0].trim();
+    const explanationSource = String(
+      state.procedure_explanation || md.procedure_explanation || ""
+    ).trim();
+    const explanation = getCptPlainLanguageExplanation(cpt, explanationSource);
+    const serviceLabel = String(serviceQuery || md.service_query || state.procedure_display_name || "").trim();
+    const title = cpt
+      ? explanation
+        ? `CPT code ${cpt} (${explanation})`
+        : `CPT code ${cpt}`
+      : serviceLabel || String(state.procedure_display_name || md.procedure_display_name || "").trim();
     setResultsTitle(title);
     const prices = fs.map(f => f.price).filter((p): p is number => p != null);
     if (prices.length > 0) { setPriceRange({ min: Math.min(...prices), max: Math.max(...prices) }); setEstimatesOnly(false); }
@@ -204,9 +260,18 @@ export default function PriceSearch() {
   );
 
   const minPrice = sorted.filter(f => f.price).map(f => f.price as number).reduce((m, p) => Math.min(m, p), Infinity);
+  const pricingSource = String(mapData?.pricing_source || (mapData?.web_sourced ? "web" : "database")).toLowerCase();
+  const pricingSourceLabel =
+    pricingSource === "web"
+      ? "Brave web search"
+      : pricingSource === "web_candidate"
+        ? "Web candidate"
+      : pricingSource === "database"
+        ? "Database fallback"
+        : "AI-assisted search";
 
   // ── Map markers synced to sorted list ─────────────────────────────────
-  const mapFacilities = mapData ? { ...mapData, facilities: sorted.slice(0, 5).filter(f => f.latitude && f.longitude).map((f, i) => ({ list_index: i + 1, facility_key: f.facility_key, name: f.hospital_name, latitude: f.latitude!, longitude: f.longitude!, address: normalizeAddress(f.address || ""), price: f.price, estimated_range: f.estimated_range, website_url: f.website_url })) } : null;
+  const mapFacilities = mapData ? { ...mapData, facilities: sorted.slice(0, 5).filter(f => f.latitude && f.longitude).map((f, i) => ({ list_index: i + 1, facility_key: f.facility_key, name: f.hospital_name, latitude: f.latitude!, longitude: f.longitude!, address: normalizeAddress(f.address || ""), price: f.price, estimated_range: f.estimated_range, website_url: f.website_url, price_source: f.price_source, insurance_match: f.insurance_match, matching_insurers: f.matching_insurers, insurance_provider_name: f.insurance_provider_name })) } : null;
 
   const QUICK_ACTIONS = ["How much does an MRI cost?", "Find X-ray prices near 10001", "How much does a CT scan cost?", "Colonoscopy prices near me"];
 
@@ -223,7 +288,7 @@ export default function PriceSearch() {
                 <Search className="w-4 h-4 text-[#6b2458] flex-shrink-0" />
                 <select
                   value={service}
-                  onChange={e => setService(e.target.value)}
+                  onChange={e => handleServiceChange(e.target.value)}
                   className="flex-1 text-sm text-gray-700 bg-transparent outline-none cursor-pointer"
                 >
                   <option value="">Select a service…</option>
@@ -236,7 +301,9 @@ export default function PriceSearch() {
               </div>
               <div className="flex items-center my-1 text-xs text-gray-400 gap-2"><hr className="flex-1 border-gray-200" /><span>or CPT code</span><hr className="flex-1 border-gray-200" /></div>
               <input
-                type="text" value={cptCode} onChange={e => setCptCode(e.target.value)}
+                type="text"
+                value={cptCode}
+                onChange={e => handleCptChange(e.target.value.replace(/\D/g, "").slice(0, 5))}
                 placeholder="e.g. 71046" maxLength={5} inputMode="numeric"
                 className="w-full text-sm px-2 py-1.5 border border-gray-200 rounded-lg outline-none focus:border-[#6b2458]"
               />
@@ -274,13 +341,13 @@ export default function PriceSearch() {
 
           {/* Submit */}
           <div className="px-4 py-3 flex items-end">
-            <button
-              type="submit" disabled={loading}
-              className="flex items-center justify-center gap-2 bg-[#8C2F5D] hover:bg-[#A34E78] disabled:bg-gray-300 text-white px-6 py-3 rounded-xl font-semibold text-sm transition-colors w-full lg:w-auto cursor-pointer"
-            >
-              {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
-              Search Prices
-            </button>
+              <button
+                type="submit" disabled={loading}
+                className="inline-flex h-11 items-center justify-center gap-2 rounded-full bg-[#8C2F5D] px-7 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-[#A34E78] disabled:cursor-not-allowed disabled:bg-gray-300 w-full lg:w-auto cursor-pointer"
+              >
+                {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+                Search Prices
+              </button>
           </div>
         </div>
 
@@ -292,7 +359,17 @@ export default function PriceSearch() {
         <div ref={resultsRef} className="w-full bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden mb-6">
           {/* Header */}
           <div className="px-5 py-4 border-b border-gray-100 flex flex-wrap justify-between items-center gap-3">
-            <h2 className="text-lg font-semibold text-gray-800">Results for {resultsTitle}</h2>
+            <div className="space-y-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="text-lg font-semibold text-gray-800">Results for {resultsTitle}</h2>
+                <span className="inline-flex items-center rounded-full border border-[#f5d0e6] bg-[#fdf2f8] px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#6b2458]">
+                  AI-powered web search
+                </span>
+                <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] ${pricingSource === "web" ? "border border-emerald-200 bg-emerald-50 text-emerald-700" : "border border-slate-200 bg-slate-50 text-slate-700"}`}>
+                  {pricingSourceLabel}
+                </span>
+              </div>
+            </div>
             <div className="flex items-center gap-4 text-sm text-gray-500">
               {priceRange ? (
                 <span>Price range: <span className="font-semibold text-green-600">${priceRange.min.toLocaleString()}</span> – <span className="font-semibold text-red-500">${priceRange.max.toLocaleString()}</span></span>
@@ -320,7 +397,41 @@ export default function PriceSearch() {
                   const isLow = f.price && f.price <= minPrice * 1.2;
                   const isEst = !f.price;
                   const showWeb = f.web_price != null && Number(f.web_price) > 0;
-                  const note = f.price ? (f.price_source === "web_search" ? "Web search" : f.price_source === "db" ? "Verified" : "Verified") : "Estimate";
+                  const isWebSource = f.price_source === "web_search" || f.price_source === "web_candidate";
+                  const sourceLabel = isWebSource ? "Hospital-linked estimate page" : "Healthcare facility";
+                  const note = f.price
+                    ? (f.price_source === "web_search"
+                        ? "Web search"
+                        : f.price_source === "web_candidate"
+                          ? "Web candidate"
+                          : f.price_source === "db"
+                            ? "Verified"
+                            : "Verified")
+                    : f.price_source === "web_candidate"
+                      ? "Web candidate"
+                      : "Estimate";
+                  const matchingInsurers = Array.from(new Set((f.matching_insurers || []).map((insurer) => insurer.trim()).filter(Boolean)));
+                  const insurerLabel = matchingInsurers.length > 0
+                    ? matchingInsurers.length === 1
+                      ? matchingInsurers[0]
+                      : matchingInsurers.join(", ")
+                    : String(f.insurance_provider_name || "").trim();
+                  const displayInsurerLabel =
+                    searchedInsurance && insurerLabel && insurerLabel.toLowerCase() === searchedInsurance.toLowerCase()
+                      ? ""
+                      : insurerLabel;
+                  const nearbyInsuranceLabel = searchedInsurance
+                    ? displayInsurerLabel
+                      ? `Nearby match: no ${searchedInsurance} match; shown with ${displayInsurerLabel}`
+                      : `Nearby match: no ${searchedInsurance} match`
+                    : displayInsurerLabel
+                      ? `Nearby match: ${displayInsurerLabel}`
+                      : "Nearby match";
+                  const insuranceBadge = f.insurance_match
+                    ? displayInsurerLabel
+                      ? `Insurance match: ${displayInsurerLabel}`
+                      : "Insurance match"
+                    : nearbyInsuranceLabel;
                   let siteHtml: React.ReactNode = null;
                   try {
                     if (f.website_url) {
@@ -341,11 +452,14 @@ export default function PriceSearch() {
                       <div className="flex gap-3 flex-1 min-w-0">
                         <div className="w-6 h-6 rounded-full bg-[#6b2458] text-white text-xs font-bold flex items-center justify-center flex-shrink-0 mt-0.5">{i + 1}</div>
                         <div className="min-w-0">
-                          <p className="font-semibold text-[#6b2458] text-sm truncate">{f.hospital_name || "Healthcare Facility"}</p>
-                          <p className="text-xs text-gray-400 mb-1">Healthcare Facility</p>
+                          <p className="font-semibold text-[#6b2458] text-sm truncate">{f.hospital_name || (isWebSource ? "Hospital estimate page" : "Healthcare facility")}</p>
+                          <p className="text-xs text-gray-400 mb-1">{sourceLabel}</p>
                           <p className="text-xs text-gray-500">
                             {f.distance_miles != null && <span>📍 {f.distance_miles.toFixed(1)} mi · </span>}
                             {normalizeAddress(f.address || "")}
+                          </p>
+                          <p className={`mt-2 inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold ${f.insurance_match ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-[#6b2458]"}`}>
+                            {insuranceBadge}
                           </p>
                           {siteHtml}
                         </div>
@@ -420,17 +534,17 @@ export default function PriceSearch() {
               placeholder="Ask about healthcare prices…"
               className="flex-1 px-4 py-2.5 border border-gray-200 rounded-full text-sm outline-none focus:border-[#6b2458] focus:ring-2 focus:ring-[#6b2458]/10"
             />
-            <button onClick={handleSend} disabled={chatLoading} className="w-10 h-10 rounded-full bg-[#6b2458] hover:bg-[#8C2F5D] disabled:bg-gray-300 text-white flex items-center justify-center transition-colors cursor-pointer">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-            </button>
-          </div>
-          <div className="flex flex-wrap gap-2 mt-3">
-            {QUICK_ACTIONS.map(q => (
-              <button key={q} onClick={() => { setChatInput(q); }} className="px-3 py-1.5 bg-[#fdf2f8] text-[#6b2458] border border-[#f5d0e6] rounded-full text-xs hover:bg-[#6b2458] hover:text-white transition-colors cursor-pointer">
-                {q}
+              <button onClick={handleSend} disabled={chatLoading} className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-[#6b2458] text-white transition-colors hover:bg-[#8C2F5D] disabled:cursor-not-allowed disabled:bg-gray-300 cursor-pointer">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
               </button>
-            ))}
-          </div>
+            </div>
+            <div className="flex flex-wrap gap-2 mt-3">
+              {QUICK_ACTIONS.map(q => (
+                <button key={q} onClick={() => { setChatInput(q); }} className="rounded-full border border-[#f5d0e6] bg-[#fdf2f8] px-3 py-1.5 text-xs font-medium text-[#6b2458] transition-colors hover:bg-[#6b2458] hover:text-white cursor-pointer">
+                  {q}
+                </button>
+              ))}
+            </div>
         </div>
       </div>
     </div>

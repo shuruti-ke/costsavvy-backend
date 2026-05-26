@@ -18,13 +18,18 @@ import { useAuth } from "@/context/AuthContext";
 import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import { googleAuthUrl } from "@/api/auth/api";
+import type { IntakeType } from "@/types/context/auth-user";
 
 export default function SignInForm({
   authType,
   onSwitch,
+  redirectTo,
+  hideSwitch = false,
 }: {
-  authType: "business" | "consumer" | null;
+  authType: IntakeType | null;
   onSwitch: () => void;
+  redirectTo?: string;
+  hideSwitch?: boolean;
 }) {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -33,11 +38,11 @@ export default function SignInForm({
   const [error, setError] = useState<string | null>(null);
 
   // Get the redirect URL from query params (if any)
-  const from = searchParams.get("from") || "/";
+  const from = redirectTo || searchParams.get("from") || "/";
 
   useEffect(() => {
     if (isAuthenticated && !isLoading) {
-      router.push("/");
+      router.push(from);
     }
   }, [isAuthenticated, isLoading, router, from]);
 
@@ -51,13 +56,19 @@ export default function SignInForm({
     const password = formData.get("password") as string;
 
     try {
-      // Call the login function from auth context
-      await login(email, password);
+      const response = await login(email, password);
+      toast.success("Login successful");
 
-      toast.success("Login Successfull");
+      const fallbackDestination =
+        response.user.role === "admin"
+          ? "/admin"
+          : response.user.accountType === "business"
+            ? "/dashboard/business"
+            : "/";
+      const destination = from && from !== "/" ? from : fallbackDestination;
 
-      // Redirect to the original destination or dashboard
-      window.location.href = "/";
+      router.push(destination);
+      router.refresh();
     } catch (error) {
       console.error("Login error:", error);
       setError(
@@ -65,7 +76,7 @@ export default function SignInForm({
           ? error.message
           : "Failed to sign in. Please check your credentials."
       );
-      toast.success("Login failed");
+      toast.error("Login failed");
     } finally {
       setIsSubmitting(false);
     }
@@ -92,17 +103,23 @@ export default function SignInForm({
         <img src="/icon-black.png" alt="" />
       </Link>
 
-      <div className="text-center text-normal text-gray-600 flex items-center justify-center border-b pb-3 gap-16">
-        <button className="font-medium text-gray-800 underline underline-offset-4 cursor-pointer">
-          Sign in
-        </button>
-        <button
-          onClick={onSwitch}
-          className="hover:underline underline-offset-4 hover:text-gray-800 cursor-pointer"
-        >
-          Sign up
-        </button>
-      </div>
+      {!hideSwitch && (
+        <div className="text-center text-normal text-gray-600 flex items-center justify-center border-b pb-3 gap-16">
+          <button
+            type="button"
+            className="font-medium text-gray-800 underline underline-offset-4 cursor-pointer"
+          >
+            Sign in
+          </button>
+          <button
+            type="button"
+            onClick={onSwitch}
+            className="hover:underline underline-offset-4 hover:text-gray-800 cursor-pointer"
+          >
+            Sign up
+          </button>
+        </div>
+      )}
 
       <CardHeader className="text-center pb-2">
         <CardTitle className="text-xl font-bold">Sign In</CardTitle>

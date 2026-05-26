@@ -16,8 +16,9 @@ import "leaflet-defaulticon-compatibility/dist/leaflet-defaulticon-compatibility
 
 
 export interface ProviderMapProps {
-  zipCodes: number[];
-  names:     string[];
+  zipCodes: string[];
+  names: string[];
+  coordinates?: Array<{ lat: number; lng: number; name?: string }>;
 }
 
 interface GeoLocation {
@@ -38,12 +39,25 @@ function FitMarkers({ locations }: { locations: GeoLocation[] }) {
   return null;
 }
 
-export default function Map({ zipCodes, names }: ProviderMapProps) {
+export default function Map({ zipCodes, names, coordinates }: ProviderMapProps) {
   const [locations, setLocations] = useState<GeoLocation[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (coordinates && coordinates.length > 0) {
+      setLocations(
+        coordinates.map((coord, index) => ({
+          lat: coord.lat,
+          lng: coord.lng,
+          name: coord.name || names[index] || "Provider",
+        }))
+      );
+      setError(null);
+      setLoading(false);
+      return;
+    }
+
     async function fetchLocations() {
       const results: GeoLocation[] = [];
       setError(null);
@@ -82,7 +96,7 @@ export default function Map({ zipCodes, names }: ProviderMapProps) {
       setLocations([]);
       setLoading(false);
     }
-  }, [zipCodes, names]);
+  }, [zipCodes, names, coordinates]);
 
   if (loading) {
     return (

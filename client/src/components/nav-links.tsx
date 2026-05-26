@@ -11,15 +11,13 @@ export default function NavLinks({
   onLinkClick,
   isMobileMenuOpen,
 }: NavLinksProps) {
-  const { user, isAuthenticated } = useAuth();
+  const { user } = useAuth();
   const isAdmin = user?.role === "admin";
+  const isBusiness = user?.accountType === "business";
+  const dashboardHref = isAdmin ? "/admin" : isBusiness ? "/dashboard/business" : null;
 
-  const handleAdminDashboardClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
+  const handleAdminDashboardClick = () => {
     onLinkClick?.();
-
-    if (isAdmin) {
-      window.open("https://cost-savy.sanity.studio/structure", "_blank");
-    }
   };
 
   const handleRegularLinkClick = () => {
@@ -28,8 +26,8 @@ export default function NavLinks({
 
   return (
     <>
-      {isAdmin && (
-        <a href="/" onClick={handleAdminDashboardClick}>
+      {dashboardHref && (
+        <a href={dashboardHref} onClick={handleAdminDashboardClick}>
           <NavItem text="Dashboard" hasDropdown={false} isMobileMenuOpen={isMobileMenuOpen} />
         </a>
       )}

@@ -12,11 +12,9 @@ import {
   TabType,
   SearchFieldType,
   GlossaryItem,
+  StateOption,
 } from "../../types/providers-glossary/glossary-types";
 
-import {
-  mockStates,
-} from "@/data/providers-glossary/glossary";
 import {
   fetchHealthSystems,
   fetchProcedures,
@@ -24,6 +22,28 @@ import {
 } from "@/api/sanity/queries";
 
 export default function ProvidersGlossaryPage() {
+  const mergeUniqueGlossaryItems = (primary: GlossaryItem[], secondary: GlossaryItem[]) => {
+    const map = new Map<string, GlossaryItem>();
+    const makeKey = (item: GlossaryItem) =>
+      `${item.tab}|${item.name.trim().toLowerCase()}|${(item.state || "").trim().toLowerCase()}|${(item.location || "").trim().toLowerCase()}`;
+
+    for (const item of secondary) {
+      map.set(makeKey(item), item);
+    }
+    for (const item of primary) {
+      map.set(makeKey(item), item);
+    }
+    return Array.from(map.values());
+  };
+
+  const buildStateOptions = (records: GlossaryItem[]) => {
+    const states = Array.from(
+      new Set(records.map((record) => (record.state || "").trim()).filter(Boolean))
+    ).sort((a, b) => a.localeCompare(b));
+
+    return states.map((state) => ({ id: state, name: state }));
+  };
+
   const tabs: TabType[] = [
     {
       id: "procedures",
@@ -45,6 +65,7 @@ export default function ProvidersGlossaryPage() {
     },
   ];
   const [items, setItems] = useState<GlossaryItem[]>([]);
+  const [stateOptions, setStateOptions] = useState<StateOption[]>([]);
   //CONSTANTS
   const itemsPerPage = 30;
   // States
@@ -80,17 +101,62 @@ export default function ProvidersGlossaryPage() {
       setLoading(true);
       try {
         let data: GlossaryItem[] = [];
+        let states: StateOption[] = [];
         if (activeTab === "procedures") {
           data = await fetchProcedures();
         } else if (activeTab === "providers") {
-          data = await fetchProviders();
+          try {
+            const [providersResponse, statesResponse, sanityProviders] = await Promise.all([
+              fetch("/api/hospitals?directoryType=provider&limit=500", { cache: "no-store" }),
+              fetch("/api/hospitals/states?directoryType=provider", { cache: "no-store" }),
+              fetchProviders(),
+            ]);
+
+            if (!providersResponse.ok || !statesResponse.ok) {
+              throw new Error("Provider directory API unavailable");
+            }
+
+            const providersPayload = await providersResponse.json();
+            const statesPayload = await statesResponse.json();
+
+            const apiProviders: GlossaryItem[] = providersPayload.data || [];
+            data = mergeUniqueGlossaryItems(apiProviders, sanityProviders || []);
+
+            const apiStates: StateOption[] = (statesPayload.data || []).map((state: string) => ({
+              id: state,
+              name: state,
+            }));
+            const mergedStateNames = Array.from(
+              new Set([
+                ...apiStates.map((state) => state.name),
+                ...buildStateOptions(data).map((state) => state.name),
+              ])
+            ).sort((a, b) => a.localeCompare(b));
+            states = mergedStateNames.map((state) => ({ id: state, name: state }));
+          } catch {
+            data = await fetchProviders();
+            states = buildStateOptions(data);
+          }
         } else {
-          data = await fetchHealthSystems();
+          try {
+            const healthSystemsResponse = await fetch("/api/hospitals?directoryType=health-system&limit=500", {
+              cache: "no-store",
+            });
+            if (!healthSystemsResponse.ok) {
+              throw new Error("Health system directory API unavailable");
+            }
+            const payload = await healthSystemsResponse.json();
+            data = payload.data || [];
+          } catch {
+            data = await fetchHealthSystems();
+          }
         }
         setItems(data);
+        setStateOptions(states);
       } catch (err) {
         console.error("Failed loading glossary items:", err);
         setItems([]);
+        setStateOptions([]);
       } finally {
         setLoading(false);
       }
@@ -138,7 +204,7 @@ export default function ProvidersGlossaryPage() {
 
             <div className="w-full md:w-auto">
               <StateDropdown
-                states={mockStates}
+                states={stateOptions}
                 selectedState={selectedState}
                 onStateChange={setSelectedState}
                 show={currentTab.hasStateFilter || false}

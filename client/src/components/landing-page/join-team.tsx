@@ -1,5 +1,6 @@
 import React from "react";
 import Image from "next/image";
+import Link from "next/link";
 
 interface JoinTeamProps {
   heading: string;
@@ -36,11 +37,12 @@ const JoinTeam: React.FC<JoinTeamProps> = ({
             </p>
           </div>
         </div>
-        <a href="/">
-          <button className="bg-[#A34E78] hover:bg-[#C85990] cursor-pointer text-white px-6 py-3 rounded-full font-semibold transition-colors w-full lg:w-auto">
+        <Link
+          href="/blog"
+          className="inline-flex h-11 items-center justify-center rounded-full bg-white px-7 text-sm font-semibold text-[#8C2F5D] shadow-sm transition-colors hover:bg-[#f7eff3] w-full lg:w-auto"
+        >
             {ctaText}
-          </button>
-        </a>
+        </Link>
       </div>
     </div>
   );

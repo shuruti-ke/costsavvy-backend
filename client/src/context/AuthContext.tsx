@@ -8,8 +8,8 @@ import React, {
   ReactNode,
 } from "react";
 import { getCurrentUser, login, logout, register } from "@/api/auth/api";
-import { useRouter } from "next/navigation";
-import { AuthContextType, User } from "@/types/context/auth-user";
+import { usePathname, useRouter } from "next/navigation";
+import { AuthContextType, User, RegisterUserInput, RegisterResult } from "@/types/context/auth-user";
 
 // Create the auth context
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -20,6 +20,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const router = useRouter();
+  const pathname = usePathname();
+  const isProtectedRoute =
+    pathname?.startsWith("/admin") || pathname?.startsWith("/dashboard");
   useEffect(() => {
     const checkAuthStatus = async () => {
       setIsLoading(true);
@@ -79,7 +82,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
               localStorage.setItem("user", JSON.stringify(userData.data));
             }
           } else {
-            console.log("No token found, redirecting to auth");
+            if (isProtectedRoute) {
+              console.info("No token found on a protected route.");
+            }
             // router.push("/auth");
           }
         }
@@ -95,7 +100,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
 
     checkAuthStatus();
-  }, [router]);
+  }, [isProtectedRoute, router]);
 
   // Login function
   const handleLogin = async (email: string, password: string) => {
@@ -106,6 +111,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       localStorage.setItem("token", response.token);
       localStorage.setItem("user", JSON.stringify(response.user));
       setUser(response.user);
+      return response;
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
       throw err;
@@ -115,18 +121,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   // Register function
-  const handleRegister = async (
-    name: string,
-    email: string,
-    password: string
-  ) => {
+  const handleRegister = async (input: RegisterUserInput): Promise<RegisterResult> => {
     setIsLoading(true);
     setError(null);
     try {
-      const response = await register({ name, email, password });
-      localStorage.setItem("token", response.token);
-      localStorage.setItem("user", JSON.stringify(response.user));
-      setUser(response.user);
+      const response = await register(input);
+      return response;
     } catch (err) {
       setError(err instanceof Error ? err.message : "Registration failed");
       throw err;

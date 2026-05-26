@@ -50,13 +50,9 @@ const Enterprise: React.FC<EnterpriseProps> = ({
 
           <Link
             href={ctaLink}
-            className="inline-block bg-[#8C2F5D] self-start lg:self-end rounded-full text-white px-7 py-3 hover:bg-[#A34E78] transition-colors duration-300 text-md font-medium"
+            className="inline-flex h-11 items-center justify-center self-start lg:self-end rounded-full bg-[#8C2F5D] px-7 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-[#A34E78]"
           >
-            <div className="flex items-center justify-center gap-1">
-              {ctaText.split(" ").map((word, i) => (
-                <p key={i}>{word}</p>
-              ))}
-            </div>
+            {ctaText}
           </Link>
         </div>
       </section>

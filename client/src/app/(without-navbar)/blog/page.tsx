@@ -2,6 +2,8 @@ import { Metadata } from 'next';
 import { generateMetadataTemplate } from '@/lib/metadata';
 import BlogPage from "@/components/blog/blog-page";
 
+export const revalidate = 60;
+
 export async function generateMetadata(): Promise<Metadata> {
   return generateMetadataTemplate({
     title: 'Healthcare Blog | Cost Savy Health',
