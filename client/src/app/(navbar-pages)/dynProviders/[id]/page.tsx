@@ -90,8 +90,7 @@ export default async function ProviderPage({
 }) {
   const { id } = await params;
   const provider = await getProviderRecord(id);
-  const parsedZip = Number.parseInt(provider?.address?.zip || "", 10);
-  const providerZipCodes = Number.isFinite(parsedZip) ? [parsedZip] : [];
+  const providerZipCodes = provider?.address?.zip ? [provider.address.zip] : [];
 
   if (!provider) {
     return (
@@ -170,18 +169,16 @@ export default async function ProviderPage({
             </div>
 
             {/* Map Component */}
-            <div className="bg-gray-200 h-44 mb-4 rounded-lg flex items-center justify-center">
-              <div className="w-full h-full rounded-lg overflow-hidden">
-                <ProviderMap
-                  zipCodes={providerZipCodes}
-                  names={provider.nearbyProviders}
-                  coordinates={
-                    provider.latitude != null && provider.longitude != null
-                      ? [{ lat: provider.latitude, lng: provider.longitude, name: provider.name }]
-                      : undefined
-                  }
-                />
-              </div>
+            <div className="mb-4 rounded-lg overflow-hidden">
+              <ProviderMap
+                zipCodes={providerZipCodes}
+                names={provider.nearbyProviders}
+                coordinates={
+                  provider.latitude != null && provider.longitude != null
+                    ? [{ lat: provider.latitude, lng: provider.longitude, name: provider.name }]
+                    : undefined
+                }
+              />
             </div>
 
             {provider.nearbyProviders?.length > 0 && (

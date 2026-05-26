@@ -69,7 +69,7 @@ export default function AllProviders() {
   // derive map props
   console.log(providers)
   const type = providers[0]?.billing_code_type
-  const zipCodes = providers.map((p) => p.provider_zip_code);
+  const zipCodes = providers.map((p) => String(p.provider_zip_code).padStart(5, "0"));
   const names = providers.map((p) => p.provider_name);
   console.log(names)
 

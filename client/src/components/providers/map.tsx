@@ -16,7 +16,7 @@ import "leaflet-defaulticon-compatibility/dist/leaflet-defaulticon-compatibility
 
 
 export interface ProviderMapProps {
-  zipCodes: number[];
+  zipCodes: string[];
   names: string[];
   coordinates?: Array<{ lat: number; lng: number; name?: string }>;
 }
