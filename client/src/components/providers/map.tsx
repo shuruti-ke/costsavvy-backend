@@ -51,7 +51,9 @@ export default function Map({ zipCodes, names = [], coordinates }: ProviderMapPr
 
       for (let i = 0; i < zipCodes.length; i++) {
         try {
-          const res = await fetch(`/api/geocode?zip=${zipCodes[i]}`);
+          const isFullAddress = zipCodes[i].includes(",");
+          const param = isFullAddress ? `address=${encodeURIComponent(zipCodes[i])}` : `zip=${zipCodes[i]}`;
+          const res = await fetch(`/api/geocode?${param}`);
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const data = await res.json();
           const first = Array.isArray(data) ? data[0] : null;

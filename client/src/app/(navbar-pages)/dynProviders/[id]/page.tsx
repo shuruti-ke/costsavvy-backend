@@ -90,7 +90,8 @@ export default async function ProviderPage({
 }) {
   const { id } = await params;
   const provider = await getProviderRecord(id);
-  const providerZipCodes = provider?.address?.zip ? [provider.address.zip] : [];
+  const fullAddress = [provider?.address?.street, provider?.address?.city, provider?.address?.state, provider?.address?.zip].filter(Boolean).join(", ");
+  const providerZipCodes = fullAddress ? [fullAddress] : (provider?.address?.zip ? [provider.address.zip] : []);
 
   if (!provider) {
     return (
